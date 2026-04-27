@@ -1,0 +1,12 @@
+# Rust build output
+/target
+
+# Editor / OS junk
+*.swp
+*~
+.DS_Store
+
+# Test scratch dirs (anything we throw under /tmp doesn't matter; this is
+# defensive in case someone runs the demo flow inside the repo)
+/seed-state
+/out

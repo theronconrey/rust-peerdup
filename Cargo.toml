@@ -1,0 +1,30 @@
+[package]
+name = "rust-peerdup"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Folder-sync daemon built on p2panda + librqbit"
+repository = "https://github.com/theronconrey/rust-peerdup"
+readme = "README.md"
+
+[dependencies]
+p2panda-net = "0.5.2"
+p2panda-core = "0.5.2"
+librqbit = "8.1.1"
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+anyhow = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+serde_json = "1.0"
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+directories = "5"
+fs2 = "0.4"
+blake3 = "1"
+chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
+notify = "6"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+bincode = { version = "2", features = ["serde"] }
