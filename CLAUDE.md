@@ -61,6 +61,18 @@ header so receivers know which key to use. Rotation appends a new key;
 nothing ever removes one. This is what makes "old ciphertext stays
 readable after rotation" work; if you delete old keys you break that.
 
+### Auth ops are append-only and signed (Phase 5c)
+Each share has its own membership CRDT (`auth.rs`, built on
+`p2panda-auth`). Operations (`Create`/`Add`/`Remove`/`Promote`/`Demote`)
+are Ed25519-signed by the author using the daemon's `identity.key` and
+stored in `<data_dir>/shares/<id>/auth.log` — bincode-encoded
+`Vec<SignedOp>`, replaced atomically on update. Don't strip the
+signature step or skip `apply_remote`'s `op.verify()` call when adding
+a new ingestion path; those are the only thing keeping a malicious
+peer from forging Add/Remove ops on the wire. Auth state and the
+encryption keyring are *separate*: revocation in 5c only updates
+membership, not keys — 5d will wire the rotation trigger.
+
 ## How to build, test, run
 
 ```bash

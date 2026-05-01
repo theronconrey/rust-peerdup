@@ -90,6 +90,66 @@ Skipped now because the Phase 3 done criterion is met by LWW alone, and
 real-world conflict-strategy preferences are likely to come out of user
 testing rather than upfront design.
 
+## p2panda-auth (Phase 5c)
+
+### Pure CRDT, no transport or persistence
+`p2panda-auth` 0.5.2 is a *library* of generic types — `GroupCrdt`,
+`GroupCrdtState`, `Access`, etc. — parameterised over `IdentityHandle`,
+`OperationId`, `Conditions`, `Resolver`, and `Orderer` traits. It does
+not sign, transport, persist, or order operations. The application must
+provide:
+- An identity scheme (we use raw 32-byte Ed25519 pubkeys, `MemberId`).
+- An op id scheme (we use `blake3(canonical_bytes(op) || signature)`).
+- Application-level signing (we Ed25519-sign the canonical
+  `bincode((author, deps, payload))` with the local `identity.key`).
+- Storage (we append-log signed ops to `<data_dir>/shares/<id>/auth.log`
+  and replay on daemon start).
+- Transport (we broadcast all known ops via gossip on every announce
+  tick; receivers dedupe by op id).
+- Dependency ordering (auth ops can arrive out of order via gossip; we
+  buffer them in `AuthState.pending` and drain on each new arrival).
+
+### The `Orderer` trait can be no-op
+`p2panda-auth` only calls `Orderer::next_message` from `GroupCrdt::prepare`
+(used by the high-level `Groups` API, e.g. `Groups::add()`). Calling
+`GroupCrdt::process` directly — passing in a fully-formed operation —
+never touches the orderer. peerdup constructs operations directly with
+correct dependencies (= current graph heads at author time) and only
+uses `process`. This means our `NoOpOrderer` can `unimplemented!()`
+`next_message` safely; `queue` and `next_ready_message` are inert
+no-ops.
+
+### Group id distinct from member ids
+Both group ids and member ids share the same `IdentityHandle` type
+(`MemberId([u8; 32])`). We derive the group id as
+`blake3("peerdup-group/" || share_id)` so it's globally unique *and*
+provably can't collide with any 32-byte Ed25519 pubkey (different
+preimage space).
+
+### Ticket carries the full auth-log snapshot
+`share-invite` runs `Add(invitee)` *before* generating the ticket and
+embeds the entire current op log. The receiver replays it via
+`AuthState::apply_remote` (signature-verified), then verifies that its
+own pubkey appears as a member; otherwise the join is refused. This
+matches how the keyring is bootstrapped — the ticket is the complete
+"everything you need to join" payload. Tradeoff: ticket size grows with
+membership-op count, but those are bounded (membership churn is small
+compared to data ops).
+
+### Two parallel notions of peer identity
+Vector clocks (`PersistedState.clock`) key on the **hex string** of the
+public key (set up that way in Phase 3 before auth existed). Auth keys
+on the **raw 32-byte** representation (`MemberId([u8; 32])`). Both
+derive from the same `identity.key`; helpers in `auth.rs`
+(`MemberId::from_hex`, `MemberId::to_hex`) bridge the two when needed.
+Could be unified later but unification touches `clock.rs` and
+`share_state.rs` everywhere they hold a peer id, so we deferred it.
+
+### Ticket format is now v2; v1 is rejected
+`Ticket.version` was bumped from 1 to 2 to add `auth_log` and
+`invitee_pubkey`. There is no migration path — v1 tickets fail to
+decode. Acceptable because no shipped builds had real users yet.
+
 ## Things that look wrong but aren't
 
 Three things in `src/main.rs` are deliberate and should not be "fixed" without

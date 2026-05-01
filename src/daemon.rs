@@ -1,3 +1,4 @@
+use crate::auth::{self, AuthState, SignedOp};
 use crate::clock::{ClockOrdering, VectorClock};
 use crate::crypto::{self, KeyRing};
 use crate::share::{ShareConfig, ShareRole};
@@ -51,6 +52,54 @@ enum ShareMsg {
         #[serde(default)]
         timestamp: Option<DateTime<Utc>>,
     },
+    /// Phase 5c: full snapshot of this peer's known auth ops for the share.
+    /// Receivers verify each, dedupe by op id, and apply via
+    /// `AuthState::apply_remote`. Periodic re-broadcasts ensure late joiners
+    /// catch up; receivers ignore ops they already hold so reflood is cheap.
+    /// `bincode`-encoded `SignedOp`s are inlined as `Vec<u8>` so a peer can
+    /// decode the envelope (`serde_json` here) without depending on the
+    /// inner schema.
+    #[serde(rename = "share_auth_ops")]
+    AuthOps { ops: Vec<Vec<u8>> },
+}
+
+fn auth_announce_bytes(state: &AuthState) -> Result<Vec<u8>> {
+    let ops: Result<Vec<Vec<u8>>> = state.ops().iter().map(SignedOp::encode).collect();
+    let msg = ShareMsg::AuthOps { ops: ops? };
+    Ok(serde_json::to_vec(&msg)?)
+}
+
+/// Apply an incoming `AuthOps` payload to the share's auth state. Persists
+/// the log on disk if any op was newly applied. The `payload` is the parsed
+/// `ShareMsg::AuthOps.ops` vector.
+fn apply_auth_ops(
+    state: &mut AuthState,
+    payload: Vec<Vec<u8>>,
+    data_dir: &Path,
+    share_id: &str,
+) -> Result<usize> {
+    let mut applied = 0usize;
+    for raw in payload {
+        let op = match SignedOp::decode(&raw) {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!(error = %e, share_id = %share_id, "discarding malformed auth op");
+                continue;
+            }
+        };
+        match state.apply_remote(op) {
+            Ok(true) => applied += 1,
+            Ok(false) => {} // duplicate or pending — fine
+            Err(e) => {
+                tracing::warn!(error = %e, share_id = %share_id, "auth op rejected");
+            }
+        }
+    }
+    if applied > 0 {
+        auth::save(data_dir, share_id, state)
+            .with_context(|| format!("persisting auth.log for share {share_id}"))?;
+    }
+    Ok(applied)
 }
 
 pub async fn serve(
@@ -107,10 +156,19 @@ pub async fn serve(
                 continue;
             }
         };
+        let auth_state = match auth::load(&data_dir, &share_id) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = ?e, share_id = %share_id, "could not load auth log");
+                continue;
+            }
+        };
         tasks.spawn(async move {
-            run_share(config, session, gossip, bt_port, data_dir, peer_id_hex, key)
-                .await
-                .with_context(|| format!("share {share_id} failed"))
+            run_share(
+                config, session, gossip, bt_port, data_dir, peer_id_hex, key, auth_state,
+            )
+            .await
+            .with_context(|| format!("share {share_id} failed"))
         });
     }
 
@@ -188,14 +246,24 @@ async fn run_share(
     data_dir: PathBuf,
     peer_id_hex: String,
     key: KeyRing,
+    auth_state: AuthState,
 ) -> Result<()> {
     let topic = TopicId::from(Hash::new(config.topic.as_bytes()));
-    tracing::info!(share_id = %config.id, topic = %config.topic, role = ?config.role, "starting share");
+    tracing::info!(
+        share_id = %config.id,
+        topic = %config.topic,
+        role = ?config.role,
+        auth_ops = auth_state.ops().len(),
+        "starting share"
+    );
     match config.role {
-        ShareRole::Seed => seed_loop(config, session, gossip, topic, bt_port).await,
-        ShareRole::Leech => leech_loop(config, session, gossip, topic).await,
+        ShareRole::Seed => seed_loop(config, session, gossip, topic, bt_port, data_dir, auth_state).await,
+        ShareRole::Leech => leech_loop(config, session, gossip, topic, data_dir, auth_state).await,
         ShareRole::Sync => {
-            sync_loop(config, session, gossip, topic, bt_port, data_dir, peer_id_hex, key).await
+            sync_loop(
+                config, session, gossip, topic, bt_port, data_dir, peer_id_hex, key, auth_state,
+            )
+            .await
         }
     }
 }
@@ -206,6 +274,8 @@ async fn seed_loop(
     gossip: Gossip,
     topic: TopicId,
     bt_port: u16,
+    data_dir: PathBuf,
+    mut auth_state: AuthState,
 ) -> Result<()> {
     let root = config
         .root_path
@@ -245,17 +315,41 @@ async fn seed_loop(
         clock: None,
         timestamp: None,
     };
-    let bytes = serde_json::to_vec(&announce)?;
+    let announce_bytes = serde_json::to_vec(&announce)?;
 
     let handle = gossip.stream(topic).await?;
+    let mut sub = handle.subscribe();
+    let mut tick = tokio::time::interval(Duration::from_secs(10));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick.tick().await;
+
     loop {
-        if let Err(e) = handle.publish(bytes.clone()).await {
-            tracing::warn!(share_id = %config.id, error = %e, "gossip publish failed");
-        } else {
-            tracing::debug!(share_id = %config.id, "published announce");
+        tokio::select! {
+            _ = tick.tick() => {
+                if let Err(e) = handle.publish(announce_bytes.clone()).await {
+                    tracing::warn!(share_id = %config.id, error = %e, "gossip publish failed");
+                }
+                publish_auth_ops(&handle, &auth_state, &config.id).await;
+            }
+            item = sub.next() => {
+                let Some(item) = item else { break };
+                let payload = match item {
+                    Ok(p) => p,
+                    Err(e) => { tracing::debug!(error = %e, "gossip lag"); continue; }
+                };
+                match serde_json::from_slice::<ShareMsg>(&payload) {
+                    Ok(ShareMsg::AuthOps { ops }) => {
+                        if let Err(e) = apply_auth_ops(&mut auth_state, ops, &data_dir, &config.id) {
+                            tracing::warn!(error = ?e, share_id = %config.id, "auth apply failed");
+                        }
+                    }
+                    Ok(ShareMsg::Announce { .. }) => {} // seeds ignore other peers' announces
+                    Err(_) => {} // unknown payload, drop
+                }
+            }
         }
-        tokio::time::sleep(Duration::from_secs(10)).await;
     }
+    Err(anyhow!("seed gossip subscription ended"))
 }
 
 async fn leech_loop(
@@ -263,6 +357,8 @@ async fn leech_loop(
     session: Arc<Session>,
     gossip: Gossip,
     topic: TopicId,
+    data_dir: PathBuf,
+    mut auth_state: AuthState,
 ) -> Result<()> {
     let root = config.root_path.clone();
     tokio::fs::create_dir_all(&root)
@@ -286,17 +382,26 @@ async fn leech_loop(
                 continue;
             }
         };
-        let Ok(announce) = serde_json::from_slice::<ShareMsg>(&payload) else {
-            tracing::debug!("ignoring non-ShareMsg payload");
-            continue;
+        let msg = match serde_json::from_slice::<ShareMsg>(&payload) {
+            Ok(m) => m,
+            Err(_) => {
+                tracing::debug!("ignoring non-ShareMsg payload");
+                continue;
+            }
         };
-        let ShareMsg::Announce {
-            info_hash,
-            bt_endpoints,
-            version_hash: _,
-            clock: _,
-            timestamp: _,
-        } = announce;
+        let (info_hash, bt_endpoints) = match msg {
+            ShareMsg::Announce {
+                info_hash,
+                bt_endpoints,
+                ..
+            } => (info_hash, bt_endpoints),
+            ShareMsg::AuthOps { ops } => {
+                if let Err(e) = apply_auth_ops(&mut auth_state, ops, &data_dir, &config.id) {
+                    tracing::warn!(error = ?e, share_id = %config.id, "auth apply failed");
+                }
+                continue;
+            }
+        };
         tracing::info!(
             share_id = %config.id,
             %info_hash,
@@ -360,6 +465,7 @@ async fn sync_loop(
     data_dir: PathBuf,
     peer_id_hex: String,
     key: KeyRing,
+    mut auth_state: AuthState,
 ) -> Result<()> {
     let root = config.root_path.clone();
     tokio::fs::create_dir_all(&root)
@@ -407,6 +513,7 @@ async fn sync_loop(
                 if let Some(s) = &state {
                     publish_sync_announce(&topic_handle, s, bt_port).await;
                 }
+                publish_auth_ops(&topic_handle, &auth_state, &config.id).await;
             }
             item = sub.next() => {
                 let Some(item) = item else { break };
@@ -414,8 +521,20 @@ async fn sync_loop(
                     Ok(p) => p,
                     Err(e) => { tracing::debug!(error = %e, "gossip lag"); continue; }
                 };
-                let Ok(announce) = serde_json::from_slice::<ShareMsg>(&payload) else { continue };
-                let ShareMsg::Announce { info_hash, bt_endpoints, version_hash, clock, timestamp } = announce;
+                let msg = match serde_json::from_slice::<ShareMsg>(&payload) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let (info_hash, bt_endpoints, version_hash, clock, timestamp) = match msg {
+                    ShareMsg::Announce { info_hash, bt_endpoints, version_hash, clock, timestamp } =>
+                        (info_hash, bt_endpoints, version_hash, clock, timestamp),
+                    ShareMsg::AuthOps { ops } => {
+                        if let Err(e) = apply_auth_ops(&mut auth_state, ops, &data_dir, &config.id) {
+                            tracing::warn!(error = ?e, share_id = %config.id, "auth apply failed");
+                        }
+                        continue;
+                    }
+                };
 
                 let (Some(remote_vhash), Some(remote_clock), Some(remote_ts)) = (version_hash, clock, timestamp) else {
                     tracing::debug!(share_id = %config.id, "ignoring legacy announce missing required fields");
@@ -1028,5 +1147,21 @@ async fn publish_sync_announce(handle: &GossipHandle, state: &ShareState, bt_por
         if let Err(e) = handle.publish(bytes).await {
             tracing::warn!(error = %e, "gossip publish failed");
         }
+    }
+}
+
+async fn publish_auth_ops(handle: &GossipHandle, auth_state: &AuthState, share_id: &str) {
+    if auth_state.is_empty() {
+        return;
+    }
+    let bytes = match auth_announce_bytes(auth_state) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, share_id = %share_id, "encoding auth ops failed");
+            return;
+        }
+    };
+    if let Err(e) = handle.publish(bytes).await {
+        tracing::warn!(error = %e, share_id = %share_id, "gossip publish (auth ops) failed");
     }
 }

@@ -15,15 +15,25 @@ guesses, not commitments. Add 50% if part-time, double for "with surprises."
 | Phase | State | Estimate |
 |---|---|---|
 | 1. Foundation | ✅ Done | — |
-| 2. Persistent state & daemon | 👉 Next | 2–3 weeks |
-| 3. Multi-master sync | Planned | 4–6 weeks |
-| 4. Encryption at rest | Planned | 3–4 weeks |
-| 5. ACL via p2panda-auth | Planned | 4–6 weeks |
-| 6. Swarm admission gate | Planned | 2–3 weeks |
+| 2. Persistent state & daemon | ✅ Done | — |
+| 3. Multi-master sync | ✅ Done | — |
+| 4. Encryption at rest | ✅ Done (file-level; `p2panda-encryption` deferred — see notes) | — |
+| 5. ACL via p2panda-auth | 🚧 In progress (5a/5b/5c done; 5d/5e pending) | 1–2 weeks remaining |
+| 6. Swarm admission gate | 👉 Next after Phase 5 | 2–3 weeks |
 | 7. D-Bus IPC surface | Planned | 2–3 weeks |
 | 8. Linux UI | Planned | 4–6 weeks |
 | 9. Cross-platform packaging | Planned | 4–8 weeks |
 | 10. Production hardening | Planned | Ongoing |
+
+**Phase 5 substep tracking** (mirrors `README.md`):
+
+| Substep | State |
+|---|---|
+| 5a. Invite/join via copy-paste tickets | ✅ Done |
+| 5b. Peer activity listing (`share peers`) | ✅ Done |
+| 5c. `p2panda-auth` group CRDT integration | ✅ Done (members/revoke CLI, gossip, signed ops, `auth.log` persistence) |
+| 5d. Auto key rotation on revocation | ⏳ TODO |
+| 5e. 4-peer revocation e2e test | ⏳ TODO |
 
 **Total to v1.0:** roughly 6–9 months of focused work, with phases 3–6 being
 the technically meatiest.

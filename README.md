@@ -40,7 +40,7 @@ writing:
 | 4. Encryption at rest (file-level, KeyRing with epoch tagging, key rotation) | ✅ Done |
 | 5a. Invite/join via copy-paste tickets | ✅ Done |
 | 5b. Peer activity listing (`share peers`) | ✅ Done |
-| 5c. `p2panda-auth` group CRDT integration | ⏳ TODO |
+| 5c. `p2panda-auth` group CRDT integration | ✅ Done |
 | 5d. Auto key rotation on revocation | ⏳ TODO |
 | 5e. 4-peer revocation e2e test | ⏳ TODO |
 | 6+ | Per ROADMAP.md |
