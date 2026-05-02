@@ -41,7 +41,7 @@ writing:
 | 5a. Invite/join via copy-paste tickets | ✅ Done |
 | 5b. Peer activity listing (`share peers`) | ✅ Done |
 | 5c. `p2panda-auth` group CRDT integration | ✅ Done |
-| 5d. Auto key rotation on revocation | ⏳ TODO |
+| 5d. Auto key rotation on revocation | ✅ Done |
 | 5e. 4-peer revocation e2e test | ⏳ TODO |
 | 6+ | Per ROADMAP.md |
 
@@ -115,6 +115,7 @@ src/
 ├── clock.rs          VectorClock + ClockOrdering
 ├── crypto.rs         KeyRing + XChaCha20-Poly1305 encryption
 ├── auth.rs           Membership CRDT (p2panda-auth) + signed op log
+├── rotation.rs       Phase 5d signed sealed-box key rotation envelopes
 ├── ticket.rs         Invite ticket encode/decode
 ├── identity.rs       Ed25519 identity load/persist
 ├── data_dir.rs       Path resolution

@@ -135,15 +135,20 @@ pub struct SignedOp {
     pub signature: [u8; SIGNATURE_LEN],
 }
 
-mod serde_bytes_64 {
+pub(crate) mod serde_bytes_64 {
     use super::SIGNATURE_LEN;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    pub fn serialize<S: Serializer>(v: &[u8; SIGNATURE_LEN], s: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(
+        v: &[u8; SIGNATURE_LEN],
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
         v.as_slice().serialize(s)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; SIGNATURE_LEN], D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<[u8; SIGNATURE_LEN], D::Error> {
         let v: Vec<u8> = Vec::deserialize(d)?;
         if v.len() != SIGNATURE_LEN {
             return Err(serde::de::Error::custom(format!(

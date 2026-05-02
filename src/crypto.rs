@@ -123,6 +123,61 @@ pub fn rotate_keyring(data_dir: &Path, share_id: &str) -> Result<u64> {
     Ok(ring.current_epoch())
 }
 
+/// Outcome of a remote epoch key install attempt. Distinguishes the cases the
+/// caller needs to act on differently: idempotent re-delivery, conflicting
+/// content for a known epoch, future epoch we can't apply yet (caller buffers),
+/// and stale (older than current — silently dropped).
+#[derive(Debug, PartialEq, Eq)]
+pub enum InstallOutcome {
+    /// New epoch appended to the keyring on disk.
+    Installed,
+    /// Epoch already present with the same key bytes; no-op.
+    Idempotent,
+    /// Epoch is older than `current_epoch`; silently dropped.
+    Stale,
+    /// Epoch is more than one ahead of `current_epoch`; caller should buffer
+    /// and retry once the missing epochs have been installed.
+    Gap { have: u64, got: u64 },
+}
+
+/// Install a key for a specific epoch, received out-of-band (e.g. via a
+/// signed sealed-box rotation envelope from a manager). The keyring is loaded,
+/// inspected, and only mutated if `epoch == current_epoch + 1`. See
+/// [`InstallOutcome`] for the per-case behavior.
+pub fn install_epoch_key(
+    data_dir: &Path,
+    share_id: &str,
+    epoch: u64,
+    key: &Key,
+) -> Result<InstallOutcome> {
+    let mut ring = load_or_create_keyring(data_dir, share_id)?;
+    let current = ring.current_epoch();
+    if epoch == current {
+        let existing = ring
+            .key_for_epoch(epoch)
+            .expect("current_epoch always has a key");
+        if existing == key {
+            return Ok(InstallOutcome::Idempotent);
+        }
+        return Err(anyhow!(
+            "epoch {epoch} already populated with a different key"
+        ));
+    }
+    if epoch < current {
+        return Ok(InstallOutcome::Stale);
+    }
+    if epoch > current + 1 {
+        return Ok(InstallOutcome::Gap {
+            have: current,
+            got: epoch,
+        });
+    }
+    // epoch == current + 1: append.
+    ring.keys.push(*key);
+    save_keyring(data_dir, share_id, &ring)?;
+    Ok(InstallOutcome::Installed)
+}
+
 /// Encrypt with the keyring's current key. Output: `epoch(8 LE) ‖ nonce(24) ‖ ct ‖ tag(16)`.
 pub fn encrypt(ring: &KeyRing, plaintext: &[u8]) -> Result<Vec<u8>> {
     let epoch = ring.current_epoch();
@@ -236,5 +291,106 @@ mod tests {
         let ct = encrypt(&r1, b"secret").unwrap();
         // r2's epoch 1 key is different from r1's
         assert!(decrypt(&r2, &ct).is_err());
+    }
+
+    /// Minimal RAII temp dir for tests; deletes on drop. We avoid pulling in
+    /// the `tempdir` crate just for this.
+    struct TmpDir(PathBuf);
+    impl TmpDir {
+        fn new(label: &str) -> Self {
+            let mut nonce = [0u8; 16];
+            OsRng.fill_bytes(&mut nonce);
+            let suffix = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let p = std::env::temp_dir().join(format!("peerdup-{label}-{suffix}"));
+            std::fs::create_dir_all(&p).unwrap();
+            TmpDir(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fresh_ring_on_disk(share_id: &str) -> TmpDir {
+        let td = TmpDir::new("crypto");
+        // Bootstrap epoch 1.
+        let _ = load_or_create_keyring(td.path(), share_id).unwrap();
+        td
+    }
+
+    #[test]
+    fn install_epoch_key_appends_when_epoch_is_next() {
+        let td = fresh_ring_on_disk("share-install-1");
+        let new_key = [9u8; KEY_LEN];
+        let outcome =
+            install_epoch_key(td.path(), "share-install-1", 2, &new_key).unwrap();
+        assert_eq!(outcome, InstallOutcome::Installed);
+
+        let ring = load_or_create_keyring(td.path(), "share-install-1").unwrap();
+        assert_eq!(ring.current_epoch(), 2);
+        assert_eq!(ring.key_for_epoch(2).unwrap(), &new_key);
+    }
+
+    #[test]
+    fn install_epoch_key_idempotent_for_same_key() {
+        let td = fresh_ring_on_disk("share-install-2");
+        let ring = load_or_create_keyring(td.path(), "share-install-2").unwrap();
+        let epoch1_key = *ring.key_for_epoch(1).unwrap();
+
+        let outcome =
+            install_epoch_key(td.path(), "share-install-2", 1, &epoch1_key).unwrap();
+        assert_eq!(outcome, InstallOutcome::Idempotent);
+
+        // Disk unchanged: still single-epoch ring.
+        let ring2 = load_or_create_keyring(td.path(), "share-install-2").unwrap();
+        assert_eq!(ring2.current_epoch(), 1);
+    }
+
+    #[test]
+    fn install_epoch_key_rejects_overwrite() {
+        let td = fresh_ring_on_disk("share-install-3");
+        let mismatched = [0xABu8; KEY_LEN];
+        let err = install_epoch_key(td.path(), "share-install-3", 1, &mismatched)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("epoch 1 already populated"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn install_epoch_key_returns_gap_for_future_epoch() {
+        let td = fresh_ring_on_disk("share-install-4");
+        let key = [0x77u8; KEY_LEN];
+        let outcome =
+            install_epoch_key(td.path(), "share-install-4", 5, &key).unwrap();
+        assert_eq!(outcome, InstallOutcome::Gap { have: 1, got: 5 });
+
+        // Disk unchanged.
+        let ring = load_or_create_keyring(td.path(), "share-install-4").unwrap();
+        assert_eq!(ring.current_epoch(), 1);
+    }
+
+    #[test]
+    fn install_epoch_key_stale_is_noop() {
+        let td = fresh_ring_on_disk("share-install-5");
+        // Bump to epoch 2 by rotating.
+        let new_epoch = rotate_keyring(td.path(), "share-install-5").unwrap();
+        assert_eq!(new_epoch, 2);
+
+        let stale = [0x55u8; KEY_LEN];
+        let outcome =
+            install_epoch_key(td.path(), "share-install-5", 1, &stale).unwrap();
+        assert_eq!(outcome, InstallOutcome::Stale);
+
+        // Disk still has the original epoch-1 key (overwrite didn't happen).
+        let ring = load_or_create_keyring(td.path(), "share-install-5").unwrap();
+        assert_eq!(ring.current_epoch(), 2);
+        assert_ne!(ring.key_for_epoch(1).unwrap(), &stale);
     }
 }

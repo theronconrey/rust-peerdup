@@ -32,7 +32,7 @@ guesses, not commitments. Add 50% if part-time, double for "with surprises."
 | 5a. Invite/join via copy-paste tickets | ✅ Done |
 | 5b. Peer activity listing (`share peers`) | ✅ Done |
 | 5c. `p2panda-auth` group CRDT integration | ✅ Done (members/revoke CLI, gossip, signed ops, `auth.log` persistence) |
-| 5d. Auto key rotation on revocation | ⏳ TODO |
+| 5d. Auto key rotation on revocation | ✅ Done |
 | 5e. 4-peer revocation e2e test | ⏳ TODO |
 
 **Total to v1.0:** roughly 6–9 months of focused work, with phases 3–6 being

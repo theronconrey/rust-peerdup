@@ -70,8 +70,23 @@ stored in `<data_dir>/shares/<id>/auth.log` — bincode-encoded
 signature step or skip `apply_remote`'s `op.verify()` call when adding
 a new ingestion path; those are the only thing keeping a malicious
 peer from forging Add/Remove ops on the wire. Auth state and the
-encryption keyring are *separate*: revocation in 5c only updates
-membership, not keys — 5d will wire the rotation trigger.
+encryption keyring are *separate* — they're persisted under the same
+share dir but have independent lifecycles. Phase 5d wires the rotation
+trigger so a `Remove` op also produces a fresh epoch.
+
+### Revocation triggers a key rotation (Phase 5d)
+`share-revoke` does three things atomically on disk: (1) appends the
+`Remove` op to `auth.log`, (2) appends a fresh 32-byte epoch key to
+`keys.bin`, and (3) writes one signed sealed-box envelope per remaining
+member to `<data_dir>/shares/<id>/pending_rotations/<epoch>.bin`. The
+daemon picks the queued rotations up on next start and re-broadcasts
+them on each announce tick via `ShareMsg::KeyRotation`. Receivers
+verify the rotator is a current Owner in their local auth state,
+decrypt the envelope addressed to them, and `install_epoch_key` the
+result. Out-of-order arrivals are buffered in memory (capped at 64).
+The KEM is `crypto_box` (X25519 + XSalsa20-Poly1305) with the static
+recipient key derived from their Ed25519 identity; see
+`INTEGRATION_NOTES.md` "Phase 5d key distribution" for the tradeoff.
 
 ## How to build, test, run
 

@@ -5,6 +5,7 @@ mod daemon;
 mod data_dir;
 mod identity;
 mod lock;
+mod rotation;
 mod share;
 mod share_state;
 mod ticket;
@@ -93,10 +94,11 @@ enum Cmd {
     /// local replay of the share's auth log.
     ShareMembers { id: String },
     /// Revoke a member from a share's auth group. Authors a `Remove` op
-    /// signed with the local identity; the change propagates to other
-    /// peers via gossip on next daemon tick. Phase 5d will additionally
-    /// trigger an encryption-key rotation; for now this only updates the
-    /// membership CRDT.
+    /// signed with the local identity, then rotates the per-share keyring
+    /// (appending a fresh epoch) and queues one signed sealed-box envelope
+    /// per remaining member under `pending_rotations/`. The running daemon
+    /// picks up the queued rotation on next start and broadcasts it on
+    /// each gossip announce tick (Phase 5d).
     ShareRevoke {
         id: String,
         /// 64-char hex public key of the member to remove.
@@ -290,8 +292,39 @@ fn cmd_share_revoke(data_dir: PathBuf, id: String, peer_pubkey_hex: String) -> R
     }
     auth_state.remove_member(&identity, group_id, target)?;
     auth::save(&data_dir, &id, &auth_state)?;
+
+    // Phase 5d: rotate the per-share key and queue signed sealed-box envelopes
+    // for every remaining member. The daemon picks pending_rotations/ up on
+    // restart and broadcasts via gossip.
+    let mut remaining: Vec<auth::MemberId> = auth_state
+        .members(group_id)
+        .into_iter()
+        .map(|(m, _role)| m)
+        .filter(|m| *m != target)
+        .collect();
+    remaining.sort_by_key(|m| m.0);
+
+    let new_epoch = crypto::rotate_keyring(&data_dir, &id)?;
+    let new_key = {
+        let ring = crypto::load_or_create_keyring(&data_dir, &id)?;
+        *ring
+            .key_for_epoch(new_epoch)
+            .ok_or_else(|| anyhow!("rotated keyring missing epoch {new_epoch}"))?
+    };
+
+    let rotation_msg = rotation::build_signed_rotation(
+        &identity, new_epoch, &new_key, &remaining,
+    )?;
+    rotation::save_pending(&data_dir, &id, &rotation_msg)?;
+
     println!("Revoked {} from share {id}", peer_pubkey_hex);
-    println!("(running daemon will not see this change until restart; key rotation lands in 5d)");
+    println!("Rotated keyring to epoch {new_epoch}.");
+    println!(
+        "Distribution queued for {} remaining member{}.",
+        remaining.len(),
+        if remaining.len() == 1 { "" } else { "s" },
+    );
+    println!("(running daemon will not see this change until restart)");
     Ok(())
 }
 

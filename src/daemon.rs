@@ -1,6 +1,7 @@
-use crate::auth::{self, AuthState, SignedOp};
+use crate::auth::{self, AuthState, MemberId, SignedOp};
 use crate::clock::{ClockOrdering, VectorClock};
-use crate::crypto::{self, KeyRing};
+use crate::crypto::{self, InstallOutcome, KeyRing};
+use crate::rotation::{self, SignedRotation, VerifyOutcome};
 use crate::share::{ShareConfig, ShareRole};
 use crate::share_state::{self, PersistedState};
 use anyhow::{anyhow, Context, Result};
@@ -22,7 +23,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::RwLock;
 use tokio::task::JoinSet;
+
+/// Cap the in-memory buffer of out-of-order key rotations per share. 64 epochs
+/// is far more than expected; we evict the oldest if we somehow run past it.
+const ROTATION_BUFFER_CAP: usize = 64;
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "kind")]
@@ -61,6 +67,15 @@ enum ShareMsg {
     /// inner schema.
     #[serde(rename = "share_auth_ops")]
     AuthOps { ops: Vec<Vec<u8>> },
+    /// Phase 5d: a freshly-rotated epoch key, sealed once per remaining
+    /// member (sealed-box-style envelope). Rebroadcast on every announce
+    /// tick until the manager either confirms membership has stabilised or
+    /// removes the file from `pending_rotations/`. Receivers verify the
+    /// outer signature against `rotator_pubkey`, check that pubkey is a
+    /// current Owner in their local auth state, then decrypt the envelope
+    /// addressed to them and `install_epoch_key` the result.
+    #[serde(rename = "share_key_rotation")]
+    KeyRotation(SignedRotation),
 }
 
 fn auth_announce_bytes(state: &AuthState) -> Result<Vec<u8>> {
@@ -112,8 +127,10 @@ pub async fn serve(
     tracing::info!(peer_id = %peer_id_hex, share_count = configs.len(), "daemon starting");
 
     let address_book = AddressBook::builder().spawn().await?;
+    // We need the identity for both the endpoint and per-share key-rotation
+    // verification. Endpoint::builder takes by value; clone first.
     let endpoint = Endpoint::builder(address_book.clone())
-        .private_key(identity)
+        .private_key(identity.clone())
         .spawn()
         .await?;
     let _mdns = MdnsDiscovery::builder(address_book.clone(), endpoint.clone())
@@ -150,6 +167,7 @@ pub async fn serve(
         let gossip = gossip.clone();
         let data_dir = data_dir.clone();
         let peer_id_hex = peer_id_hex.clone();
+        let identity = identity.clone();
         let key = match crypto::load_or_create_keyring(&data_dir, &share_id) {
             Ok(k) => k,
             Err(e) => {
@@ -157,6 +175,7 @@ pub async fn serve(
                 continue;
             }
         };
+        let key = Arc::new(RwLock::new(key));
         let auth_state = match auth::load(&data_dir, &share_id) {
             Ok(s) => s,
             Err(e) => {
@@ -164,9 +183,26 @@ pub async fn serve(
                 continue;
             }
         };
+        let pending_rotations = match rotation::load_pending(&data_dir, &share_id) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = ?e, share_id = %share_id,
+                    "could not load pending rotations; continuing with empty queue");
+                Vec::new()
+            }
+        };
         tasks.spawn(async move {
             run_share(
-                config, session, gossip, bt_port, data_dir, peer_id_hex, key, auth_state,
+                config,
+                session,
+                gossip,
+                bt_port,
+                data_dir,
+                peer_id_hex,
+                identity,
+                key,
+                auth_state,
+                pending_rotations,
             )
             .await
             .with_context(|| format!("share {share_id} failed"))
@@ -249,8 +285,10 @@ async fn run_share(
     bt_port: u16,
     data_dir: PathBuf,
     peer_id_hex: String,
-    key: KeyRing,
+    identity: PrivateKey,
+    key: Arc<RwLock<KeyRing>>,
     auth_state: AuthState,
+    pending_rotations: Vec<SignedRotation>,
 ) -> Result<()> {
     let topic = TopicId::from(Hash::new(config.topic.as_bytes()));
     tracing::info!(
@@ -258,14 +296,52 @@ async fn run_share(
         topic = %config.topic,
         role = ?config.role,
         auth_ops = auth_state.ops().len(),
+        pending_rotations = pending_rotations.len(),
         "starting share"
     );
     match config.role {
-        ShareRole::Seed => seed_loop(config, session, gossip, topic, bt_port, data_dir, auth_state).await,
-        ShareRole::Leech => leech_loop(config, session, gossip, topic, data_dir, auth_state).await,
+        ShareRole::Seed => {
+            seed_loop(
+                config,
+                session,
+                gossip,
+                topic,
+                bt_port,
+                data_dir,
+                identity,
+                key,
+                auth_state,
+                pending_rotations,
+            )
+            .await
+        }
+        ShareRole::Leech => {
+            leech_loop(
+                config,
+                session,
+                gossip,
+                topic,
+                data_dir,
+                identity,
+                key,
+                auth_state,
+                pending_rotations,
+            )
+            .await
+        }
         ShareRole::Sync => {
             sync_loop(
-                config, session, gossip, topic, bt_port, data_dir, peer_id_hex, key, auth_state,
+                config,
+                session,
+                gossip,
+                topic,
+                bt_port,
+                data_dir,
+                peer_id_hex,
+                identity,
+                key,
+                auth_state,
+                pending_rotations,
             )
             .await
         }
@@ -279,7 +355,10 @@ async fn seed_loop(
     topic: TopicId,
     bt_port: u16,
     data_dir: PathBuf,
+    identity: PrivateKey,
+    key: Arc<RwLock<KeyRing>>,
     mut auth_state: AuthState,
+    pending_rotations: Vec<SignedRotation>,
 ) -> Result<()> {
     let root = config
         .root_path
@@ -321,6 +400,9 @@ async fn seed_loop(
     };
     let announce_bytes = serde_json::to_vec(&announce)?;
 
+    let group_id = auth::group_id_for(&config.id);
+    let mut rotation_buffer: Vec<SignedRotation> = Vec::new();
+
     let handle = gossip.stream(topic).await?;
     let mut sub = handle.subscribe();
     let mut tick = tokio::time::interval(Duration::from_secs(10));
@@ -334,6 +416,7 @@ async fn seed_loop(
                     tracing::warn!(share_id = %config.id, error = %e, "gossip publish failed");
                 }
                 publish_auth_ops(&handle, &auth_state, &config.id).await;
+                publish_pending_rotations(&handle, &pending_rotations, &config.id).await;
             }
             item = sub.next() => {
                 let Some(item) = item else { break };
@@ -347,12 +430,27 @@ async fn seed_loop(
                             tracing::warn!(error = ?e, share_id = %config.id, "auth apply failed");
                         }
                     }
+                    Ok(ShareMsg::KeyRotation(rot)) => {
+                        if let Err(e) = apply_key_rotation(
+                            rot,
+                            &auth_state,
+                            group_id,
+                            &identity,
+                            &key,
+                            &mut rotation_buffer,
+                            &data_dir,
+                            &config.id,
+                        ).await {
+                            tracing::warn!(error = ?e, share_id = %config.id, "key rotation handler failed");
+                        }
+                    }
                     Ok(ShareMsg::Announce { .. }) => {} // seeds ignore other peers' announces
                     Err(_) => {} // unknown payload, drop
                 }
             }
         }
     }
+    let _ = pending_rotations; // currently never mutated by seed loop, but plumbed for symmetry
     Err(anyhow!("seed gossip subscription ended"))
 }
 
@@ -362,7 +460,10 @@ async fn leech_loop(
     gossip: Gossip,
     topic: TopicId,
     data_dir: PathBuf,
+    identity: PrivateKey,
+    key: Arc<RwLock<KeyRing>>,
     mut auth_state: AuthState,
+    pending_rotations: Vec<SignedRotation>,
 ) -> Result<()> {
     let root = config.root_path.clone();
     tokio::fs::create_dir_all(&root)
@@ -374,9 +475,16 @@ async fn leech_loop(
         .to_string_lossy()
         .into_owned();
 
+    let group_id = auth::group_id_for(&config.id);
+    let mut rotation_buffer: Vec<SignedRotation> = Vec::new();
+
     let handle = gossip.stream(topic).await?;
     let mut sub = handle.subscribe();
     tracing::info!(share_id = %config.id, "subscribed; waiting for announce");
+
+    // Drain any pending rotations queued by the CLI on this peer (rare for a
+    // pure leech, but keep symmetry with sync_loop / seed_loop).
+    publish_pending_rotations(&handle, &pending_rotations, &config.id).await;
 
     while let Some(item) = sub.next().await {
         let payload = match item {
@@ -402,6 +510,21 @@ async fn leech_loop(
             ShareMsg::AuthOps { ops } => {
                 if let Err(e) = apply_auth_ops(&mut auth_state, ops, &data_dir, &config.id) {
                     tracing::warn!(error = ?e, share_id = %config.id, "auth apply failed");
+                }
+                continue;
+            }
+            ShareMsg::KeyRotation(rot) => {
+                if let Err(e) = apply_key_rotation(
+                    rot,
+                    &auth_state,
+                    group_id,
+                    &identity,
+                    &key,
+                    &mut rotation_buffer,
+                    &data_dir,
+                    &config.id,
+                ).await {
+                    tracing::warn!(error = ?e, share_id = %config.id, "key rotation handler failed");
                 }
                 continue;
             }
@@ -468,8 +591,10 @@ async fn sync_loop(
     bt_port: u16,
     data_dir: PathBuf,
     peer_id_hex: String,
-    key: KeyRing,
+    identity: PrivateKey,
+    key: Arc<RwLock<KeyRing>>,
     mut auth_state: AuthState,
+    pending_rotations: Vec<SignedRotation>,
 ) -> Result<()> {
     let root = config.root_path.clone();
     tokio::fs::create_dir_all(&root)
@@ -479,12 +604,17 @@ async fn sync_loop(
         .canonicalize()
         .with_context(|| format!("canonicalize {root:?}"))?;
 
+    let group_id = auth::group_id_for(&config.id);
+    let mut rotation_buffer: Vec<SignedRotation> = Vec::new();
+
     let topic_handle = gossip.stream(topic).await?;
     let mut sub = topic_handle.subscribe();
     tracing::info!(share_id = %config.id, root = %root.display(), "sync started");
 
-    let mut state =
-        reconcile_on_start(&config, &session, &root, &data_dir, &peer_id_hex, &key).await?;
+    let mut state = {
+        let k = key.read().await;
+        reconcile_on_start(&config, &session, &root, &data_dir, &peer_id_hex, &*k).await?
+    };
     if let Some(s) = &state {
         publish_sync_announce(&topic_handle, s, bt_port).await;
     }
@@ -498,7 +628,11 @@ async fn sync_loop(
     loop {
         tokio::select! {
             Some(()) = debounce(&mut watch_rx, Duration::from_millis(500)) => {
-                match handle_local_change(&config, &session, &root, &data_dir, &peer_id_hex, &key, state.as_ref()).await {
+                let outcome = {
+                    let k = key.read().await;
+                    handle_local_change(&config, &session, &root, &data_dir, &peer_id_hex, &*k, state.as_ref()).await
+                };
+                match outcome {
                     Ok(Some(new_state)) => {
                         tracing::info!(
                             share_id = %config.id,
@@ -518,6 +652,7 @@ async fn sync_loop(
                     publish_sync_announce(&topic_handle, s, bt_port).await;
                 }
                 publish_auth_ops(&topic_handle, &auth_state, &config.id).await;
+                publish_pending_rotations(&topic_handle, &pending_rotations, &config.id).await;
             }
             item = sub.next() => {
                 let Some(item) = item else { break };
@@ -535,6 +670,21 @@ async fn sync_loop(
                     ShareMsg::AuthOps { ops } => {
                         if let Err(e) = apply_auth_ops(&mut auth_state, ops, &data_dir, &config.id) {
                             tracing::warn!(error = ?e, share_id = %config.id, "auth apply failed");
+                        }
+                        continue;
+                    }
+                    ShareMsg::KeyRotation(rot) => {
+                        if let Err(e) = apply_key_rotation(
+                            rot,
+                            &auth_state,
+                            group_id,
+                            &identity,
+                            &key,
+                            &mut rotation_buffer,
+                            &data_dir,
+                            &config.id,
+                        ).await {
+                            tracing::warn!(error = ?e, share_id = %config.id, "key rotation handler failed");
                         }
                         continue;
                     }
@@ -593,7 +743,11 @@ async fn sync_loop(
                     peers = ?bt_endpoints,
                     "received remote announce; applying"
                 );
-                match apply_remote_sync(&session, &root, &info_hash, &remote_vhash, &remote_clock, remote_ts, &bt_endpoints, &key, state.as_ref()).await {
+                let apply_outcome = {
+                    let k = key.read().await;
+                    apply_remote_sync(&session, &root, &info_hash, &remote_vhash, &remote_clock, remote_ts, &bt_endpoints, &*k, state.as_ref()).await
+                };
+                match apply_outcome {
                     Ok(new_state) => {
                         if let Err(e) = persist(&data_dir, &config.id, &new_state) {
                             tracing::warn!(error = ?e, "could not persist state");
@@ -1168,4 +1322,193 @@ async fn publish_auth_ops(handle: &GossipHandle, auth_state: &AuthState, share_i
     if let Err(e) = handle.publish(bytes).await {
         tracing::warn!(error = %e, share_id = %share_id, "gossip publish (auth ops) failed");
     }
+}
+
+/// Re-broadcast all queued sealed-box rotations once per announce tick. Keeps
+/// peers that joined late (or were offline at revoke time) able to catch up.
+async fn publish_pending_rotations(
+    handle: &GossipHandle,
+    pending: &[SignedRotation],
+    share_id: &str,
+) {
+    for rot in pending {
+        let msg = ShareMsg::KeyRotation(rot.clone());
+        let bytes = match serde_json::to_vec(&msg) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, share_id = %share_id, epoch = rot.epoch,
+                    "encoding rotation failed");
+                continue;
+            }
+        };
+        if let Err(e) = handle.publish(bytes).await {
+            tracing::warn!(error = %e, share_id = %share_id, epoch = rot.epoch,
+                "gossip publish (rotation) failed");
+        }
+    }
+}
+
+/// Receive-side handler for `ShareMsg::KeyRotation`. Verifies, decrypts,
+/// installs the new epoch key, then drains any buffered out-of-order
+/// rotations whose dependencies are now satisfied.
+async fn apply_key_rotation(
+    rotation: SignedRotation,
+    auth_state: &AuthState,
+    group_id: MemberId,
+    identity: &PrivateKey,
+    key: &Arc<RwLock<KeyRing>>,
+    rotation_buffer: &mut Vec<SignedRotation>,
+    data_dir: &Path,
+    share_id: &str,
+) -> Result<()> {
+    match try_install_rotation(&rotation, auth_state, group_id, identity, key, data_dir, share_id)
+        .await?
+    {
+        AppliedOrBuffered::Applied => {
+            // Drain buffered rotations whose epochs are now installable.
+            drain_rotation_buffer(
+                auth_state, group_id, identity, key, rotation_buffer, data_dir, share_id,
+            )
+            .await;
+        }
+        AppliedOrBuffered::Idempotent | AppliedOrBuffered::Stale => {}
+        AppliedOrBuffered::Buffered => {
+            buffer_push(rotation_buffer, rotation);
+        }
+    }
+    Ok(())
+}
+
+enum AppliedOrBuffered {
+    Applied,
+    Idempotent,
+    Stale,
+    Buffered,
+}
+
+async fn try_install_rotation(
+    rotation: &SignedRotation,
+    auth_state: &AuthState,
+    group_id: MemberId,
+    identity: &PrivateKey,
+    key: &Arc<RwLock<KeyRing>>,
+    data_dir: &Path,
+    share_id: &str,
+) -> Result<AppliedOrBuffered> {
+    match rotation::verify_and_decrypt(rotation, auth_state, group_id, identity) {
+        VerifyOutcome::OkForUs(new_key) => {
+            let outcome =
+                crypto::install_epoch_key(data_dir, share_id, rotation.epoch, &new_key)
+                    .with_context(|| {
+                        format!(
+                            "installing rotation key for share {share_id} at epoch {}",
+                            rotation.epoch
+                        )
+                    })?;
+            match outcome {
+                InstallOutcome::Installed => {
+                    // Reload the on-disk keyring into the in-memory Arc so
+                    // subsequent encrypt/decrypt calls see the new epoch.
+                    let fresh = crypto::load_or_create_keyring(data_dir, share_id)
+                        .with_context(|| {
+                            format!("reloading keyring for share {share_id} after install")
+                        })?;
+                    *key.write().await = fresh;
+                    tracing::info!(
+                        share_id = %share_id,
+                        epoch = rotation.epoch,
+                        "installed rotated key"
+                    );
+                    Ok(AppliedOrBuffered::Applied)
+                }
+                InstallOutcome::Idempotent => {
+                    tracing::debug!(share_id = %share_id, epoch = rotation.epoch,
+                        "rotation already installed; ignoring");
+                    Ok(AppliedOrBuffered::Idempotent)
+                }
+                InstallOutcome::Stale => {
+                    tracing::debug!(share_id = %share_id, epoch = rotation.epoch,
+                        "rotation older than current epoch; ignoring");
+                    Ok(AppliedOrBuffered::Stale)
+                }
+                InstallOutcome::Gap { have, got } => {
+                    tracing::info!(share_id = %share_id, have, got,
+                        "rotation epoch ahead of local keyring; buffering");
+                    Ok(AppliedOrBuffered::Buffered)
+                }
+            }
+        }
+        VerifyOutcome::NotForUs => {
+            tracing::debug!(share_id = %share_id, epoch = rotation.epoch,
+                "rotation has no envelope for us; ignoring");
+            Ok(AppliedOrBuffered::Idempotent)
+        }
+        VerifyOutcome::NotAManager => {
+            tracing::warn!(share_id = %share_id, epoch = rotation.epoch,
+                rotator = %rotation.rotator_pubkey.to_hex(),
+                "rotation rejected: rotator is not a current manager");
+            Ok(AppliedOrBuffered::Idempotent)
+        }
+        VerifyOutcome::BadSignature => {
+            tracing::warn!(share_id = %share_id, epoch = rotation.epoch,
+                "rotation rejected: bad signature");
+            Ok(AppliedOrBuffered::Idempotent)
+        }
+        VerifyOutcome::DecryptFailed => {
+            tracing::warn!(share_id = %share_id, epoch = rotation.epoch,
+                "rotation rejected: decrypt failed");
+            Ok(AppliedOrBuffered::Idempotent)
+        }
+    }
+}
+
+async fn drain_rotation_buffer(
+    auth_state: &AuthState,
+    group_id: MemberId,
+    identity: &PrivateKey,
+    key: &Arc<RwLock<KeyRing>>,
+    rotation_buffer: &mut Vec<SignedRotation>,
+    data_dir: &Path,
+    share_id: &str,
+) {
+    loop {
+        if rotation_buffer.is_empty() {
+            return;
+        }
+        // Try installing the smallest-epoch buffered rotation. If it slots in,
+        // remove it and try the next; if it gaps again, leave it and stop.
+        rotation_buffer.sort_by_key(|r| r.epoch);
+        let candidate = rotation_buffer.remove(0);
+        match try_install_rotation(
+            &candidate, auth_state, group_id, identity, key, data_dir, share_id,
+        )
+        .await
+        {
+            Ok(AppliedOrBuffered::Applied)
+            | Ok(AppliedOrBuffered::Idempotent)
+            | Ok(AppliedOrBuffered::Stale) => continue,
+            Ok(AppliedOrBuffered::Buffered) => {
+                // Still gapped; put it back and stop draining.
+                buffer_push(rotation_buffer, candidate);
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, share_id = %share_id,
+                    "buffered rotation install errored; dropping");
+                continue;
+            }
+        }
+    }
+}
+
+/// Bounded push: drop the oldest (lowest-epoch) entry once the buffer fills.
+fn buffer_push(buf: &mut Vec<SignedRotation>, rot: SignedRotation) {
+    if buf.iter().any(|r| r.epoch == rot.epoch) {
+        return;
+    }
+    if buf.len() >= ROTATION_BUFFER_CAP {
+        buf.sort_by_key(|r| r.epoch);
+        buf.remove(0);
+    }
+    buf.push(rot);
 }

@@ -150,6 +150,85 @@ Could be unified later but unification touches `clock.rs` and
 `invitee_pubkey`. There is no migration path — v1 tickets fail to
 decode. Acceptable because no shipped builds had real users yet.
 
+## Phase 5d key distribution
+
+### KEM choice: `crypto_box` sealed-box construction
+Phase 5d distributes a freshly-rotated 32-byte share key to remaining members
+by sealing it once per recipient with `crypto_box` (`SalsaBox` =
+X25519 ECDH + XSalsa20-Poly1305). Each envelope carries a fresh
+ephemeral X25519 public key, a 24-byte nonce, and the 32-byte AEAD
+ciphertext + tag. The whole bundle (epoch + author + envelopes) is
+Ed25519-signed by the rotator using the same `identity.key` that drives
+the rest of peerdup's signing.
+
+The recipient's static X25519 public key is derived from their Ed25519
+identity via the standard `to_montgomery()` conversion (private side:
+`ed25519_dalek::SigningKey::to_scalar_bytes()`). This reuses the
+existing identity for KEM rather than introducing a separate X25519
+identity.
+
+**Tradeoff:** the same long-term key signs and decrypts. The Ed25519
+spec community generally prefers separate keys for signing vs. key
+agreement (see "On using the same key pair for Ed25519 and an X25519
+based KEM," Brendel et al. 2021). For peerdup v1 we accept this — the
+alternative (a separate X25519 pubkey on every ticket and gossip
+announce) doubles identity-management surface for marginal benefit
+given the rest of the threat model. Tracked as a possible later
+hardening.
+
+### Wire format
+On the wire, a rotation rides as `ShareMsg::KeyRotation(SignedRotation)`:
+
+```rust
+struct SignedRotation {
+    epoch: u64,
+    rotator_pubkey: MemberId,        // raw Ed25519 32 bytes
+    signature: [u8; 64],             // Ed25519 over canonical bytes below
+    envelopes: Vec<KeyEnvelope>,
+}
+struct KeyEnvelope {
+    recipient_pubkey: MemberId,
+    ephemeral_pubkey: [u8; 32],      // X25519
+    nonce: [u8; 24],                 // XSalsa20
+    ciphertext: Vec<u8>,             // 32 + 16 = 48 bytes (key + AEAD tag)
+}
+```
+
+Canonical bytes signed = `bincode((epoch, rotator_pubkey, envelopes))`
+with `bincode::config::standard()`. Field tuple ordering is part of the
+protocol — re-ordering invalidates every old signature.
+
+### Manager-at-receive-vantage looseness
+The receiver checks "rotator is currently an Owner" against *its* local
+auth state at the time of receiving the rotation. If a rotator was
+demoted between authoring the rotation and the receiver applying that
+demotion, it would still be accepted; conversely, a rotation
+authored before a demotion may be rejected if the demotion has already
+propagated. This is acceptable for v1: revocation cascades are rare
+and a rejected rotation is safe (it's just discarded), and the
+alternative (track each rotation's "auth-state-at-author-time") would
+require carrying an extra dependency vector on every rotation.
+
+### On-disk: `pending_rotations/`
+The CLI's `share-revoke` writes a per-rotation file at
+`<data_dir>/shares/<id>/pending_rotations/<epoch>.bin` (atomic
+tmp+rename, 0600 on Unix). The daemon loads all such files at start and
+re-broadcasts each one on every announce tick until the operator
+manually clears them. There's no automatic GC yet — a rotation
+recipient who has come back online and installed the new epoch
+will simply reply with `Idempotent` to subsequent re-broadcasts.
+
+### Receiver buffering for out-of-order epochs
+Rotations may arrive out of order (rare in practice; possible if two
+managers rotate concurrently or a rotator broadcasts faster than gossip
+propagates a previous one). Receivers maintain a per-share in-memory
+`rotation_buffer: Vec<SignedRotation>` capped at 64 entries
+(`ROTATION_BUFFER_CAP` in `daemon.rs`); arrivals whose `epoch >
+current_epoch + 1` get queued and re-tried in epoch order each time a
+new rotation slots in. Cap-overflow drops the oldest. The buffer is
+ephemeral (in-memory only); a daemon restart re-loads it from disk
+queue + lossy gossip catch-up.
+
 ## Things that look wrong but aren't
 
 Three things in `src/main.rs` are deliberate and should not be "fixed" without
