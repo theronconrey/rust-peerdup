@@ -50,29 +50,59 @@ p2panda, live in [`INTEGRATION_NOTES.md`](INTEGRATION_NOTES.md). Read it
 before making changes — the "Things that look wrong but aren't" section
 in particular saves an hour of unnecessary fixing.
 
-## Quick start
+## Install
+
+The repo ships a shell installer that builds a release binary, drops it
+at `~/.local/bin/rust-peerdup`, and installs a `systemd --user` unit:
 
 ```bash
-cargo build --release
+git clone https://github.com/theronconrey/rust-peerdup
+cd rust-peerdup
+./install.sh
+```
 
-# Set up a share on peer A:
-./target/release/rust-peerdup --data-dir ~/.peerdup-a \
-    share-add --topic mydemo --path ~/Sync/mydemo --role sync
+Re-run `install.sh` to upgrade in place. `./uninstall.sh` reverses both
+the binary and unit (and leaves your data directory alone).
 
-# Generate an invite (send the resulting string only over a secure channel):
-./target/release/rust-peerdup --data-dir ~/.peerdup-a \
-    share-invite <share-id>
+## Two-machine quick start
 
-# On peer B, import the share:
-./target/release/rust-peerdup --data-dir ~/.peerdup-b \
-    share-join <ticket-string> --path ~/Sync/mydemo
+Once installed on both machines (call them **A** and **B**):
 
-# Start daemons (different BT ports if on the same machine):
-./target/release/rust-peerdup --data-dir ~/.peerdup-a serve --bt-port 41000
-./target/release/rust-peerdup --data-dir ~/.peerdup-b serve --bt-port 41001
+```bash
+# 1. On B: print the public key so A can name you in the invite.
+rust-peerdup whoami
+#   prints:  d18c65e7…
+
+# 2. On A: create a share and invite B.
+rust-peerdup share-add --topic mydemo --path ~/Sync/mydemo --role sync
+SHARE_ID=$(rust-peerdup share-list | tail -1 | awk '{print $1}')
+rust-peerdup share-invite "$SHARE_ID" <B-pubkey-hex> --auth-role writer
+#   prints the ticket string. Send it to B over a secure channel.
+
+# 3. On B: consume the ticket.
+rust-peerdup share-join <ticket-string> --path ~/Sync/mydemo
+
+# 4. On both: start the daemon.
+systemctl --user enable --now peerdup
+journalctl --user -u peerdup -f       # watch sync events live
 ```
 
 Edits in either share root propagate within ~1–2 seconds.
+
+For two daemons on the **same** machine (e.g. local smoke testing),
+override the data dir and BT port to avoid collisions:
+
+```bash
+rust-peerdup --data-dir /tmp/peerdup-a serve --bt-port 41000 &
+rust-peerdup --data-dir /tmp/peerdup-b serve --bt-port 41001 &
+```
+
+Inspect membership and revoke peers:
+
+```bash
+rust-peerdup share-members <share-id>
+rust-peerdup share-revoke  <share-id> <peer-pubkey-hex>
+```
 
 ## Layout
 
@@ -84,10 +114,15 @@ src/
 ├── share_state.rs    Per-share runtime state (vhash, clock, manifest, timestamp)
 ├── clock.rs          VectorClock + ClockOrdering
 ├── crypto.rs         KeyRing + XChaCha20-Poly1305 encryption
+├── auth.rs           Membership CRDT (p2panda-auth) + signed op log
 ├── ticket.rs         Invite ticket encode/decode
 ├── identity.rs       Ed25519 identity load/persist
 ├── data_dir.rs       Path resolution
 └── lock.rs           Daemon exclusive-lock file
+
+systemd/peerdup.service  systemd user unit installed by install.sh
+install.sh               build + install (binary + unit)
+uninstall.sh             remove binary + unit (keeps data dir)
 ```
 
 Tests are in-module (`#[cfg(test)] mod tests`); run with `cargo test`.

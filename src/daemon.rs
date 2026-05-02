@@ -138,7 +138,8 @@ pub async fn serve(
     .await
     .context("creating librqbit session")?;
 
-    if configs.is_empty() {
+    let no_shares_at_start = configs.is_empty();
+    if no_shares_at_start {
         tracing::warn!("no shares configured; daemon will idle. Add some with `peerdup share-add`.");
     }
 
@@ -185,15 +186,18 @@ pub async fn serve(
                 }
                 break;
             }
-            joined = tasks.join_next() => {
+            joined = tasks.join_next(), if !tasks.is_empty() => {
                 match joined {
                     Some(Ok(Ok(()))) => tracing::info!("share task exited cleanly"),
                     Some(Ok(Err(e))) => tracing::error!(error = ?e, "share task returned error"),
                     Some(Err(e)) => tracing::error!(error = ?e, "share task join error"),
-                    None => {
-                        tracing::info!("all share tasks have finished");
-                        break;
-                    }
+                    // join_next() with !is_empty() guard means None is unreachable, but keep
+                    // the arm for type completeness.
+                    None => {}
+                }
+                if tasks.is_empty() && !no_shares_at_start {
+                    tracing::info!("all share tasks have finished");
+                    break;
                 }
             }
         }

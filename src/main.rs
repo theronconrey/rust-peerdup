@@ -30,8 +30,9 @@ enum Cmd {
     /// Run the daemon: bring up panda + librqbit, run all configured shares
     /// concurrently until SIGINT/SIGTERM.
     Serve {
-        /// BitTorrent listen port. Use distinct ports for two daemons on one machine.
-        #[arg(long)]
+        /// BitTorrent listen port. Defaults to 41000. Pick distinct ports
+        /// for two daemons on one machine.
+        #[arg(long, default_value_t = 41000)]
         bt_port: u16,
     },
     /// Add a new share. Writes to disk; a running daemon will not pick it up

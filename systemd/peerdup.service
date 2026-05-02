@@ -1,0 +1,14 @@
+[Unit]
+Description=peerdup folder sync daemon (Rust)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/rust-peerdup serve --bt-port 41000
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=rust_peerdup=info
+
+[Install]
+WantedBy=default.target
