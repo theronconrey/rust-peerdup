@@ -1,0 +1,25 @@
+# Minimal image for running a second `rust-peerdup` peer alongside a host
+# install. The host-built release binary is volume-mounted in at run time
+# (no rebuild needed when the source changes) so this image only carries
+# the runtime library deps the binary links against (openssl, glibc, zlib).
+#
+# Build:
+#   podman build -t rust-peerdup-peer -f containers/Containerfile .
+#
+# See containers/run-peer.sh for the run invocation.
+
+FROM fedora:44
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        openssl-libs ca-certificates \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# /data — peer's data dir (named-volume mounted)
+# /share — peer's share root (host bind-mount)
+# /usr/local/bin/rust-peerdup — host binary, volume-mounted
+WORKDIR /data
+ENV RUST_LOG=rust_peerdup=info
+
+ENTRYPOINT ["/usr/local/bin/rust-peerdup"]
+CMD ["--data-dir", "/data", "serve", "--bt-port", "41001"]
