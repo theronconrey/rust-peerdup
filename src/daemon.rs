@@ -1,9 +1,10 @@
-use crate::auth::{self, AuthState, MemberId, SignedOp};
+use crate::auth::{self, AuthRole, AuthState, MemberId, SignedOp};
 use crate::clock::{ClockOrdering, VectorClock};
 use crate::crypto::{self, InstallOutcome, KeyRing};
 use crate::rotation::{self, SignedRotation, VerifyOutcome};
 use crate::share::{ShareConfig, ShareRole};
 use crate::share_state::{self, PersistedState};
+use crate::ticket::{self, Ticket, TICKET_VERSION};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
@@ -17,13 +18,13 @@ use p2panda_net::iroh_mdns::MdnsDiscoveryMode;
 use p2panda_net::{AddressBook, Discovery, Endpoint, Gossip, MdnsDiscovery, TopicId};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::RwLock;
+use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::task::JoinSet;
 
 /// Cap the in-memory buffer of out-of-order key rotations per share. 64 epochs
@@ -78,6 +79,32 @@ enum ShareMsg {
     KeyRotation(SignedRotation),
 }
 
+/// Command sent from an IPC handler into the running share task. Each variant
+/// pairs a request with a `oneshot::Sender` for the reply, so per-share state
+/// (auth log, keyring, pending rotations) only mutates inside the share loop's
+/// own stack — no cross-task locking on the per-share data.
+pub enum ShareCommand {
+    Invite {
+        invitee: MemberId,
+        auth_role: AuthRole,
+        suggested_role: ShareRole,
+        reply: oneshot::Sender<Result<String /* base64 ticket */>>,
+    },
+    Revoke {
+        target: MemberId,
+        reply: oneshot::Sender<Result<u64 /* new_epoch */>>,
+    },
+    RotateKey {
+        reply: oneshot::Sender<Result<u64 /* new_epoch */>>,
+    },
+    Members {
+        reply: oneshot::Sender<Result<Vec<(MemberId, AuthRole)>>>,
+    },
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
+}
+
 fn auth_announce_bytes(state: &AuthState) -> Result<Vec<u8>> {
     let ops: Result<Vec<Vec<u8>>> = state.ops().iter().map(SignedOp::encode).collect();
     let msg = ShareMsg::AuthOps { ops: ops? };
@@ -117,22 +144,43 @@ fn apply_auth_ops(
     Ok(applied)
 }
 
-pub async fn serve(
+/// Process-wide handle on the running daemon's shared state. Constructed once
+/// in `serve()` and handed to both the share-task spawner and the D-Bus IPC
+/// surface. Per-share mutation runs inside the share loops; this struct only
+/// holds enough plumbing to spawn new ones and look up running ones.
+pub struct DaemonRuntime {
+    pub data_dir: PathBuf,
+    pub identity: PrivateKey,
+    pub bt_port: u16,
+    pub session: Arc<Session>,
+    pub gossip: Gossip,
+    /// `share_id -> mpsc tx for ShareCommand`. Populated when a share task is
+    /// spawned, removed on shutdown / `share-remove`.
+    pub shares: Arc<Mutex<HashMap<String, mpsc::Sender<ShareCommand>>>>,
+    /// All share tasks. The select loop in `serve()` polls this for
+    /// unexpected exits; the IPC layer pushes new tasks here on
+    /// `ShareAdd`/`ShareJoin`.
+    pub tasks: Arc<Mutex<JoinSet<Result<()>>>>,
+}
+
+/// Bring up the panda layer, the librqbit session, and an empty runtime.
+/// No share tasks have been spawned yet — the caller (typically `serve()`)
+/// loads the on-disk share configs and calls `spawn_share_task` for each.
+pub async fn start_runtime(
     data_dir: PathBuf,
     bt_port: u16,
     identity: PrivateKey,
-    configs: Vec<ShareConfig>,
-) -> Result<()> {
-    let peer_id_hex = identity.public_key().to_hex();
-    tracing::info!(peer_id = %peer_id_hex, share_count = configs.len(), "daemon starting");
-
+) -> Result<DaemonRuntime> {
     let address_book = AddressBook::builder().spawn().await?;
-    // We need the identity for both the endpoint and per-share key-rotation
-    // verification. Endpoint::builder takes by value; clone first.
     let endpoint = Endpoint::builder(address_book.clone())
         .private_key(identity.clone())
         .spawn()
         .await?;
+    // _mdns and _discovery are kept alive for the daemon's lifetime by being
+    // borrowed inside long-lived tasks they spawn. We currently don't need to
+    // address them explicitly; on a future shutdown path we'd hold them on
+    // the runtime to drop in order. For Phase 7 the JoinSet shutdown is the
+    // single source of "stop everything."
     let _mdns = MdnsDiscovery::builder(address_book.clone(), endpoint.clone())
         .mode(MdnsDiscoveryMode::Active)
         .spawn()
@@ -143,6 +191,13 @@ pub async fn serve(
     let gossip = Gossip::builder(address_book.clone(), endpoint.clone())
         .spawn()
         .await?;
+    // Leak the discovery handles into a background task so they live for the
+    // process lifetime — same shape as the pre-Phase-7 `_mdns` / `_discovery`
+    // bindings on `serve`'s stack.
+    tokio::spawn(async move {
+        let _hold = (_mdns, _discovery);
+        std::future::pending::<()>().await;
+    });
 
     let session = Session::new_with_opts(
         data_dir.clone(),
@@ -155,91 +210,200 @@ pub async fn serve(
     .await
     .context("creating librqbit session")?;
 
+    Ok(DaemonRuntime {
+        data_dir,
+        identity,
+        bt_port,
+        session,
+        gossip,
+        shares: Arc::new(Mutex::new(HashMap::new())),
+        tasks: Arc::new(Mutex::new(JoinSet::new())),
+    })
+}
+
+/// Spawn a share task for `config` and return the `mpsc::Sender<ShareCommand>`
+/// the IPC layer uses to drive it. The caller already holds the runtime's
+/// `tasks` lock (passed in to make the "check the shares map and spawn"
+/// pattern atomic without taking the lock twice).
+pub async fn spawn_share_task(
+    rt: &DaemonRuntime,
+    tasks_guard: &mut JoinSet<Result<()>>,
+    config: ShareConfig,
+) -> Result<mpsc::Sender<ShareCommand>> {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<ShareCommand>(32);
+    let key = match crypto::load_or_create_keyring(&rt.data_dir, &config.id) {
+        Ok(k) => Arc::new(RwLock::new(k)),
+        Err(e) => return Err(e.context("loading share keyring")),
+    };
+    let auth_state = match auth::load(&rt.data_dir, &config.id) {
+        Ok(s) => s,
+        Err(e) => return Err(e.context("loading auth log")),
+    };
+    let pending_rotations = match rotation::load_pending(&rt.data_dir, &config.id) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = ?e, share_id = %config.id,
+                "could not load pending rotations; continuing with empty queue");
+            Vec::new()
+        }
+    };
+    let session = rt.session.clone();
+    let gossip = rt.gossip.clone();
+    let identity = rt.identity.clone();
+    let data_dir = rt.data_dir.clone();
+    let bt_port = rt.bt_port;
+    let peer_id_hex = identity.public_key().to_hex();
+    let share_id_for_ctx = config.id.clone();
+
+    tasks_guard.spawn(async move {
+        run_share(
+            config,
+            session,
+            gossip,
+            bt_port,
+            data_dir,
+            peer_id_hex,
+            identity,
+            key,
+            auth_state,
+            pending_rotations,
+            cmd_rx,
+        )
+        .await
+        .with_context(|| format!("share {share_id_for_ctx} failed"))
+    });
+    Ok(cmd_tx)
+}
+
+/// Configure the daemon's runtime, spawn share tasks for every config on
+/// disk, and wait for shutdown. The IPC registration (Phase 7) is layered
+/// on top by the caller in `cmd_serve`.
+pub async fn serve(
+    data_dir: PathBuf,
+    bt_port: u16,
+    identity: PrivateKey,
+    configs: Vec<ShareConfig>,
+    register_dbus: bool,
+) -> Result<()> {
+    let peer_id_hex = identity.public_key().to_hex();
+    tracing::info!(peer_id = %peer_id_hex, share_count = configs.len(), "daemon starting");
+
+    let rt = Arc::new(start_runtime(data_dir, bt_port, identity).await?);
     let no_shares_at_start = configs.is_empty();
     if no_shares_at_start {
-        tracing::warn!("no shares configured; daemon will idle. Add some with `peerdup share-add`.");
+        tracing::warn!("no shares configured; daemon will idle. Add some with `peerdup share-add` (or via D-Bus).");
     }
 
-    let mut tasks: JoinSet<Result<()>> = JoinSet::new();
-    for config in configs {
-        let share_id = config.id.clone();
-        let session = session.clone();
-        let gossip = gossip.clone();
-        let data_dir = data_dir.clone();
-        let peer_id_hex = peer_id_hex.clone();
-        let identity = identity.clone();
-        let key = match crypto::load_or_create_keyring(&data_dir, &share_id) {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::error!(error = ?e, share_id = %share_id, "could not load share key");
-                continue;
-            }
-        };
-        let key = Arc::new(RwLock::new(key));
-        let auth_state = match auth::load(&data_dir, &share_id) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = ?e, share_id = %share_id, "could not load auth log");
-                continue;
-            }
-        };
-        let pending_rotations = match rotation::load_pending(&data_dir, &share_id) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!(error = ?e, share_id = %share_id,
-                    "could not load pending rotations; continuing with empty queue");
-                Vec::new()
-            }
-        };
-        tasks.spawn(async move {
-            run_share(
-                config,
-                session,
-                gossip,
-                bt_port,
-                data_dir,
-                peer_id_hex,
-                identity,
-                key,
-                auth_state,
-                pending_rotations,
-            )
-            .await
-            .with_context(|| format!("share {share_id} failed"))
-        });
-    }
-
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<&'static str>();
-    spawn_shutdown_watcher(shutdown_tx);
-
-    loop {
-        tokio::select! {
-            biased;
-            sig = &mut shutdown_rx => {
-                match sig {
-                    Ok(name) => tracing::info!(signal = name, "shutdown signal received"),
-                    Err(_) => tracing::warn!("shutdown watcher dropped without firing"),
+    {
+        let mut shares = rt.shares.lock().await;
+        let mut tasks = rt.tasks.lock().await;
+        for config in configs {
+            let share_id = config.id.clone();
+            match spawn_share_task(&rt, &mut tasks, config).await {
+                Ok(tx) => {
+                    shares.insert(share_id, tx);
                 }
-                break;
-            }
-            joined = tasks.join_next(), if !tasks.is_empty() => {
-                match joined {
-                    Some(Ok(Ok(()))) => tracing::info!("share task exited cleanly"),
-                    Some(Ok(Err(e))) => tracing::error!(error = ?e, "share task returned error"),
-                    Some(Err(e)) => tracing::error!(error = ?e, "share task join error"),
-                    // join_next() with !is_empty() guard means None is unreachable, but keep
-                    // the arm for type completeness.
-                    None => {}
-                }
-                if tasks.is_empty() && !no_shares_at_start {
-                    tracing::info!("all share tasks have finished");
-                    break;
+                Err(e) => {
+                    tracing::error!(error = ?e, share_id = %share_id,
+                        "could not spawn share task; skipping");
                 }
             }
         }
     }
 
+    // Optionally register on the session bus. We hold the connection so the
+    // bus name stays claimed for the daemon's lifetime; dropping it would
+    // un-register us.
+    let _dbus_conn: Option<zbus::Connection> = if register_dbus {
+        if crate::ipc::session_bus_likely_available() {
+            match crate::ipc::register(rt.clone()).await {
+                Ok(conn) => Some(conn),
+                Err(e) => {
+                    tracing::error!(error = ?e,
+                        "could not register on session bus; continuing without IPC");
+                    None
+                }
+            }
+        } else {
+            tracing::info!(
+                "no session bus detected (DBUS_SESSION_BUS_ADDRESS unset and \
+                 $XDG_RUNTIME_DIR/bus missing); running without D-Bus IPC"
+            );
+            None
+        }
+    } else {
+        None
+    };
+
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<&'static str>();
+    spawn_shutdown_watcher(shutdown_tx);
+
+    // The tasks lock is also held briefly by IPC handlers spawning new
+    // share tasks. To avoid blocking the IPC handler while we sit awaiting
+    // `join_next()`, we poll the JoinSet on a short timer and release the
+    // lock between polls. 250ms is fast enough that a freshly-started share
+    // task is observed almost immediately on its (rare) early exit, and
+    // long enough that the lock is not the bottleneck.
+    loop {
+        let join_outcome = {
+            let mut tasks = rt.tasks.lock().await;
+            if tasks.is_empty() {
+                None
+            } else {
+                // Try to drain at most one finished task non-blockingly.
+                let outcome = tokio::select! {
+                    biased;
+                    sig = &mut shutdown_rx => {
+                        match sig {
+                            Ok(name) => tracing::info!(signal = name, "shutdown signal received"),
+                            Err(_) => tracing::warn!("shutdown watcher dropped without firing"),
+                        }
+                        // Release the tasks lock before finish_shutdown
+                        // re-acquires it, otherwise we self-deadlock on
+                        // the async Mutex.
+                        drop(tasks);
+                        return finish_shutdown(rt.clone()).await;
+                    }
+                    joined = tasks.join_next() => Some(joined),
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => None,
+                };
+                outcome
+            }
+        };
+        match join_outcome {
+            Some(Some(Ok(Ok(())))) => tracing::info!("share task exited cleanly"),
+            Some(Some(Ok(Err(e)))) => tracing::error!(error = ?e, "share task returned error"),
+            Some(Some(Err(e))) => tracing::error!(error = ?e, "share task join error"),
+            Some(None) | None => {
+                // No-op tick; either nothing was waiting or the JoinSet was
+                // empty. Briefly yield so the IPC handlers can grab locks.
+                tokio::select! {
+                    biased;
+                    sig = &mut shutdown_rx => {
+                        match sig {
+                            Ok(name) => tracing::info!(signal = name, "shutdown signal received"),
+                            Err(_) => tracing::warn!("shutdown watcher dropped without firing"),
+                        }
+                        return finish_shutdown(rt.clone()).await;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                }
+            }
+        }
+
+        // If we started with shares but they've all exited (and no IPC
+        // registered any new ones), call it a day.
+        let shares_active = !rt.shares.lock().await.is_empty();
+        if !shares_active && !no_shares_at_start && !register_dbus {
+            tracing::info!("all share tasks have finished");
+            return finish_shutdown(rt.clone()).await;
+        }
+    }
+}
+
+async fn finish_shutdown(rt: Arc<DaemonRuntime>) -> Result<()> {
     tracing::info!("aborting remaining tasks");
+    let mut tasks = rt.tasks.lock().await;
     tasks.shutdown().await;
     Ok(())
 }
@@ -278,6 +442,7 @@ async fn wait_for_shutdown_signal() -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_share(
     config: ShareConfig,
     session: Arc<Session>,
@@ -289,6 +454,7 @@ async fn run_share(
     key: Arc<RwLock<KeyRing>>,
     auth_state: AuthState,
     pending_rotations: Vec<SignedRotation>,
+    cmd_rx: mpsc::Receiver<ShareCommand>,
 ) -> Result<()> {
     let topic = TopicId::from(Hash::new(config.topic.as_bytes()));
     tracing::info!(
@@ -312,6 +478,7 @@ async fn run_share(
                 key,
                 auth_state,
                 pending_rotations,
+                cmd_rx,
             )
             .await
         }
@@ -326,6 +493,7 @@ async fn run_share(
                 key,
                 auth_state,
                 pending_rotations,
+                cmd_rx,
             )
             .await
         }
@@ -342,12 +510,14 @@ async fn run_share(
                 key,
                 auth_state,
                 pending_rotations,
+                cmd_rx,
             )
             .await
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn seed_loop(
     config: ShareConfig,
     session: Arc<Session>,
@@ -358,7 +528,8 @@ async fn seed_loop(
     identity: PrivateKey,
     key: Arc<RwLock<KeyRing>>,
     mut auth_state: AuthState,
-    pending_rotations: Vec<SignedRotation>,
+    mut pending_rotations: Vec<SignedRotation>,
+    mut cmd_rx: mpsc::Receiver<ShareCommand>,
 ) -> Result<()> {
     let root = config
         .root_path
@@ -418,8 +589,21 @@ async fn seed_loop(
                 publish_auth_ops(&handle, &auth_state, &config.id).await;
                 publish_pending_rotations(&handle, &pending_rotations, &config.id).await;
             }
+            Some(cmd) = cmd_rx.recv() => {
+                if handle_share_command(
+                    cmd,
+                    &config,
+                    &data_dir,
+                    &identity,
+                    &key,
+                    &mut auth_state,
+                    &mut pending_rotations,
+                ).await {
+                    return Ok(());
+                }
+            }
             item = sub.next() => {
-                let Some(item) = item else { break };
+                let Some(item) = item else { break Ok(()) };
                 let payload = match item {
                     Ok(p) => p,
                     Err(e) => { tracing::debug!(error = %e, "gossip lag"); continue; }
@@ -450,10 +634,9 @@ async fn seed_loop(
             }
         }
     }
-    let _ = pending_rotations; // currently never mutated by seed loop, but plumbed for symmetry
-    Err(anyhow!("seed gossip subscription ended"))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn leech_loop(
     config: ShareConfig,
     session: Arc<Session>,
@@ -463,7 +646,8 @@ async fn leech_loop(
     identity: PrivateKey,
     key: Arc<RwLock<KeyRing>>,
     mut auth_state: AuthState,
-    pending_rotations: Vec<SignedRotation>,
+    mut pending_rotations: Vec<SignedRotation>,
+    mut cmd_rx: mpsc::Receiver<ShareCommand>,
 ) -> Result<()> {
     let root = config.root_path.clone();
     tokio::fs::create_dir_all(&root)
@@ -486,95 +670,115 @@ async fn leech_loop(
     // pure leech, but keep symmetry with sync_loop / seed_loop).
     publish_pending_rotations(&handle, &pending_rotations, &config.id).await;
 
-    while let Some(item) = sub.next().await {
-        let payload = match item {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(error = %e, "gossip subscription lag");
-                continue;
-            }
-        };
-        let msg = match serde_json::from_slice::<ShareMsg>(&payload) {
-            Ok(m) => m,
-            Err(_) => {
-                tracing::debug!("ignoring non-ShareMsg payload");
-                continue;
-            }
-        };
-        let (info_hash, bt_endpoints) = match msg {
-            ShareMsg::Announce {
-                info_hash,
-                bt_endpoints,
-                ..
-            } => (info_hash, bt_endpoints),
-            ShareMsg::AuthOps { ops } => {
-                if let Err(e) = apply_auth_ops(&mut auth_state, ops, &data_dir, &config.id) {
-                    tracing::warn!(error = ?e, share_id = %config.id, "auth apply failed");
-                }
-                continue;
-            }
-            ShareMsg::KeyRotation(rot) => {
-                if let Err(e) = apply_key_rotation(
-                    rot,
-                    &auth_state,
-                    group_id,
+    let mut completed = false;
+    loop {
+        tokio::select! {
+            Some(cmd) = cmd_rx.recv() => {
+                if handle_share_command(
+                    cmd,
+                    &config,
+                    &data_dir,
                     &identity,
                     &key,
-                    &mut rotation_buffer,
-                    &data_dir,
-                    &config.id,
+                    &mut auth_state,
+                    &mut pending_rotations,
                 ).await {
-                    tracing::warn!(error = ?e, share_id = %config.id, "key rotation handler failed");
+                    return Ok(());
                 }
-                continue;
             }
-        };
-        tracing::info!(
-            share_id = %config.id,
-            %info_hash,
-            peers = ?bt_endpoints,
-            "received announce"
-        );
-
-        let initial_peers: Vec<SocketAddr> = bt_endpoints
-            .iter()
-            .filter_map(|(host, port)| {
-                format!("{}:{}", host, port)
-                    .parse::<SocketAddr>()
-                    .map_err(|e| {
-                        tracing::warn!(host, port, error = %e, "skipping unparseable peer")
-                    })
-                    .ok()
-            })
-            .collect();
-        if initial_peers.is_empty() {
-            tracing::warn!("announce had no usable peers");
-            continue;
+            item = sub.next() => {
+                let Some(item) = item else { break };
+                let payload = match item {
+                    Ok(p) => p,
+                    Err(e) => { tracing::debug!(error = %e, "gossip subscription lag"); continue; }
+                };
+                let msg = match serde_json::from_slice::<ShareMsg>(&payload) {
+                    Ok(m) => m,
+                    Err(_) => { tracing::debug!("ignoring non-ShareMsg payload"); continue; }
+                };
+                match msg {
+                    ShareMsg::Announce { info_hash, bt_endpoints, .. } if !completed => {
+                        if let Err(e) = leech_apply_announce(
+                            &session, &root_string, &info_hash, &bt_endpoints, &config.id,
+                        ).await {
+                            tracing::warn!(error = ?e, share_id = %config.id, "leech apply failed");
+                        } else {
+                            completed = true;
+                        }
+                    }
+                    ShareMsg::Announce { .. } => {} // already done
+                    ShareMsg::AuthOps { ops } => {
+                        if let Err(e) = apply_auth_ops(&mut auth_state, ops, &data_dir, &config.id) {
+                            tracing::warn!(error = ?e, share_id = %config.id, "auth apply failed");
+                        }
+                    }
+                    ShareMsg::KeyRotation(rot) => {
+                        if let Err(e) = apply_key_rotation(
+                            rot,
+                            &auth_state,
+                            group_id,
+                            &identity,
+                            &key,
+                            &mut rotation_buffer,
+                            &data_dir,
+                            &config.id,
+                        ).await {
+                            tracing::warn!(error = ?e, share_id = %config.id, "key rotation handler failed");
+                        }
+                    }
+                }
+            }
         }
-
-        let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
-        let opts = AddTorrentOptions {
-            output_folder: Some(root_string.clone()),
-            initial_peers: Some(initial_peers),
-            overwrite: true,
-            ..Default::default()
-        };
-        let add = AddTorrent::from_url(magnet);
-        let torrent_handle = session
-            .add_torrent(add, Some(opts))
-            .await?
-            .into_handle()
-            .ok_or_else(|| anyhow!("add_torrent returned no handle"))?;
-        tracing::info!(share_id = %config.id, "added torrent, waiting for completion");
-
-        torrent_handle
-            .wait_until_completed()
-            .await
-            .context("wait_until_completed failed")?;
-        tracing::info!(share_id = %config.id, "download completed");
-        return Ok(());
+        if completed && cmd_rx.is_closed() {
+            break;
+        }
     }
-    Err(anyhow!("gossip subscription ended before any announce was seen"))
+    Ok(())
+}
+
+async fn leech_apply_announce(
+    session: &Arc<Session>,
+    root_string: &str,
+    info_hash: &str,
+    bt_endpoints: &[(String, u16)],
+    share_id: &str,
+) -> Result<()> {
+    tracing::info!(share_id = %share_id, %info_hash, peers = ?bt_endpoints,
+        "received announce");
+    let initial_peers: Vec<SocketAddr> = bt_endpoints
+        .iter()
+        .filter_map(|(host, port)| {
+            format!("{}:{}", host, port)
+                .parse::<SocketAddr>()
+                .map_err(|e| {
+                    tracing::warn!(host, port, error = %e, "skipping unparseable peer")
+                })
+                .ok()
+        })
+        .collect();
+    if initial_peers.is_empty() {
+        return Err(anyhow!("announce had no usable peers"));
+    }
+    let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
+    let opts = AddTorrentOptions {
+        output_folder: Some(root_string.to_string()),
+        initial_peers: Some(initial_peers),
+        overwrite: true,
+        ..Default::default()
+    };
+    let add = AddTorrent::from_url(magnet);
+    let torrent_handle = session
+        .add_torrent(add, Some(opts))
+        .await?
+        .into_handle()
+        .ok_or_else(|| anyhow!("add_torrent returned no handle"))?;
+    tracing::info!(share_id = %share_id, "added torrent, waiting for completion");
+    torrent_handle
+        .wait_until_completed()
+        .await
+        .context("wait_until_completed failed")?;
+    tracing::info!(share_id = %share_id, "download completed");
+    Ok(())
 }
 
 /// Bidirectional sync. Both peers run this for the same share.
@@ -583,6 +787,7 @@ async fn leech_loop(
 /// either direction converge. Concurrent edits (each peer ahead on a
 /// different counter) are detected and logged but not resolved — that's 3.4.
 /// File deletions don't propagate yet — also 3.4.
+#[allow(clippy::too_many_arguments)]
 async fn sync_loop(
     config: ShareConfig,
     session: Arc<Session>,
@@ -594,7 +799,8 @@ async fn sync_loop(
     identity: PrivateKey,
     key: Arc<RwLock<KeyRing>>,
     mut auth_state: AuthState,
-    pending_rotations: Vec<SignedRotation>,
+    mut pending_rotations: Vec<SignedRotation>,
+    mut cmd_rx: mpsc::Receiver<ShareCommand>,
 ) -> Result<()> {
     let root = config.root_path.clone();
     tokio::fs::create_dir_all(&root)
@@ -654,8 +860,21 @@ async fn sync_loop(
                 publish_auth_ops(&topic_handle, &auth_state, &config.id).await;
                 publish_pending_rotations(&topic_handle, &pending_rotations, &config.id).await;
             }
+            Some(cmd) = cmd_rx.recv() => {
+                if handle_share_command(
+                    cmd,
+                    &config,
+                    &data_dir,
+                    &identity,
+                    &key,
+                    &mut auth_state,
+                    &mut pending_rotations,
+                ).await {
+                    return Ok(());
+                }
+            }
             item = sub.next() => {
-                let Some(item) = item else { break };
+                let Some(item) = item else { break Ok(()) };
                 let payload = match item {
                     Ok(p) => p,
                     Err(e) => { tracing::debug!(error = %e, "gossip lag"); continue; }
@@ -760,7 +979,174 @@ async fn sync_loop(
             }
         }
     }
-    Err(anyhow!("gossip subscription ended"))
+}
+
+/// Dispatch a `ShareCommand` against the share-loop's owned state. Returns
+/// `true` iff the loop should exit (Shutdown).
+async fn handle_share_command(
+    cmd: ShareCommand,
+    config: &ShareConfig,
+    data_dir: &Path,
+    identity: &PrivateKey,
+    key: &Arc<RwLock<KeyRing>>,
+    auth_state: &mut AuthState,
+    pending_rotations: &mut Vec<SignedRotation>,
+) -> bool {
+    match cmd {
+        ShareCommand::Invite {
+            invitee,
+            auth_role,
+            suggested_role,
+            reply,
+        } => {
+            let result = handle_invite(
+                config,
+                data_dir,
+                identity,
+                key,
+                auth_state,
+                invitee,
+                auth_role,
+                suggested_role,
+            )
+            .await;
+            let _ = reply.send(result);
+            false
+        }
+        ShareCommand::Revoke { target, reply } => {
+            let result =
+                handle_revoke(config, data_dir, identity, key, auth_state, pending_rotations, target)
+                    .await;
+            let _ = reply.send(result);
+            false
+        }
+        ShareCommand::RotateKey { reply } => {
+            let result = handle_rotate_key(config, data_dir, key).await;
+            let _ = reply.send(result);
+            false
+        }
+        ShareCommand::Members { reply } => {
+            let group_id = auth::group_id_for(&config.id);
+            let mut members = auth_state.members(group_id);
+            members.sort_by_key(|(m, _)| m.0);
+            let _ = reply.send(Ok(members));
+            false
+        }
+        ShareCommand::Shutdown { reply } => {
+            let _ = reply.send(());
+            true
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_invite(
+    config: &ShareConfig,
+    data_dir: &Path,
+    identity: &PrivateKey,
+    key: &Arc<RwLock<KeyRing>>,
+    auth_state: &mut AuthState,
+    invitee: MemberId,
+    auth_role: AuthRole,
+    suggested_role: ShareRole,
+) -> Result<String> {
+    let group_id = auth::group_id_for(&config.id);
+    if auth_state.is_empty() {
+        return Err(anyhow!(
+            "share {} has no auth state on disk; can only invite from the creator's machine",
+            config.id
+        ));
+    }
+    if auth_state.is_member(group_id, invitee) {
+        return Err(anyhow!(
+            "{} is already a member of share {}",
+            invitee.to_hex(),
+            config.id
+        ));
+    }
+    auth_state.add_member(identity, group_id, invitee, auth_role)?;
+    auth::save(data_dir, &config.id, auth_state)?;
+
+    let exported = {
+        let k = key.read().await;
+        k.export_keys()
+    };
+    let ticket = Ticket {
+        version: TICKET_VERSION,
+        share_id: config.id.clone(),
+        topic: config.topic.clone(),
+        keys: exported,
+        auth_log: auth_state.ops().to_vec(),
+        invitee_pubkey: invitee.0,
+        role: suggested_role,
+    };
+    let _ = ticket::TICKET_VERSION; // touch to keep the import live
+    ticket.encode()
+}
+
+async fn handle_revoke(
+    config: &ShareConfig,
+    data_dir: &Path,
+    identity: &PrivateKey,
+    key: &Arc<RwLock<KeyRing>>,
+    auth_state: &mut AuthState,
+    pending_rotations: &mut Vec<SignedRotation>,
+    target: MemberId,
+) -> Result<u64> {
+    let group_id = auth::group_id_for(&config.id);
+    if auth_state.is_empty() {
+        return Err(anyhow!("share {} has no auth state on disk", config.id));
+    }
+    if !auth_state.is_member(group_id, target) {
+        return Err(anyhow!(
+            "{} is not a current member of share {}",
+            target.to_hex(),
+            config.id
+        ));
+    }
+    auth_state.remove_member(identity, group_id, target)?;
+    auth::save(data_dir, &config.id, auth_state)?;
+
+    let mut remaining: Vec<MemberId> = auth_state
+        .members(group_id)
+        .into_iter()
+        .map(|(m, _role)| m)
+        .filter(|m| *m != target)
+        .collect();
+    remaining.sort_by_key(|m| m.0);
+
+    let new_epoch = crypto::rotate_keyring(data_dir, &config.id)?;
+    let new_key_bytes = {
+        let ring = crypto::load_or_create_keyring(data_dir, &config.id)?;
+        *ring
+            .key_for_epoch(new_epoch)
+            .ok_or_else(|| anyhow!("rotated keyring missing epoch {new_epoch}"))?
+    };
+    // Reload the in-memory keyring so encrypt/decrypt sees the new epoch.
+    {
+        let fresh = crypto::load_or_create_keyring(data_dir, &config.id)?;
+        *key.write().await = fresh;
+    }
+
+    let rotation_msg =
+        rotation::build_signed_rotation(identity, new_epoch, &new_key_bytes, &remaining)?;
+    rotation::save_pending(data_dir, &config.id, &rotation_msg)?;
+    // Live broadcasting: append to the in-memory queue so the next announce
+    // tick picks it up (no daemon restart needed).
+    pending_rotations.push(rotation_msg);
+
+    Ok(new_epoch)
+}
+
+async fn handle_rotate_key(
+    config: &ShareConfig,
+    data_dir: &Path,
+    key: &Arc<RwLock<KeyRing>>,
+) -> Result<u64> {
+    let new_epoch = crypto::rotate_keyring(data_dir, &config.id)?;
+    let fresh = crypto::load_or_create_keyring(data_dir, &config.id)?;
+    *key.write().await = fresh;
+    Ok(new_epoch)
 }
 
 #[derive(Debug, Clone)]
@@ -1136,6 +1522,7 @@ async fn create_and_add_shadow_torrent(
     Ok((info_hash, handle.id()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_remote_sync(
     session: &Arc<Session>,
     root: &Path,
@@ -1511,4 +1898,109 @@ fn buffer_push(buf: &mut Vec<SignedRotation>, rot: SignedRotation) {
         buf.remove(0);
     }
     buf.push(rot);
+}
+
+#[cfg(test)]
+mod tests {
+    //! Per-share IPC handler tests. Each test builds a tempdir, creates a
+    //! fresh share with this peer as Owner, then exercises the
+    //! `handle_invite`/`handle_revoke`/`handle_rotate_key` functions
+    //! directly (no D-Bus, no JoinSet) so we can assert on the on-disk
+    //! and in-memory side-effects.
+
+    use super::*;
+    use crate::auth::{group_id_for, AuthRole, AuthState, MemberId};
+    use crate::crypto;
+    use crate::share::{ShareConfig, ShareRole};
+
+    struct TmpDir(PathBuf);
+    impl TmpDir {
+        fn new(label: &str) -> Self {
+            let nonce: u64 = rand::random();
+            let p = std::env::temp_dir()
+                .join(format!("peerdup-ipc-{label}-{nonce:016x}"));
+            std::fs::create_dir_all(&p).unwrap();
+            TmpDir(p)
+        }
+        fn path(&self) -> &Path { &self.0 }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn me_of(k: &PrivateKey) -> MemberId { MemberId(*k.public_key().as_bytes()) }
+
+    fn bootstrap(label: &str) -> (TmpDir, ShareConfig, PrivateKey, AuthState, Arc<RwLock<KeyRing>>) {
+        let td = TmpDir::new(label);
+        let identity = PrivateKey::new();
+        let topic = format!("topic-{label}");
+        let config = ShareConfig::new(topic, td.path().join("share-root"), ShareRole::Sync);
+        config.save(td.path()).unwrap();
+        let group = group_id_for(&config.id);
+        let mut auth_state = AuthState::empty();
+        auth_state.create_group(&identity, group).unwrap();
+        auth::save(td.path(), &config.id, &auth_state).unwrap();
+        let ring = crypto::load_or_create_keyring(td.path(), &config.id).unwrap();
+        (td, config, identity, auth_state, Arc::new(RwLock::new(ring)))
+    }
+
+    #[tokio::test]
+    async fn invite_handler_appends_op_and_returns_ticket() {
+        let (td, config, identity, mut auth_state, key) = bootstrap("invite-1");
+        let bob = PrivateKey::new();
+        let ticket = handle_invite(
+            &config, td.path(), &identity, &key, &mut auth_state,
+            me_of(&bob), AuthRole::Writer, ShareRole::Sync,
+        ).await.unwrap();
+        assert!(!ticket.is_empty(), "ticket must not be empty");
+
+        // Auth log on disk should now contain Create + Add.
+        let reloaded = auth::load(td.path(), &config.id).unwrap();
+        assert_eq!(reloaded.ops().len(), 2);
+        let group = group_id_for(&config.id);
+        assert!(reloaded.is_member(group, me_of(&bob)));
+    }
+
+    #[tokio::test]
+    async fn revoke_handler_rotates_keyring_and_writes_pending() {
+        let (td, config, identity, mut auth_state, key) = bootstrap("revoke-1");
+        let bob = PrivateKey::new();
+        // First add bob.
+        handle_invite(
+            &config, td.path(), &identity, &key, &mut auth_state,
+            me_of(&bob), AuthRole::Writer, ShareRole::Sync,
+        ).await.unwrap();
+
+        let mut pending = Vec::new();
+        let new_epoch = handle_revoke(
+            &config, td.path(), &identity, &key, &mut auth_state, &mut pending,
+            me_of(&bob),
+        ).await.unwrap();
+        assert_eq!(new_epoch, 2);
+
+        // Pending in-memory queue should have one entry; on disk too.
+        assert_eq!(pending.len(), 1);
+        let on_disk = rotation::load_pending(td.path(), &config.id).unwrap();
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].epoch, 2);
+
+        // Keyring on disk must have grown.
+        let ring = crypto::load_or_create_keyring(td.path(), &config.id).unwrap();
+        assert_eq!(ring.current_epoch(), 2);
+
+        // The in-memory keyring (held via Arc<RwLock<...>>) must have the
+        // new epoch too.
+        assert_eq!(key.read().await.current_epoch(), 2);
+    }
+
+    #[tokio::test]
+    async fn rotate_key_handler_appends_epoch() {
+        let (td, config, _identity, _auth_state, key) = bootstrap("rotate-1");
+        assert_eq!(key.read().await.current_epoch(), 1);
+        let new_epoch = handle_rotate_key(&config, td.path(), &key).await.unwrap();
+        assert_eq!(new_epoch, 2);
+        assert_eq!(key.read().await.current_epoch(), 2);
+    }
 }

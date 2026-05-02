@@ -43,7 +43,8 @@ writing:
 | 5c. `p2panda-auth` group CRDT integration | ✅ Done |
 | 5d. Auto key rotation on revocation | ✅ Done |
 | 5e. 4-peer revocation e2e test | ✅ Done |
-| 6+ | Per ROADMAP.md |
+| 7. D-Bus IPC surface | ✅ Done (CLI talks to the daemon over `org.peerdup.Daemon1` on the session bus) |
+| 6, 8+ | Per ROADMAP.md |
 
 Detailed design notes, including non-obvious gotchas about librqbit and
 p2panda, live in [`INTEGRATION_NOTES.md`](INTEGRATION_NOTES.md). Read it
@@ -104,12 +105,45 @@ rust-peerdup share-members <share-id>
 rust-peerdup share-revoke  <share-id> <peer-pubkey-hex>
 ```
 
+## D-Bus IPC
+
+Since Phase 7, the daemon exposes its API on the user session bus as
+`org.peerdup.Daemon1` at `/org/peerdup/Daemon1`. Client CLI subcommands
+default to talking to the running daemon over D-Bus. With the activation
+file (`~/.local/share/dbus-1/services/org.peerdup.Daemon1.service`,
+installed by `install.sh`) the daemon auto-starts on first call — no
+manual `systemctl --user start` needed.
+
+```bash
+busctl --user list | grep peerdup        # daemon registered?
+busctl --user introspect org.peerdup.Daemon1 /org/peerdup/Daemon1
+```
+
+The `--data-dir` flag has dual semantics in Phase 7:
+
+- With `serve`: tells the daemon where to keep state.
+- With a client subcommand: opts the CLI out of D-Bus entirely and
+  performs the operation directly against the on-disk state. Useful
+  for headless test rigs (the container peers in `tests/e2e-revoke.sh`
+  run this way), and matches the Phase 2–6 behaviour. The "running
+  daemon will not see this change until restart" caveat from the older
+  phases applies in this mode.
+- With no flag: routes through D-Bus, and the running daemon picks up
+  changes live.
+
+When no session bus is detected at `serve` time (no
+`DBUS_SESSION_BUS_ADDRESS` and no `$XDG_RUNTIME_DIR/bus`), the daemon
+auto-skips IPC registration and runs in legacy mode without surface
+churn — the container test rig depends on this.
+
 ## Layout
 
 ```
 src/
 ├── main.rs           CLI: parsing, dispatch
-├── daemon.rs         Per-share sync_loop, JoinSet, signal handling
+├── daemon.rs         DaemonRuntime, per-share sync_loop, JoinSet, ShareCommand dispatch
+├── ipc.rs            org.peerdup.Daemon1 D-Bus interface (Phase 7)
+├── client.rs         Thin DaemonClient wrapping zbus::Proxy (Phase 7)
 ├── share.rs          ShareConfig, ShareRole, on-disk layout
 ├── share_state.rs    Per-share runtime state (vhash, clock, manifest, timestamp)
 ├── clock.rs          VectorClock + ClockOrdering
@@ -121,9 +155,10 @@ src/
 ├── data_dir.rs       Path resolution
 └── lock.rs           Daemon exclusive-lock file
 
-systemd/rust-peerdup.service  systemd user unit installed by install.sh
-install.sh               build + install (binary + unit)
-uninstall.sh             remove binary + unit (keeps data dir)
+systemd/rust-peerdup.service       systemd user unit installed by install.sh
+dbus-1/org.peerdup.Daemon1.service D-Bus session activation file
+install.sh                          build + install (binary + unit + activation)
+uninstall.sh                        remove binary + unit + activation (keeps data dir)
 ```
 
 Tests are in-module (`#[cfg(test)] mod tests`); run with `cargo test`.

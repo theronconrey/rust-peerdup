@@ -78,15 +78,41 @@ trigger so a `Remove` op also produces a fresh epoch.
 `share-revoke` does three things atomically on disk: (1) appends the
 `Remove` op to `auth.log`, (2) appends a fresh 32-byte epoch key to
 `keys.bin`, and (3) writes one signed sealed-box envelope per remaining
-member to `<data_dir>/shares/<id>/pending_rotations/<epoch>.bin`. The
-daemon picks the queued rotations up on next start and re-broadcasts
-them on each announce tick via `ShareMsg::KeyRotation`. Receivers
-verify the rotator is a current Owner in their local auth state,
-decrypt the envelope addressed to them, and `install_epoch_key` the
-result. Out-of-order arrivals are buffered in memory (capped at 64).
-The KEM is `crypto_box` (X25519 + XSalsa20-Poly1305) with the static
-recipient key derived from their Ed25519 identity; see
-`INTEGRATION_NOTES.md` "Phase 5d key distribution" for the tradeoff.
+member to `<data_dir>/shares/<id>/pending_rotations/<epoch>.bin`. Since
+Phase 7 the running daemon's revoke handler also pushes the rotation
+into the in-memory `pending_rotations` vector so the next 10-second
+announce tick broadcasts it without a daemon restart. Receivers verify
+the rotator is a current Owner in their local auth state, decrypt the
+envelope addressed to them, and `install_epoch_key` the result.
+Out-of-order arrivals are buffered in memory (capped at 64). The KEM is
+`crypto_box` (X25519 + XSalsa20-Poly1305) with the static recipient key
+derived from their Ed25519 identity; see `INTEGRATION_NOTES.md`
+"Phase 5d key distribution" for the tradeoff.
+
+### CLI talks to daemon over D-Bus (Phase 7)
+The CLI dispatches to `org.peerdup.Daemon1` on the session bus at
+`/org/peerdup/Daemon1` by default. An activation `.service` file
+installed at `~/.local/share/dbus-1/services/` lets the bus auto-start
+the daemon on first call. `--data-dir` has dual semantics: with `serve`
+it sets the daemon's data dir, with a client subcommand it opts out of
+D-Bus and runs directly on disk (the container test rig depends on
+this). When the daemon comes up without a session bus available
+(`DBUS_SESSION_BUS_ADDRESS` unset and `$XDG_RUNTIME_DIR/bus` missing),
+it logs a single info line and runs without IPC; this keeps headless
+container peers working without Containerfile churn.
+
+The IPC surface has no auth gate beyond the session bus's user scoping
+— anyone with access to the user's bus can invoke any method. Acceptable
+for v1 since the data dir already has the same scope; if a multi-user
+or polkit-gated story becomes necessary, the gate is added in
+`src/ipc.rs::Daemon1Iface`.
+
+Per-share state mutations (`auth_state`, `keyring`, `pending_rotations`)
+flow through the share loop's `mpsc::Sender<ShareCommand>` and are
+serialised on the share task's stack. The IPC dispatcher only holds
+the `runtime.shares` lock long enough to look up the sender; reads
+that don't need a per-share task (`Whoami`, `ShareList`, `SharePeers`)
+go directly off `runtime.data_dir` from disk.
 
 ## How to build, test, run
 

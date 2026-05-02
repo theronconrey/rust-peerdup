@@ -13,8 +13,10 @@ set -euo pipefail
 
 BIN_DIR="$HOME/.local/bin"
 UNIT_DIR="$HOME/.config/systemd/user"
+DBUS_DIR="$HOME/.local/share/dbus-1/services"
 BIN_NAME="rust-peerdup"
 UNIT_NAME="rust-peerdup.service"
+DBUS_SERVICE_NAME="org.peerdup.Daemon1.service"
 
 info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()    { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
@@ -34,6 +36,11 @@ fi
 if [ -f "$UNIT_DIR/$UNIT_NAME" ]; then
     rm -f "$UNIT_DIR/$UNIT_NAME"
     ok "Removed $UNIT_DIR/$UNIT_NAME"
+fi
+
+if [ -f "$DBUS_DIR/$DBUS_SERVICE_NAME" ]; then
+    rm -f "$DBUS_DIR/$DBUS_SERVICE_NAME"
+    ok "Removed $DBUS_DIR/$DBUS_SERVICE_NAME"
 fi
 
 if [ -x "$BIN_DIR/$BIN_NAME" ] || [ -L "$BIN_DIR/$BIN_NAME" ]; then

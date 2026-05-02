@@ -45,6 +45,18 @@ PORTS=(41001 41002 41003)
 TOPIC="e2e-revoke-${RUN_ID}"
 BIN="${REPO_ROOT}/target/release/rust-peerdup"
 
+# Phase 7 toggle (off by default). When set to 1, host-side peerdup
+# invocations skip --data-dir overrides and route through the running
+# daemon's session bus, exercising the IPC path alongside the gossip
+# convergence test. Currently a stub: the focused IPC coverage lives in
+# tests/e2e-dbus.sh; flipping this on while the activation file still
+# points at $DATA_A is a future refinement (would need wired-up bus
+# activation per-test data dir, which conflicts with a host install).
+USE_DBUS="${PEERDUP_E2E_USE_DBUS:-0}"
+if [ "$USE_DBUS" = "1" ]; then
+    printf '\033[1;33m warn\033[0m PEERDUP_E2E_USE_DBUS=1 is reserved for a future refinement; using direct on-disk path for this run.\n' >&2
+fi
+
 declare -A DATA_DIR SHARE_DIR PUBKEY
 for p in "${PEERS[@]}"; do
     DATA_DIR[$p]="/tmp/peerdup-e2e-${p}-${RUN_ID}-data"

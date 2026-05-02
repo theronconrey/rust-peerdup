@@ -229,6 +229,77 @@ new rotation slots in. Cap-overflow drops the oldest. The buffer is
 ephemeral (in-memory only); a daemon restart re-loads it from disk
 queue + lossy gossip catch-up.
 
+## Phase 7: D-Bus IPC
+
+### `zbus` 5 + tokio interop is gated behind a feature flag
+`zbus = { version = "5", default-features = false, features = ["tokio"] }`
+in `Cargo.toml`. The default features pull `async-io`, which adds a
+second async runtime to the binary alongside tokio; the resulting binary
+runs but has two reactors competing. The `tokio` feature is
+load-bearing; do not relax `default-features = false` in a refactor.
+
+### Method names: snake_case in Rust, PascalCase on the wire
+zbus exposes a method named `share_add` in Rust as `ShareAdd` on the
+bus, matching the `nmcli`/`firewall-cmd` convention that Fedora users
+expect. The proxy on the client side has to call it as `ShareAdd`
+(see `src/client.rs`). If you add a new method, do the snake_case in
+Rust and it'll auto-convert; the wire-name mismatch only bites if you
+rename existing methods.
+
+### Activation file and how the bus picks it up
+`~/.local/share/dbus-1/services/org.peerdup.Daemon1.service` tells
+`dbus-broker` (or classic `dbus-daemon`) "if anyone calls a method on
+`org.peerdup.Daemon1` and no one currently owns that name, start the
+process specified in `Exec=` and wait for it to claim the name." We
+delegate to `SystemdService=rust-peerdup.service` so the activation
+goes through the existing systemd user unit (so the unit's
+`Restart=on-failure`, environment vars, and `journalctl --user` story
+all keep working). The bus reads the directory list at startup, not
+per-call — `dbus-broker` supports `org.freedesktop.DBus.ReloadConfig`
+to pick up new files without a session restart; classic `dbus-daemon`
+needs a session bus restart. Most distro defaults are `dbus-broker`
+now, so install-and-call works without restart.
+
+### `--data-dir` has dual semantics
+On Phase 7 client subcommands, `--data-dir` is the explicit "run
+directly against disk, skip D-Bus" toggle. This is a deviation from
+the original Phase 7 plan (which proposed a hard-error) chosen so the
+existing container test rig in `tests/e2e-revoke.sh` keeps working
+unchanged — the containers run with `--network host` and no session
+bus, and their CLIs invoke against the same data dir as their detached
+daemon. With the dual-mode flag, those tests don't need rewriting.
+The `serve` subcommand still treats `--data-dir` as the daemon's
+state-directory override.
+
+### Auto-detect missing session bus
+`crate::ipc::session_bus_likely_available` checks for
+`DBUS_SESSION_BUS_ADDRESS` and falls back to `$XDG_RUNTIME_DIR/bus`.
+Container daemons running with `--network host` typically have neither
+(systemd's user manager doesn't run in the container, and the host's
+abstract socket isn't reachable through the container's private mount
+namespace), so the daemon auto-skips IPC registration and runs in
+"legacy on-disk only" mode. This is the path the container peers in
+`tests/e2e-revoke.sh` exercise.
+
+### Per-share serialization point
+Each share task owns its `auth_state`, `keyring` (behind `Arc<RwLock>`,
+shared with the encrypt/decrypt paths only), and `pending_rotations`.
+IPC method handlers send `ShareCommand` variants over an
+`mpsc::Sender<ShareCommand>` and await a `oneshot::Receiver` for the
+reply. This means two CLI invocations for the same share serialize
+naturally on the channel; cross-share calls run in parallel because
+each share has its own channel. The `runtime.shares` and `runtime.tasks`
+locks are held only briefly (around lookup and spawn).
+
+### Live revocation broadcasting
+Phase 5d's revoke wrote `pending_rotations/<epoch>.bin` and depended on
+a daemon restart to pick it up on the next start. Phase 7's
+`handle_revoke` additionally pushes the new `SignedRotation` onto the
+in-memory `pending_rotations` vector that the share loop's announce-tick
+arm reads, so the rotation goes out on the next 10-second tick without
+a restart. The on-disk write is still done so a daemon crash during
+the broadcast tick doesn't lose the rotation.
+
 ## Things that look wrong but aren't
 
 Three things in `src/main.rs` are deliberate and should not be "fixed" without

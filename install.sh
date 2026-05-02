@@ -15,8 +15,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 UNIT_DIR="$HOME/.config/systemd/user"
+DBUS_DIR="$HOME/.local/share/dbus-1/services"
 BIN_NAME="rust-peerdup"
 UNIT_NAME="rust-peerdup.service"
+DBUS_SERVICE_NAME="org.peerdup.Daemon1.service"
 
 info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()    { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
@@ -27,6 +29,7 @@ die()   { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ -f "$REPO_ROOT/Cargo.toml" ] || die "must run from the rust-peerdup repo root (no Cargo.toml here)"
 [ -f "$REPO_ROOT/systemd/$UNIT_NAME" ] || die "missing $REPO_ROOT/systemd/$UNIT_NAME"
+[ -f "$REPO_ROOT/dbus-1/$DBUS_SERVICE_NAME" ] || die "missing $REPO_ROOT/dbus-1/$DBUS_SERVICE_NAME"
 
 if ! command -v cargo >/dev/null 2>&1; then
     if [ -f "$HOME/.cargo/env" ]; then
@@ -64,6 +67,12 @@ if command -v systemctl >/dev/null 2>&1; then
     ok "systemd user daemon-reloaded"
 fi
 
+# ── install D-Bus session activation file ────────────────────────────────────
+
+mkdir -p "$DBUS_DIR"
+install -m 0644 "$REPO_ROOT/dbus-1/$DBUS_SERVICE_NAME" "$DBUS_DIR/$DBUS_SERVICE_NAME"
+ok "Installed $DBUS_DIR/$DBUS_SERVICE_NAME"
+
 # ── PATH check ───────────────────────────────────────────────────────────────
 
 if ! printf '%s' ":$PATH:" | grep -q ":$BIN_DIR:"; then
@@ -95,7 +104,17 @@ Quick reference:
   Inspect membership:
       $BIN_NAME share-members <share-id>
 
-  Run the daemon as a systemd user service:
+The daemon now exposes its API on the user session bus as
+\`org.peerdup.Daemon1\`. With the activation file installed above, calling
+any CLI subcommand will auto-start the daemon if it isn't already running.
+
+  Verify activation is registered:
+      busctl --user list | grep peerdup
+
+  Inspect the API:
+      busctl --user introspect org.peerdup.Daemon1 /org/peerdup/Daemon1
+
+You can still enable the systemd unit so the daemon starts on login:
       systemctl --user enable --now rust-peerdup
       journalctl --user -u rust-peerdup -f    # follow logs
       systemctl --user stop rust-peerdup      # stop
