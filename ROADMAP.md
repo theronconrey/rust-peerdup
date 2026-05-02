@@ -369,10 +369,10 @@ platform-appropriate location:
 ```rust
 use directories::ProjectDirs;
 
-let dirs = ProjectDirs::from("", "peerdup", "peerdup")
+let dirs = ProjectDirs::from("", "rust-peerdup", "rust-peerdup")
     .ok_or_else(|| anyhow!("can't resolve project dirs"))?;
-let data_dir = dirs.data_dir();   // ~/.local/share/peerdup on Linux
-let config_dir = dirs.config_dir(); // ~/.config/peerdup on Linux
+let data_dir = dirs.data_dir();   // ~/.local/share/rust-peerdup on Linux
+let config_dir = dirs.config_dir(); // ~/.config/rust-peerdup on Linux
 ```
 
 Allow override via `--data-dir <path>` flag for testing.

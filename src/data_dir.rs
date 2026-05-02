@@ -6,7 +6,12 @@ pub fn resolve(override_path: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = override_path {
         return Ok(p);
     }
-    let pd = ProjectDirs::from("", "peerdup", "peerdup")
+    // Use a distinct name from the Python `peerdup` so the two
+    // implementations don't share `~/.local/share/peerdup/` and corrupt
+    // each other's identity.key / daemon.lock if both are ever installed
+    // on the same machine. On Linux this resolves to
+    // `~/.local/share/rust-peerdup/`.
+    let pd = ProjectDirs::from("", "rust-peerdup", "rust-peerdup")
         .ok_or_else(|| anyhow!("could not resolve platform project dirs"))?;
     Ok(pd.data_dir().to_path_buf())
 }

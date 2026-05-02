@@ -83,8 +83,8 @@ rust-peerdup share-invite "$SHARE_ID" <B-pubkey-hex> --auth-role writer
 rust-peerdup share-join <ticket-string> --path ~/Sync/mydemo
 
 # 4. On both: start the daemon.
-systemctl --user enable --now peerdup
-journalctl --user -u peerdup -f       # watch sync events live
+systemctl --user enable --now rust-peerdup
+journalctl --user -u rust-peerdup -f  # watch sync events live
 ```
 
 Edits in either share root propagate within ~1–2 seconds.
@@ -120,7 +120,7 @@ src/
 ├── data_dir.rs       Path resolution
 └── lock.rs           Daemon exclusive-lock file
 
-systemd/peerdup.service  systemd user unit installed by install.sh
+systemd/rust-peerdup.service  systemd user unit installed by install.sh
 install.sh               build + install (binary + unit)
 uninstall.sh             remove binary + unit (keeps data dir)
 ```

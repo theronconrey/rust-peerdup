@@ -2,8 +2,8 @@
 # rust-peerdup installer
 #
 # Builds the release binary, installs it to ~/.local/bin/rust-peerdup, and
-# drops a systemd user unit at ~/.config/systemd/user/peerdup.service so
-# the daemon can be started with `systemctl --user start peerdup`.
+# drops a systemd user unit at ~/.config/systemd/user/rust-peerdup.service
+# so the daemon can be started with `systemctl --user start rust-peerdup`.
 #
 # Run from the repo root:
 #   ./install.sh
@@ -16,7 +16,7 @@ REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 BIN_DIR="$HOME/.local/bin"
 UNIT_DIR="$HOME/.config/systemd/user"
 BIN_NAME="rust-peerdup"
-UNIT_NAME="peerdup.service"
+UNIT_NAME="rust-peerdup.service"
 
 info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()    { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
@@ -96,9 +96,9 @@ Quick reference:
       $BIN_NAME share-members <share-id>
 
   Run the daemon as a systemd user service:
-      systemctl --user enable --now peerdup
-      journalctl --user -u peerdup -f         # follow logs
-      systemctl --user stop peerdup           # stop
+      systemctl --user enable --now rust-peerdup
+      journalctl --user -u rust-peerdup -f    # follow logs
+      systemctl --user stop rust-peerdup      # stop
 
   Or run it in the foreground for testing:
       $BIN_NAME serve --bt-port 41000

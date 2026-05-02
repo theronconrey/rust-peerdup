@@ -3,18 +3,18 @@
 #
 # Stops the systemd user service if running, removes the binary at
 # ~/.local/bin/rust-peerdup, and removes the unit at
-# ~/.config/systemd/user/peerdup.service.
+# ~/.config/systemd/user/rust-peerdup.service.
 #
-# Does NOT delete your data directory (~/.local/share/peerdup) or any
-# share roots — this is intentional, removing the tool shouldn't lose
-# user content.
+# Does NOT delete your data directory (~/.local/share/rust-peerdup) or
+# any share roots — this is intentional, removing the tool shouldn't
+# lose user content.
 
 set -euo pipefail
 
 BIN_DIR="$HOME/.local/bin"
 UNIT_DIR="$HOME/.config/systemd/user"
 BIN_NAME="rust-peerdup"
-UNIT_NAME="peerdup.service"
+UNIT_NAME="rust-peerdup.service"
 
 info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()    { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
@@ -45,7 +45,7 @@ if command -v systemctl >/dev/null 2>&1; then
     systemctl --user daemon-reload || true
 fi
 
-DATA_DIR="$HOME/.local/share/peerdup"
+DATA_DIR="$HOME/.local/share/rust-peerdup"
 if [ -d "$DATA_DIR" ]; then
     warn "Data directory left in place: $DATA_DIR"
     warn "Delete manually with 'rm -rf $DATA_DIR' if you want a clean wipe."
