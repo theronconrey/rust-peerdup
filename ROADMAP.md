@@ -19,9 +19,9 @@ guesses, not commitments. Add 50% if part-time, double for "with surprises."
 | 3. Multi-master sync | ✅ Done | — |
 | 4. Encryption at rest | ✅ Done (file-level; `p2panda-encryption` deferred — see notes) | — |
 | 5. ACL via p2panda-auth | ✅ Done | — |
-| 6. Swarm admission gate | 👉 Next | 2–3 weeks |
-| 7. D-Bus IPC surface | Planned | 2–3 weeks |
-| 8. Linux UI | Planned | 4–6 weeks |
+| 6. Swarm admission gate | ⏸️ Blocked on upstream librqbit ([ikatson/rqbit#582](https://github.com/ikatson/rqbit/issues/582)) | 2–3 weeks |
+| 7. D-Bus IPC surface | ✅ Done | — |
+| 8. Linux UI | 👉 Next available | 4–6 weeks |
 | 9. Cross-platform packaging | Planned | 4–8 weeks |
 | 10. Production hardening | Planned | Ongoing |
 
