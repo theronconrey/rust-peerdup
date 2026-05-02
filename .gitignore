@@ -10,3 +10,7 @@
 # defensive in case someone runs the demo flow inside the repo)
 /seed-state
 /out
+
+# Local-only artifacts: drafts of upstream issue/PR text, scratch notes,
+# anything we author here for our own reference but don't want to ship.
+/docs/upstream/
