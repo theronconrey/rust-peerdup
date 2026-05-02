@@ -42,7 +42,7 @@ writing:
 | 5b. Peer activity listing (`share peers`) | ✅ Done |
 | 5c. `p2panda-auth` group CRDT integration | ✅ Done |
 | 5d. Auto key rotation on revocation | ✅ Done |
-| 5e. 4-peer revocation e2e test | ⏳ TODO |
+| 5e. 4-peer revocation e2e test | ✅ Done |
 | 6+ | Per ROADMAP.md |
 
 Detailed design notes, including non-obvious gotchas about librqbit and
@@ -127,6 +127,18 @@ uninstall.sh             remove binary + unit (keeps data dir)
 ```
 
 Tests are in-module (`#[cfg(test)] mod tests`); run with `cargo test`.
+
+The 4-peer revocation end-to-end test lives at
+[`tests/e2e-revoke.sh`](tests/e2e-revoke.sh). It spins up A on the host
+plus B/C/D in podman containers (via `containers/run-peer.sh`), runs
+the full invite → sync → revoke → rotate flow, and asserts that the
+revoked peer can fetch ciphertext but cannot derive plaintext. Run it
+with:
+
+```bash
+podman build -t rust-peerdup-peer -f containers/Containerfile .  # one-time
+./tests/e2e-revoke.sh
+```
 
 ## License
 
