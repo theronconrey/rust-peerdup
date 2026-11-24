@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::auth::SignedOp;
 use crate::crypto::KEY_LEN;
 use crate::share::ShareRole;

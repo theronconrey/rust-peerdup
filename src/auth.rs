@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Phase 5c: per-share membership CRDT built on `p2panda-auth`.
 //!
 //! Wraps `p2panda_auth::group::GroupCrdt` with peerdup-specific identity,

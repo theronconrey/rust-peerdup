@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Phase 7: D-Bus IPC surface.
 //!
 //! Exposes `org.peerdup.Daemon1` on the user session bus. Other processes

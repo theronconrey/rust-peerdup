@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 mod auth;
 mod client;
 mod clock;
@@ -18,7 +19,7 @@ use share::{ShareConfig, ShareRole};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "peerdup", about = "p2panda + librqbit folder sync")]
+#[command(name = "rust-peerdup", version, about = "p2panda + librqbit folder sync")]
 struct Cli {
     /// Override data directory. Default: $XDG_DATA_HOME/peerdup on Linux.
     ///

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use anyhow::{anyhow, Result};
 use directories::ProjectDirs;
 use std::path::{Path, PathBuf};

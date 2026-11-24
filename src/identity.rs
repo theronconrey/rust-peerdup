@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use anyhow::{anyhow, Context, Result};
 use p2panda_core::identity::PRIVATE_KEY_LEN;
 use p2panda_core::PrivateKey;

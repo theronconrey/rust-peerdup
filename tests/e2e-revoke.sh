@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
 # Phase 5e: 4-peer revocation end-to-end test.
 #
 # Spins up peer A on the host (in a temp data dir, NOT the user's real

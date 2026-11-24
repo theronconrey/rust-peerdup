@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT
+#
+# Session-bus activation: the first call to org.peerdup.Daemon1 starts the
+# rust-peerdup user unit.
 [D-BUS Service]
 Name=org.peerdup.Daemon1
 Exec=/usr/bin/false

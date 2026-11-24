@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::clock::VectorClock;
 use crate::data_dir;
 use anyhow::{Context, Result};

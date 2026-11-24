@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::data_dir;
 use anyhow::{anyhow, Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng};

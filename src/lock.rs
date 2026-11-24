@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;
 use std::fs::{File, OpenOptions};

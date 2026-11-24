@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::auth::{self, AuthRole, AuthState, MemberId, SignedOp};
 use crate::clock::{ClockOrdering, VectorClock};
 use crate::crypto::{self, InstallOutcome, KeyRing};

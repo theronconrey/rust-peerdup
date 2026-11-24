@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Phase 5d: signed sealed-box envelopes that distribute a freshly-rotated
 //! per-share encryption key to remaining members after a revocation.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Phase 7 CLI-side D-Bus client.
 //!
 //! Each CLI subcommand opens a session-bus `DaemonClient` and forwards

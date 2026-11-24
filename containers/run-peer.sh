@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
 # Helper: run the containerized "peer B" rust-peerdup daemon alongside a
 # host install. Uses --network host so mDNS discovery works on the host
 # loopback (the daemon currently announces 127.0.0.1 — see
