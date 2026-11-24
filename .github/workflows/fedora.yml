@@ -52,8 +52,11 @@ jobs:
           echo "spec $spec, Cargo.toml $cargo"
           test "$spec" = "$cargo"
 
+      # bash, for pipefail: rpmbuild's status must survive the pipe to tee.
       - name: Build the RPM
+        shell: bash
         run: |
+          set -euo pipefail
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           rpmdev-setuptree
           packaging/vendor.sh "$HOME/rpmbuild/SOURCES"

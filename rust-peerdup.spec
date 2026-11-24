@@ -30,8 +30,10 @@ ExclusiveArch:  %{rust_arches}
 
 BuildRequires:  cargo-rpm-macros >= 26
 BuildRequires:  systemd-rpm-macros
-# Generates the man page from --help.
+# Generates the man page from --help; Locale::gettext lets it honor
+# --locale, so the page stays UTF-8.
 BuildRequires:  help2man
+BuildRequires:  perl(Locale::gettext)
 # native-tls (through reqwest) links the system OpenSSL, so TLS made that
 # way follows the system crypto-policies.
 BuildRequires:  pkgconfig(openssl)
