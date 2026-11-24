@@ -5,3 +5,8 @@
 # Names of the projects rust-peerdup is built on; the spell checker doesn't
 # know them.
 addFilter(r"spelling-error .*'(p2panda|librqbit|iroh)'")
+
+# The openssl crate (through native-tls and reqwest, vendored) sets its own
+# cipher list on top of the system crypto-policy. Known gap, documented in
+# CONTRIBUTING.md section 3; fixing it needs upstream changes.
+addFilter(r"crypto-policy-non-compliance-openssl /usr/bin/rust-peerdup SSL_CTX_set_cipher_list")

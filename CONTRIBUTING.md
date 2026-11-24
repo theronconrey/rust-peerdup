@@ -67,9 +67,17 @@ Where this file and those disagree, those win; open an issue to fix this file.
 - `License:` is an SPDX expression covering rust-peerdup **and** every
   vendored crate. CI prints `%cargo_license_summary`; when a `Cargo.lock`
   change adds a license, update `License:` in the same pull request.
-- Bundled C code: `aws-lc-sys` and `ring` (TLS for iroh and rustls) compile
-  their own crypto. That is a known gap against crypto-policies; prefer
-  crate features that use the system OpenSSL when upstream offers them.
+- Known gaps against crypto-policies and system trust, all from vendored
+  crates and all needing upstream changes; prefer crate features that use
+  the system OpenSSL and CA store whenever upstream offers them:
+  - `aws-lc-sys` and `ring` (TLS for iroh and rustls) compile their own
+    crypto.
+  - The `openssl` crate sets its own cipher list on top of the system
+    policy (rpmlint's `crypto-policy-non-compliance-openssl`, filtered in
+    `rust-peerdup.rpmlintrc` for this reason).
+  - `webpki-roots` builds Mozilla's CA list into the binary instead of
+    reading `ca-certificates` (it is where `CDLA-Permissive-2.0` in
+    `License:` comes from).
 - Builds work offline (as in `mock` and Copr's build step). `rpmlint` must
   be clean, or each remaining warning explained in `rust-peerdup.rpmlintrc`.
 - The version lives in `Cargo.toml`; the spec's `Version:` must match it (CI

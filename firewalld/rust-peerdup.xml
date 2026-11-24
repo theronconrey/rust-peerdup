@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- SPDX-License-Identifier: MIT -->
 <!--
-  Not enabled by default. To let other peers reach this one directly:
-    sudo firewall-cmd --permanent --add-service=rust-peerdup
-    sudo firewall-cmd --reload
-  Without it, peers still sync through iroh's relays, only more slowly.
+  Not enabled by default. Add the rust-peerdup service to the active
+  firewalld zone (permanently, then reload) to let other peers reach this
+  one directly; README.md has the commands. Without it, peers still sync
+  through iroh's relays, only more slowly.
 -->
 <service>
   <short>rust-peerdup</short>
