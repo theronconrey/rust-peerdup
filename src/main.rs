@@ -62,7 +62,7 @@ enum Cmd {
         no_dbus: bool,
     },
     /// Add a new share. With `--data-dir` set, writes to disk directly
-    /// (Phase 2 semantics — daemon restart required to pick up). Without
+    /// (Phase 2 semantics; daemon restart required to pick up). Without
     /// `--data-dir`, calls `ShareAdd` over D-Bus on the running daemon.
     ShareAdd {
         /// Logical topic string. Hashed into the gossip topic id; both peers
@@ -109,7 +109,7 @@ enum Cmd {
         path: PathBuf,
     },
     /// List peers observed in this share's history. Activity-based, not
-    /// ACL-based — for ACL membership use `share members`.
+    /// ACL-based; for ACL membership use `share members`.
     SharePeers { id: String },
     /// List current ACL members and their roles for a share.
     ShareMembers { id: String },
@@ -677,5 +677,34 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", &s[..max.saturating_sub(1)])
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    /// The RPM's man page is made by help2man, which Fedora builds without
+    /// locale support: non-ASCII in --help comes out as a page that is not
+    /// valid UTF-8 (rpmlint file-not-utf8). Keep every help string ASCII.
+    #[test]
+    fn help_text_is_ascii() {
+        let mut cmd = Cli::command();
+        cmd.build();
+        let mut texts = vec![cmd.render_long_help().to_string()];
+        for sub in cmd.get_subcommands_mut() {
+            texts.push(sub.render_long_help().to_string());
+        }
+        for text in texts {
+            if let Some(c) = text.chars().find(|c| !c.is_ascii()) {
+                panic!("non-ASCII {c:?} in help text:\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
     }
 }

@@ -30,10 +30,8 @@ ExclusiveArch:  %{rust_arches}
 
 BuildRequires:  cargo-rpm-macros >= 26
 BuildRequires:  systemd-rpm-macros
-# Generates the man page from --help; Locale::gettext lets it honor
-# --locale, so the page stays UTF-8.
+# Generates the man page from --help (kept ASCII; a unit test checks).
 BuildRequires:  help2man
-BuildRequires:  perl(Locale::gettext)
 # native-tls (through reqwest) links the system OpenSSL, so TLS made that
 # way follows the system crypto-policies.
 BuildRequires:  pkgconfig(openssl)
@@ -66,8 +64,7 @@ on demand; the rust-peerdup command drives it.
 %{cargo_license_summary}
 %{cargo_license} > LICENSE.dependencies
 %cargo_vendor_manifest
-# --help has non-ASCII punctuation; keep the page UTF-8.
-LC_ALL=C.UTF-8 help2man --locale=C.UTF-8 --no-info --no-discard-stderr \
+help2man --no-info --no-discard-stderr \
     --name="encrypted peer-to-peer folder sync daemon" \
     --output=rust-peerdup.1 target/rpm/rust-peerdup
 
