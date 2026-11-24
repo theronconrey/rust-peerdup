@@ -29,10 +29,15 @@ version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$repo/Cargo.toml" | head -n1)"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-# Fedora builds every Linux architecture Rust supports (%{rust_arches}).
+# Fedora's architectures (%{rust_arches}, as Fedora's rustc names them).
+# Not a glob: that would include targets Fedora's rustc can't describe.
 (cd "$repo" && cargo vendor-filterer \
-    --platform='*-unknown-linux-gnu' \
-    --platform='*-unknown-linux-gnueabihf' \
+    --platform=x86_64-unknown-linux-gnu \
+    --platform=i686-unknown-linux-gnu \
+    --platform=aarch64-unknown-linux-gnu \
+    --platform=powerpc64le-unknown-linux-gnu \
+    --platform=s390x-unknown-linux-gnu \
+    --platform=riscv64gc-unknown-linux-gnu \
     "$work/vendor" >&2)
 
 tar --sort=name --mtime="@0" --owner=0 --group=0 --numeric-owner \
