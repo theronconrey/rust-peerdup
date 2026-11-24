@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: MIT
+#
+# Checks every push and pull request inside Fedora: the code checks, then an
+# RPM build from rust-peerdup.spec with vendored crates, rpmlint, and an
+# install of the built package.
+
+name: Fedora
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  fedora:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/${{ matrix.image }}
+    continue-on-error: ${{ matrix.image == 'fedora:rawhide' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["fedora:latest", "fedora:rawhide"]
+    steps:
+      - name: Install Fedora tooling
+        run: >
+          dnf -y install glibc-langpack-en git-core rpm-build rpmdevtools rpmlint
+          cargo rust clippy rustfmt cargo-rpm-macros cargo-vendor-filterer xz
+          systemd firewalld
+
+      - uses: actions/checkout@v4
+
+      # Fedora's Rust, not rustup's: this is the compiler the RPM is built with.
+      - name: Code checks
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+
+      - name: Spec and Cargo.toml agree on the version
+        run: |
+          spec=$(rpmspec -q --srpm --qf '%{version}' rust-peerdup.spec)
+          cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          echo "spec $spec, Cargo.toml $cargo"
+          test "$spec" = "$cargo"
+
+      - name: Build the RPM
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          rpmdev-setuptree
+          packaging/vendor.sh "$HOME/rpmbuild/SOURCES"
+          dnf -y builddep rust-peerdup.spec
+          rpmbuild -ba rust-peerdup.spec 2>&1 | tee build.log
+
+      # The License: tag must list the vendored crates' licenses. Print what
+      # %cargo_license_summary found, so a Cargo.lock change that adds a
+      # license shows up in review.
+      - name: Licenses of the vendored crates
+        run: |
+          sed -n '/^# /p' build.log | sort -u
+          rpm -qp --qf 'License: %{LICENSE}\n' "$HOME"/rpmbuild/SRPMS/rust-peerdup-*.src.rpm
+
+      - name: rpmlint
+        run: |
+          rpmlint -r rust-peerdup.rpmlintrc rust-peerdup.spec \
+            "$HOME"/rpmbuild/SRPMS/rust-peerdup-*.src.rpm \
+            "$HOME"/rpmbuild/RPMS/*/rust-peerdup-*.rpm
+
+      - name: Install and smoke-test the package
+        run: |
+          dnf -y install "$HOME"/rpmbuild/RPMS/*/rust-peerdup-[0-9]*.rpm
+          cd /
+          rust-peerdup --version
+          rust-peerdup --help
+          rpm -ql rust-peerdup | grep -q "/man1/rust-peerdup.1"
+          rpm -q --qf '%{LICENSE}\n' rust-peerdup
+          rpm -q --provides rust-peerdup | grep -c 'bundled(crate('
+          # Works with no daemon and no session bus: direct on-disk mode.
+          rust-peerdup --data-dir /tmp/peer whoami
+          mkdir -p /tmp/share
+          rust-peerdup --data-dir /tmp/peer share-add --topic ci --path /tmp/share --role sync
+          rust-peerdup --data-dir /tmp/peer share-list
+          # --man=no: the container installs without documentation.
+          systemd-analyze verify --man=no /usr/lib/systemd/user/rust-peerdup.service
+          systemd-analyze security --offline=true --no-pager \
+            /usr/lib/systemd/user/rust-peerdup.service || true
+          firewall-offline-cmd --info-service=rust-peerdup
