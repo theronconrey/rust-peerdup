@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 pub struct MemberId(pub [u8; 32]);
 
 impl MemberId {
-    pub fn to_hex(&self) -> String {
+    pub fn to_hex(self) -> String {
         let mut s = String::with_capacity(64);
         for b in &self.0 {
             s.push_str(&format!("{:02x}", b));
@@ -73,7 +73,7 @@ impl IdentityHandle for MemberId {}
 pub struct OpId(pub [u8; 32]);
 
 impl OpId {
-    pub fn to_hex(&self) -> String {
+    pub fn to_hex(self) -> String {
         let mut s = String::with_capacity(64);
         for b in &self.0 {
             s.push_str(&format!("{:02x}", b));

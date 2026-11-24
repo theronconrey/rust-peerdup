@@ -62,13 +62,11 @@ pub fn load_or_create_keyring(data_dir: &Path, share_id: &str) -> Result<KeyRing
                 KEY_LEN
             ));
         }
-        let mut keys = Vec::with_capacity(raw.len() / KEY_LEN);
-        for chunk in raw.chunks_exact(KEY_LEN) {
-            let mut k = [0u8; KEY_LEN];
-            k.copy_from_slice(chunk);
-            keys.push(k);
-        }
-        Ok(KeyRing { keys })
+        // The length check above means there is no remainder.
+        let (chunks, _) = raw.as_chunks::<KEY_LEN>();
+        Ok(KeyRing {
+            keys: chunks.to_vec(),
+        })
     } else {
         let mut k = [0u8; KEY_LEN];
         OsRng.fill_bytes(&mut k);

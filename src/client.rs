@@ -117,7 +117,7 @@ impl DaemonClient {
 
     async fn call_no_args<R>(&self, method: &'static str) -> Result<R>
     where
-        R: for<'de> zbus::zvariant::Type + for<'de> serde::Deserialize<'de> + std::fmt::Debug,
+        R: zbus::zvariant::Type + for<'de> serde::Deserialize<'de> + std::fmt::Debug,
     {
         self.proxy.call(method, &()).await.map_err(map_call_err)
     }

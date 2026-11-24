@@ -223,7 +223,7 @@ async fn cmd_share_list() -> Result<()> {
         println!("No shares configured");
         return Ok(());
     }
-    println!("{:<18} {:<8} {:<20} {}", "ID", "ROLE", "TOPIC", "PATH");
+    println!("{:<18} {:<8} {:<20} PATH", "ID", "ROLE", "TOPIC");
     for (id, topic, path, role, _created_at) in shares {
         println!(
             "{:<18} {:<8} {:<20} {}",
@@ -255,7 +255,7 @@ async fn cmd_share_peers(id: String) -> Result<()> {
         println!("share {id}: no peer activity recorded yet");
         return Ok(());
     }
-    println!("{:<66} {:>9} {}", "PEER_ID", "VERSIONS", "");
+    println!("{:<66} {:>9} ", "PEER_ID", "VERSIONS");
     for (peer, ctr) in peers {
         let marker = if me.as_deref() == Some(&peer) {
             "(self)"
@@ -275,7 +275,7 @@ async fn cmd_share_members(id: String) -> Result<()> {
         println!("share {id}: no auth state on disk");
         return Ok(());
     }
-    println!("{:<66} {:<8} {}", "PEER_PUBKEY", "ROLE", "");
+    println!("{:<66} {:<8} ", "PEER_PUBKEY", "ROLE");
     for (pubkey, role) in members {
         let marker = if me.as_deref() == Some(&pubkey) {
             "(self)"
@@ -389,7 +389,7 @@ fn cmd_share_list_direct(data_dir: PathBuf) -> Result<()> {
         println!("No shares configured at {:?}", data_dir);
         return Ok(());
     }
-    println!("{:<18} {:<8} {:<20} {}", "ID", "ROLE", "TOPIC", "PATH");
+    println!("{:<18} {:<8} {:<20} PATH", "ID", "ROLE", "TOPIC");
     for c in configs {
         let role = format!("{:?}", c.role).to_lowercase();
         println!(
@@ -433,7 +433,7 @@ fn cmd_share_peers_direct(data_dir: PathBuf, id: String) -> Result<()> {
     };
     let mut peers: Vec<(&String, &u64)> = state.clock.0.iter().collect();
     peers.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-    println!("{:<66} {:>9} {}", "PEER_ID", "VERSIONS", "");
+    println!("{:<66} {:>9} ", "PEER_ID", "VERSIONS");
     for (peer, ctr) in peers {
         let marker = if me.as_deref() == Some(peer) {
             "(self)"
@@ -461,7 +461,7 @@ fn cmd_share_members_direct(data_dir: PathBuf, id: String) -> Result<()> {
         .ok();
     let mut members = auth_state.members(group_id);
     members.sort_by_key(|(m, _)| m.0);
-    println!("{:<66} {:<8} {}", "PEER_PUBKEY", "ROLE", "");
+    println!("{:<66} {:<8} ", "PEER_PUBKEY", "ROLE");
     for (m, role) in members {
         let marker = if Some(m) == me { "(self)" } else { "" };
         println!("{:<66} {:<8} {marker}", m.to_hex(), role);

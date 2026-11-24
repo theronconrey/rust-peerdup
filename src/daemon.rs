@@ -818,7 +818,7 @@ async fn sync_loop(
 
     let mut state = {
         let k = key.read().await;
-        reconcile_on_start(&config, &session, &root, &data_dir, &peer_id_hex, &*k).await?
+        reconcile_on_start(&config, &session, &root, &data_dir, &peer_id_hex, &k).await?
     };
     if let Some(s) = &state {
         publish_sync_announce(&topic_handle, s, bt_port).await;
@@ -835,7 +835,7 @@ async fn sync_loop(
             Some(()) = debounce(&mut watch_rx, Duration::from_millis(500)) => {
                 let outcome = {
                     let k = key.read().await;
-                    handle_local_change(&config, &session, &root, &data_dir, &peer_id_hex, &*k, state.as_ref()).await
+                    handle_local_change(&config, &session, &root, &data_dir, &peer_id_hex, &k, state.as_ref()).await
                 };
                 match outcome {
                     Ok(Some(new_state)) => {
@@ -963,7 +963,7 @@ async fn sync_loop(
                 );
                 let apply_outcome = {
                     let k = key.read().await;
-                    apply_remote_sync(&session, &root, &info_hash, &remote_vhash, &remote_clock, remote_ts, &bt_endpoints, &*k, state.as_ref()).await
+                    apply_remote_sync(&session, &root, &info_hash, &remote_vhash, &remote_clock, remote_ts, &bt_endpoints, &k, state.as_ref()).await
                 };
                 match apply_outcome {
                     Ok(new_state) => {
@@ -1741,6 +1741,9 @@ async fn publish_pending_rotations(
 /// Receive-side handler for `ShareMsg::KeyRotation`. Verifies, decrypts,
 /// installs the new epoch key, then drains any buffered out-of-order
 /// rotations whose dependencies are now satisfied.
+// Each argument is a separate piece of per-share state owned by the share
+// loop; bundling them into a struct would only move the list.
+#[allow(clippy::too_many_arguments)]
 async fn apply_key_rotation(
     rotation: SignedRotation,
     auth_state: &AuthState,
