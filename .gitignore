@@ -14,3 +14,8 @@
 # Local-only artifacts: drafts of upstream issue/PR text, scratch notes,
 # anything we author here for our own reference but don't want to ship.
 /docs/upstream/
+
+# RPM sources made by packaging/vendor.sh
+/rust-peerdup-*.tar.gz
+/rust-peerdup-*-vendor.tar.xz
+/build.log

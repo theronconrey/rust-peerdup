@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: MIT
+#
+# rpmlint filters. Each one needs a reason (CONTRIBUTING.md, section 3).
+
+# Names of the projects rust-peerdup is built on; the spell checker doesn't
+# know them.
+addFilter(r"spelling-error .*'(p2panda|librqbit|iroh)'")
