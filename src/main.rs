@@ -19,7 +19,11 @@ use share::{ShareConfig, ShareRole};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "rust-peerdup", version, about = "p2panda + librqbit folder sync")]
+#[command(
+    name = "rust-peerdup",
+    version,
+    about = "p2panda + librqbit folder sync"
+)]
 struct Cli {
     /// Override data directory. Default: $XDG_DATA_HOME/peerdup on Linux.
     ///
@@ -253,7 +257,11 @@ async fn cmd_share_peers(id: String) -> Result<()> {
     }
     println!("{:<66} {:>9} {}", "PEER_ID", "VERSIONS", "");
     for (peer, ctr) in peers {
-        let marker = if me.as_deref() == Some(&peer) { "(self)" } else { "" };
+        let marker = if me.as_deref() == Some(&peer) {
+            "(self)"
+        } else {
+            ""
+        };
         println!("{:<66} {:>9} {}", peer, ctr, marker);
     }
     Ok(())
@@ -269,7 +277,11 @@ async fn cmd_share_members(id: String) -> Result<()> {
     }
     println!("{:<66} {:<8} {}", "PEER_PUBKEY", "ROLE", "");
     for (pubkey, role) in members {
-        let marker = if me.as_deref() == Some(&pubkey) { "(self)" } else { "" };
+        let marker = if me.as_deref() == Some(&pubkey) {
+            "(self)"
+        } else {
+            ""
+        };
         println!("{:<66} {:<8} {marker}", pubkey, role);
     }
     Ok(())
@@ -423,7 +435,11 @@ fn cmd_share_peers_direct(data_dir: PathBuf, id: String) -> Result<()> {
     peers.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
     println!("{:<66} {:>9} {}", "PEER_ID", "VERSIONS", "");
     for (peer, ctr) in peers {
-        let marker = if me.as_deref() == Some(peer) { "(self)" } else { "" };
+        let marker = if me.as_deref() == Some(peer) {
+            "(self)"
+        } else {
+            ""
+        };
         println!("{:<66} {:>9} {}", peer, ctr, marker);
     }
     Ok(())
@@ -453,17 +469,12 @@ fn cmd_share_members_direct(data_dir: PathBuf, id: String) -> Result<()> {
     Ok(())
 }
 
-fn cmd_share_revoke_direct(
-    data_dir: PathBuf,
-    id: String,
-    peer_pubkey_hex: String,
-) -> Result<()> {
+fn cmd_share_revoke_direct(data_dir: PathBuf, id: String, peer_pubkey_hex: String) -> Result<()> {
     let configs = share::load_all(&data_dir)?;
     if !configs.iter().any(|c| c.id == id) {
         return Err(anyhow!("share {id} not found"));
     }
-    let target = auth::MemberId::from_hex(&peer_pubkey_hex)
-        .context("parsing peer public key")?;
+    let target = auth::MemberId::from_hex(&peer_pubkey_hex).context("parsing peer public key")?;
     let identity = identity::load_or_create(&data_dir::identity_path(&data_dir))?;
     let group_id = auth::group_id_for(&id);
     let mut auth_state = auth::load(&data_dir, &id)?;
@@ -495,9 +506,7 @@ fn cmd_share_revoke_direct(
             .ok_or_else(|| anyhow!("rotated keyring missing epoch {new_epoch}"))?
     };
 
-    let rotation_msg = rotation::build_signed_rotation(
-        &identity, new_epoch, &new_key, &remaining,
-    )?;
+    let rotation_msg = rotation::build_signed_rotation(&identity, new_epoch, &new_key, &remaining)?;
     rotation::save_pending(&data_dir, &id, &rotation_msg)?;
 
     println!("Revoked {} from share {id}", peer_pubkey_hex);
@@ -530,8 +539,8 @@ fn cmd_share_invite_direct(
         .iter()
         .find(|c| c.id == id)
         .ok_or_else(|| anyhow!("share {id} not found"))?;
-    let invitee = auth::MemberId::from_hex(&invitee_pubkey_hex)
-        .context("parsing invitee public key")?;
+    let invitee =
+        auth::MemberId::from_hex(&invitee_pubkey_hex).context("parsing invitee public key")?;
     let identity = identity::load_or_create(&data_dir::identity_path(&data_dir))?;
     let group_id = auth::group_id_for(&id);
 
@@ -569,11 +578,7 @@ fn cmd_share_invite_direct(
     Ok(())
 }
 
-fn cmd_share_join_direct(
-    data_dir: PathBuf,
-    ticket_str: String,
-    path: PathBuf,
-) -> Result<()> {
+fn cmd_share_join_direct(data_dir: PathBuf, ticket_str: String, path: PathBuf) -> Result<()> {
     let ticket = ticket::Ticket::decode(&ticket_str)?;
     let configs = share::load_all(&data_dir)?;
     if configs.iter().any(|c| c.id == ticket.share_id) {
@@ -615,7 +620,10 @@ fn cmd_share_join_direct(
     let mut auth_state = auth::AuthState::empty();
     for op in &ticket.auth_log {
         auth_state.apply_remote(op.clone()).with_context(|| {
-            format!("applying auth log op while joining share {}", ticket.share_id)
+            format!(
+                "applying auth log op while joining share {}",
+                ticket.share_id
+            )
         })?;
     }
     let group_id = auth::group_id_for(&ticket.share_id);
@@ -647,10 +655,7 @@ fn cmd_share_remove_direct(data_dir: PathBuf, id: String) -> Result<()> {
         let shadow_parent = root.join(".peerdup");
         if shadow_parent.exists() {
             if let Err(e) = std::fs::remove_dir_all(&shadow_parent) {
-                eprintln!(
-                    "warning: could not remove {}: {e}",
-                    shadow_parent.display()
-                );
+                eprintln!("warning: could not remove {}: {e}", shadow_parent.display());
             }
         }
     }

@@ -751,9 +751,7 @@ async fn leech_apply_announce(
         .filter_map(|(host, port)| {
             format!("{}:{}", host, port)
                 .parse::<SocketAddr>()
-                .map_err(|e| {
-                    tracing::warn!(host, port, error = %e, "skipping unparseable peer")
-                })
+                .map_err(|e| tracing::warn!(host, port, error = %e, "skipping unparseable peer"))
                 .ok()
         })
         .collect();
@@ -826,8 +824,8 @@ async fn sync_loop(
         publish_sync_announce(&topic_handle, s, bt_port).await;
     }
 
-    let (_watcher, mut watch_rx) = spawn_fs_watcher(&root)
-        .with_context(|| format!("watching {root:?}"))?;
+    let (_watcher, mut watch_rx) =
+        spawn_fs_watcher(&root).with_context(|| format!("watching {root:?}"))?;
     let mut announce_tick = tokio::time::interval(Duration::from_secs(10));
     announce_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     announce_tick.tick().await;
@@ -1015,9 +1013,16 @@ async fn handle_share_command(
             false
         }
         ShareCommand::Revoke { target, reply } => {
-            let result =
-                handle_revoke(config, data_dir, identity, key, auth_state, pending_rotations, target)
-                    .await;
+            let result = handle_revoke(
+                config,
+                data_dir,
+                identity,
+                key,
+                auth_state,
+                pending_rotations,
+                target,
+            )
+            .await;
             let _ = reply.send(result);
             false
         }
@@ -1236,8 +1241,8 @@ async fn reconcile_on_start(
             let (disk_vh, manifest) = snapshot_content(root)?;
             if p.version_hash == disk_vh {
                 sync_plaintext_to_shadow(root, key, &manifest)?;
-            let (info_hash, torrent_id) =
-                create_and_add_shadow_torrent(config, session, root).await?;
+                let (info_hash, torrent_id) =
+                    create_and_add_shadow_torrent(config, session, root).await?;
                 tracing::info!(
                     share_id = %config.id,
                     clock = ?p.clock.0,
@@ -1256,8 +1261,8 @@ async fn reconcile_on_start(
                 let mut clock = p.clock.clone();
                 clock.increment(peer_id_hex);
                 sync_plaintext_to_shadow(root, key, &manifest)?;
-            let (info_hash, torrent_id) =
-                create_and_add_shadow_torrent(config, session, root).await?;
+                let (info_hash, torrent_id) =
+                    create_and_add_shadow_torrent(config, session, root).await?;
                 let state = ShareState {
                     version_hash: disk_vh,
                     info_hash,
@@ -1291,7 +1296,10 @@ async fn handle_local_change(
         return Ok(None);
     }
     let (new_vhash, new_manifest) = snapshot_content(root)?;
-    if current.map(|s| s.version_hash == new_vhash).unwrap_or(false) {
+    if current
+        .map(|s| s.version_hash == new_vhash)
+        .unwrap_or(false)
+    {
         return Ok(None);
     }
     if let Some(s) = current {
@@ -1300,8 +1308,7 @@ async fn handle_local_change(
             .await;
     }
     sync_plaintext_to_shadow(root, key, &new_manifest)?;
-    let (info_hash, torrent_id) =
-        create_and_add_shadow_torrent(config, session, root).await?;
+    let (info_hash, torrent_id) = create_and_add_shadow_torrent(config, session, root).await?;
     let mut clock = current.map(|s| s.clock.clone()).unwrap_or_default();
     clock.increment(peer_id_hex);
     let new_state = ShareState {
@@ -1329,8 +1336,7 @@ fn snapshot_content(root: &Path) -> Result<(String, BTreeSet<PathBuf>)> {
     let mut manifest = BTreeSet::new();
     for rel in &paths {
         let abs = root.join(rel);
-        let mut file = std::fs::File::open(&abs)
-            .with_context(|| format!("opening {abs:?}"))?;
+        let mut file = std::fs::File::open(&abs).with_context(|| format!("opening {abs:?}"))?;
         let mut content_hasher = blake3::Hasher::new();
         std::io::copy(&mut file, &mut content_hasher)
             .with_context(|| format!("hashing {abs:?}"))?;
@@ -1342,7 +1348,6 @@ fn snapshot_content(root: &Path) -> Result<(String, BTreeSet<PathBuf>)> {
     }
     Ok((top.finalize().to_hex().to_string(), manifest))
 }
-
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {dir:?}"))? {
@@ -1394,8 +1399,7 @@ fn plaintext_rel_from_shadow_rel(shadow_rel: &Path) -> Option<PathBuf> {
 }
 
 fn has_content(root: &Path) -> Result<bool> {
-    let mut entries = std::fs::read_dir(root)
-        .with_context(|| format!("read_dir {root:?}"))?;
+    let mut entries = std::fs::read_dir(root).with_context(|| format!("read_dir {root:?}"))?;
     Ok(entries.next().is_some())
 }
 
@@ -1409,8 +1413,7 @@ fn sync_plaintext_to_shadow(
     plaintext_manifest: &BTreeSet<PathBuf>,
 ) -> Result<()> {
     let shadow = shadow_root(root);
-    std::fs::create_dir_all(&shadow)
-        .with_context(|| format!("create_dir_all {shadow:?}"))?;
+    std::fs::create_dir_all(&shadow).with_context(|| format!("create_dir_all {shadow:?}"))?;
 
     for rel in plaintext_manifest {
         let pt_path = root.join(rel);
@@ -1419,10 +1422,10 @@ fn sync_plaintext_to_shadow(
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create_dir_all {parent:?}"))?;
         }
-        let pt_bytes = std::fs::read(&pt_path)
-            .with_context(|| format!("reading plaintext {pt_path:?}"))?;
-        let ct_bytes = crypto::encrypt(key, &pt_bytes)
-            .with_context(|| format!("encrypting {rel:?}"))?;
+        let pt_bytes =
+            std::fs::read(&pt_path).with_context(|| format!("reading plaintext {pt_path:?}"))?;
+        let ct_bytes =
+            crypto::encrypt(key, &pt_bytes).with_context(|| format!("encrypting {rel:?}"))?;
         std::fs::write(&shadow_path, ct_bytes)
             .with_context(|| format!("writing ciphertext {shadow_path:?}"))?;
     }
@@ -1479,8 +1482,7 @@ fn sync_shadow_to_plaintext(root: &Path, key: &KeyRing) -> Result<BTreeSet<PathB
             .to_os_string();
         tmp_name.push(".peerdup-tmp");
         let tmp = pt_path.with_file_name(tmp_name);
-        std::fs::write(&tmp, &pt_bytes)
-            .with_context(|| format!("writing plaintext {tmp:?}"))?;
+        std::fs::write(&tmp, &pt_bytes).with_context(|| format!("writing plaintext {tmp:?}"))?;
         std::fs::rename(&tmp, &pt_path)
             .with_context(|| format!("renaming {tmp:?} -> {pt_path:?}"))?;
         manifest.insert(pt_rel);
@@ -1551,8 +1553,7 @@ async fn apply_remote_sync(
 
     // librqbit fetches ciphertext into the shadow.
     let shadow = shadow_root(root);
-    std::fs::create_dir_all(&shadow)
-        .with_context(|| format!("create_dir_all {shadow:?}"))?;
+    std::fs::create_dir_all(&shadow).with_context(|| format!("create_dir_all {shadow:?}"))?;
     let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
     let opts = AddTorrentOptions {
         output_folder: Some(shadow.to_string_lossy().into_owned()),
@@ -1565,7 +1566,10 @@ async fn apply_remote_sync(
         .await?;
     let handle = resp.into_handle().ok_or_else(|| anyhow!("no handle"))?;
     let torrent_id = handle.id();
-    handle.wait_until_completed().await.context("wait_until_completed")?;
+    handle
+        .wait_until_completed()
+        .await
+        .context("wait_until_completed")?;
 
     // Decrypt every shadow file into plaintext. If decryption fails (wrong
     // key, tampered blob), bail out — this is the "fetched ciphertext but
@@ -1634,9 +1638,7 @@ fn delete_orphans(root: &Path, old: &BTreeSet<PathBuf>, new: &BTreeSet<PathBuf>)
 /// alive for events to flow) and an unbounded receiver of "something changed"
 /// notifications. We don't care about event details — any change just means
 /// "recompute the version hash."
-fn spawn_fs_watcher(
-    root: &Path,
-) -> Result<(notify::RecommendedWatcher, UnboundedReceiver<()>)> {
+fn spawn_fs_watcher(root: &Path) -> Result<(notify::RecommendedWatcher, UnboundedReceiver<()>)> {
     use notify::{RecommendedWatcher, RecursiveMode, Watcher};
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mut watcher: RecommendedWatcher =
@@ -1646,10 +1648,10 @@ fn spawn_fs_watcher(
                 // own writes; reacting would make us recompute and re-encrypt
                 // forever.
                 let all_in_shadow = !ev.paths.is_empty()
-                    && ev.paths.iter().all(|p| {
-                        p.components()
-                            .any(|c| c.as_os_str() == PEERDUP_DIR_NAME)
-                    });
+                    && ev
+                        .paths
+                        .iter()
+                        .all(|p| p.components().any(|c| c.as_os_str() == PEERDUP_DIR_NAME));
                 if !all_in_shadow {
                     let _ = tx.send(());
                 }
@@ -1749,13 +1751,21 @@ async fn apply_key_rotation(
     data_dir: &Path,
     share_id: &str,
 ) -> Result<()> {
-    match try_install_rotation(&rotation, auth_state, group_id, identity, key, data_dir, share_id)
-        .await?
+    match try_install_rotation(
+        &rotation, auth_state, group_id, identity, key, data_dir, share_id,
+    )
+    .await?
     {
         AppliedOrBuffered::Applied => {
             // Drain buffered rotations whose epochs are now installable.
             drain_rotation_buffer(
-                auth_state, group_id, identity, key, rotation_buffer, data_dir, share_id,
+                auth_state,
+                group_id,
+                identity,
+                key,
+                rotation_buffer,
+                data_dir,
+                share_id,
             )
             .await;
         }
@@ -1785,20 +1795,19 @@ async fn try_install_rotation(
 ) -> Result<AppliedOrBuffered> {
     match rotation::verify_and_decrypt(rotation, auth_state, group_id, identity) {
         VerifyOutcome::OkForUs(new_key) => {
-            let outcome =
-                crypto::install_epoch_key(data_dir, share_id, rotation.epoch, &new_key)
-                    .with_context(|| {
-                        format!(
-                            "installing rotation key for share {share_id} at epoch {}",
-                            rotation.epoch
-                        )
-                    })?;
+            let outcome = crypto::install_epoch_key(data_dir, share_id, rotation.epoch, &new_key)
+                .with_context(|| {
+                format!(
+                    "installing rotation key for share {share_id} at epoch {}",
+                    rotation.epoch
+                )
+            })?;
             match outcome {
                 InstallOutcome::Installed => {
                     // Reload the on-disk keyring into the in-memory Arc so
                     // subsequent encrypt/decrypt calls see the new epoch.
-                    let fresh = crypto::load_or_create_keyring(data_dir, share_id)
-                        .with_context(|| {
+                    let fresh =
+                        crypto::load_or_create_keyring(data_dir, share_id).with_context(|| {
                             format!("reloading keyring for share {share_id} after install")
                         })?;
                     *key.write().await = fresh;
@@ -1918,12 +1927,13 @@ mod tests {
     impl TmpDir {
         fn new(label: &str) -> Self {
             let nonce: u64 = rand::random();
-            let p = std::env::temp_dir()
-                .join(format!("peerdup-ipc-{label}-{nonce:016x}"));
+            let p = std::env::temp_dir().join(format!("peerdup-ipc-{label}-{nonce:016x}"));
             std::fs::create_dir_all(&p).unwrap();
             TmpDir(p)
         }
-        fn path(&self) -> &Path { &self.0 }
+        fn path(&self) -> &Path {
+            &self.0
+        }
     }
     impl Drop for TmpDir {
         fn drop(&mut self) {
@@ -1931,9 +1941,19 @@ mod tests {
         }
     }
 
-    fn me_of(k: &PrivateKey) -> MemberId { MemberId(*k.public_key().as_bytes()) }
+    fn me_of(k: &PrivateKey) -> MemberId {
+        MemberId(*k.public_key().as_bytes())
+    }
 
-    fn bootstrap(label: &str) -> (TmpDir, ShareConfig, PrivateKey, AuthState, Arc<RwLock<KeyRing>>) {
+    fn bootstrap(
+        label: &str,
+    ) -> (
+        TmpDir,
+        ShareConfig,
+        PrivateKey,
+        AuthState,
+        Arc<RwLock<KeyRing>>,
+    ) {
         let td = TmpDir::new(label);
         let identity = PrivateKey::new();
         let topic = format!("topic-{label}");
@@ -1944,7 +1964,13 @@ mod tests {
         auth_state.create_group(&identity, group).unwrap();
         auth::save(td.path(), &config.id, &auth_state).unwrap();
         let ring = crypto::load_or_create_keyring(td.path(), &config.id).unwrap();
-        (td, config, identity, auth_state, Arc::new(RwLock::new(ring)))
+        (
+            td,
+            config,
+            identity,
+            auth_state,
+            Arc::new(RwLock::new(ring)),
+        )
     }
 
     #[tokio::test]
@@ -1952,9 +1978,17 @@ mod tests {
         let (td, config, identity, mut auth_state, key) = bootstrap("invite-1");
         let bob = PrivateKey::new();
         let ticket = handle_invite(
-            &config, td.path(), &identity, &key, &mut auth_state,
-            me_of(&bob), AuthRole::Writer, ShareRole::Sync,
-        ).await.unwrap();
+            &config,
+            td.path(),
+            &identity,
+            &key,
+            &mut auth_state,
+            me_of(&bob),
+            AuthRole::Writer,
+            ShareRole::Sync,
+        )
+        .await
+        .unwrap();
         assert!(!ticket.is_empty(), "ticket must not be empty");
 
         // Auth log on disk should now contain Create + Add.
@@ -1970,15 +2004,30 @@ mod tests {
         let bob = PrivateKey::new();
         // First add bob.
         handle_invite(
-            &config, td.path(), &identity, &key, &mut auth_state,
-            me_of(&bob), AuthRole::Writer, ShareRole::Sync,
-        ).await.unwrap();
+            &config,
+            td.path(),
+            &identity,
+            &key,
+            &mut auth_state,
+            me_of(&bob),
+            AuthRole::Writer,
+            ShareRole::Sync,
+        )
+        .await
+        .unwrap();
 
         let mut pending = Vec::new();
         let new_epoch = handle_revoke(
-            &config, td.path(), &identity, &key, &mut auth_state, &mut pending,
+            &config,
+            td.path(),
+            &identity,
+            &key,
+            &mut auth_state,
+            &mut pending,
             me_of(&bob),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         assert_eq!(new_epoch, 2);
 
         // Pending in-memory queue should have one entry; on disk too.

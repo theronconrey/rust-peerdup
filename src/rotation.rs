@@ -84,11 +84,7 @@ pub enum VerifyOutcome {
 
 /// Canonical bytes signed by the rotator. Order is part of the wire
 /// protocol — don't shuffle these fields.
-fn canonical_bytes(
-    epoch: u64,
-    rotator_pubkey: &MemberId,
-    envelopes: &[KeyEnvelope],
-) -> Vec<u8> {
+fn canonical_bytes(epoch: u64, rotator_pubkey: &MemberId, envelopes: &[KeyEnvelope]) -> Vec<u8> {
     bincode::serde::encode_to_vec(
         (&epoch, rotator_pubkey, envelopes),
         bincode::config::standard(),
@@ -100,8 +96,7 @@ fn canonical_bytes(
 /// suitable for `crypto_box::PublicKey`. Errors only on malformed Ed25519
 /// pubkeys (not on a valid curve point).
 fn ed25519_pub_to_box_pub(raw: &[u8; 32]) -> Result<BoxPublic> {
-    let vk = VerifyingKey::from_bytes(raw)
-        .map_err(|e| anyhow!("invalid Ed25519 pubkey: {e}"))?;
+    let vk = VerifyingKey::from_bytes(raw).map_err(|e| anyhow!("invalid Ed25519 pubkey: {e}"))?;
     Ok(BoxPublic::from(vk.to_montgomery().to_bytes()))
 }
 
@@ -401,8 +396,7 @@ mod tests {
 
         let new_key: Key = [0x33u8; KEY_LEN];
         // Address only to charlie.
-        let rot =
-            build_signed_rotation(&alice, 2, &new_key, &[me_of(&charlie)]).unwrap();
+        let rot = build_signed_rotation(&alice, 2, &new_key, &[me_of(&charlie)]).unwrap();
 
         let mut bob_state = AuthState::empty();
         for op in state.ops() {

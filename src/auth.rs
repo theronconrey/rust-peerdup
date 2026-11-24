@@ -330,11 +330,9 @@ impl AuthState {
         let me = MemberId(*my_key.public_key().as_bytes());
         let deps: Vec<OpId> = self.crdt.inner.heads().into_iter().collect();
         let payload = GroupControlMessage { group_id, action };
-        let canonical = bincode::serde::encode_to_vec(
-            (&me, &deps, &payload),
-            bincode::config::standard(),
-        )
-        .context("encoding canonical op")?;
+        let canonical =
+            bincode::serde::encode_to_vec((&me, &deps, &payload), bincode::config::standard())
+                .context("encoding canonical op")?;
         let sig = my_key.sign(&canonical);
         let op = SignedOp {
             author: me,
@@ -354,8 +352,7 @@ impl AuthState {
     pub fn apply_remote(&mut self, op: SignedOp) -> Result<bool> {
         op.verify().context("verifying remote auth op")?;
         let op_id = op.id();
-        if self.ops.iter().any(|o| o.id() == op_id)
-            || self.pending.iter().any(|o| o.id() == op_id)
+        if self.ops.iter().any(|o| o.id() == op_id) || self.pending.iter().any(|o| o.id() == op_id)
         {
             return Ok(false);
         }
@@ -618,17 +615,17 @@ mod tests {
             .unwrap();
         assert!(state.is_member(group, me_of(&bob)));
 
-        state
-            .remove_member(&alice, group, me_of(&bob))
-            .unwrap();
+        state.remove_member(&alice, group, me_of(&bob)).unwrap();
         assert!(!state.is_member(group, me_of(&bob)));
         assert!(state.is_member(group, me_of(&alice)));
     }
 
     #[test]
     fn member_id_hex_round_trip() {
-        let m = MemberId([0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf,
-            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f]);
+        let m = MemberId([
+            0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0x10, 0x11, 0x12, 0x13,
+            0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+        ]);
         let s = m.to_hex();
         assert_eq!(s.len(), 64);
         let back = MemberId::from_hex(&s).unwrap();
