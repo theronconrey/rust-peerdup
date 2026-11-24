@@ -22,13 +22,8 @@ pub fn load_or_create(path: &Path) -> Result<PrivateKey> {
             .parent()
             .ok_or_else(|| anyhow!("identity path has no parent: {path:?}"))?;
         fs::create_dir_all(parent).with_context(|| format!("create_dir_all {parent:?}"))?;
-        fs::write(path, key.as_bytes()).with_context(|| format!("writing {path:?}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("chmod 0600 {path:?}"))?;
-        }
+        crate::data_dir::write_private_atomic(path, key.as_bytes())
+            .with_context(|| format!("writing {path:?}"))?;
         Ok(key)
     }
 }

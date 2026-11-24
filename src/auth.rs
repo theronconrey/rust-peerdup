@@ -459,15 +459,8 @@ pub fn save(data_dir: &Path, share_id: &str, state: &AuthState) -> Result<()> {
     }
     let bytes = bincode::serde::encode_to_vec(&state.ops, bincode::config::standard())
         .context("encoding auth log")?;
-    let tmp = path.with_extension("log.tmp");
-    fs::write(&tmp, &bytes).with_context(|| format!("writing {tmp:?}"))?;
-    fs::rename(&tmp, &path).with_context(|| format!("renaming {tmp:?} -> {path:?}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 0600 {path:?}"))?;
-    }
+    crate::data_dir::write_private_atomic(&path, &bytes)
+        .with_context(|| format!("writing {path:?}"))?;
     Ok(())
 }
 

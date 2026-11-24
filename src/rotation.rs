@@ -232,15 +232,8 @@ pub fn save_pending(data_dir: &Path, share_id: &str, rotation: &SignedRotation) 
     let bytes = bincode::serde::encode_to_vec(rotation, bincode::config::standard())
         .context("encoding rotation")?;
     let path = dir.join(format!("{}.bin", rotation.epoch));
-    let tmp = path.with_extension("bin.tmp");
-    fs::write(&tmp, &bytes).with_context(|| format!("writing {tmp:?}"))?;
-    fs::rename(&tmp, &path).with_context(|| format!("renaming {tmp:?} -> {path:?}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 0600 {path:?}"))?;
-    }
+    crate::data_dir::write_private_atomic(&path, &bytes)
+        .with_context(|| format!("writing {path:?}"))?;
     Ok(())
 }
 

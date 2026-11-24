@@ -639,3 +639,12 @@ for `<parent>/<filename>` and finds nothing, then advertises the torrent as
 The current seed implementation canonicalizes the source folder and uses it
 directly as the session's default output folder, which works for both file
 counts.
+
+## Secrets on disk are created 0600, not chmod'ed to it
+
+`identity.key`, `keys.bin`, `auth.log` and the pending rotation envelopes
+all go through `data_dir::write_private_atomic`: the temp file is opened
+with `O_CREAT|O_EXCL` and mode 0600, synced, then renamed into place. The
+earlier pattern (`fs::write` then `set_permissions(0o600)`) left each
+secret readable under the default umask (usually 0644) until the chmod ran.
+If you add another file that holds key material, write it the same way.
