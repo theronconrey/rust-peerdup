@@ -31,7 +31,7 @@ jobs:
           cargo rust clippy rustfmt cargo-rpm-macros cargo-vendor-filterer xz
           systemd firewalld
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # The spec's BuildRequires (OpenSSL headers, the C toolchain the
       # crypto crates need) are what cargo needs too.

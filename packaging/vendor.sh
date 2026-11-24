@@ -30,7 +30,7 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 # Fedora builds every Linux architecture Rust supports (%{rust_arches}).
-(cd "$repo" && cargo vendor-filterer --locked \
+(cd "$repo" && cargo vendor-filterer \
     --platform='*-unknown-linux-gnu' \
     --platform='*-unknown-linux-gnueabihf' \
     "$work/vendor" >&2)
