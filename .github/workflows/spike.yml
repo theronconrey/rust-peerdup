@@ -67,6 +67,7 @@ jobs:
         run: |
           cargo build --locked
           tests/e2e-sync.sh target/debug/rust-peerdup
+          tests/e2e-revoke.sh target/debug/rust-peerdup
 
       - uses: actions/upload-artifact@v4
         with:

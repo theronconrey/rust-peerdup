@@ -85,6 +85,7 @@ jobs:
           dnf -y install "$HOME"/rpmbuild/RPMS/*/rust-peerdup-[0-9]*.rpm
           # Two installed daemons sync a share over iroh-blobs.
           tests/e2e-sync.sh /usr/bin/rust-peerdup
+          tests/e2e-revoke.sh /usr/bin/rust-peerdup
           # Linked against Fedora's SQLite, not a bundled copy.
           ldd /usr/bin/rust-peerdup | grep -q libsqlite3
           cd /

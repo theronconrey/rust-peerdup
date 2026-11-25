@@ -44,11 +44,11 @@ writing:
 | 5c. `p2panda-auth` group CRDT integration | ✅ Done |
 | 5d. Auto key rotation on revocation | ✅ Done |
 | 5e. 4-peer revocation e2e test | ✅ Done |
-| Write permission enforced on sync announces (readers, revoked members) | ❌ Not yet (Phase 7.5) |
+| Write permission enforced on sync announces (readers, revoked members) | ✅ Done (signed announces) |
 | 7. D-Bus IPC surface | ⚠️ Partial: CLI talks to the daemon over `org.peerdup.Daemon1`; no signals yet |
 | 6a. Transport: iroh-blobs over iroh | ✅ Done (spike checks open) |
 | 6. Only members can connect (replaces the BitTorrent admission gate) | ✅ Done |
-| 7.5. Sync across networks | ⚠️ In progress: works via relays; signed announces next |
+| 7.5. Sync across networks | ⚠️ In progress: works via relays; conflict copies and random topics next |
 
 Detailed design notes, including non-obvious gotchas about iroh and
 p2panda, live in [`INTEGRATION_NOTES.md`](INTEGRATION_NOTES.md). Read it
@@ -166,7 +166,7 @@ The `--data-dir` flag has dual semantics in Phase 7:
 - With `serve`: tells the daemon where to keep state.
 - With a client subcommand: opts the CLI out of D-Bus entirely and
   performs the operation directly against the on-disk state. Useful
-  for headless test rigs (the container peers in `tests/e2e-revoke.sh`
+  for headless test rigs (the daemons in the `tests/e2e-*.sh` scripts
   run this way), and matches the Phase 2–6 behaviour. The "running
   daemon will not see this change until restart" caveat from the older
   phases applies in this mode.
@@ -209,16 +209,13 @@ uninstall.sh                        remove binary + unit + activation (keeps dat
 
 Tests are in-module (`#[cfg(test)] mod tests`); run with `cargo test`.
 
-The 4-peer revocation end-to-end test lives at
-[`tests/e2e-revoke.sh`](tests/e2e-revoke.sh). It spins up A on the host
-plus B/C/D in podman containers (via `containers/run-peer.sh`), runs
-the full invite → sync → revoke → rotate flow, and asserts that the
-revoked peer can fetch ciphertext but cannot derive plaintext. Run it
-with:
+End-to-end tests, each a script that starts real daemons (CI runs all
+three against the binary from the RPM):
 
 ```bash
-podman build -t rust-peerdup-peer -f containers/Containerfile .  # one-time
-./tests/e2e-revoke.sh
+tests/e2e-sync.sh   target/debug/rust-peerdup   # two peers, one network
+tests/e2e-revoke.sh target/debug/rust-peerdup   # owner, writer, reader; revoke
+tests/e2e-xnet.sh   target/debug/rust-peerdup   # two isolated networks (docker)
 ```
 
 ## Contributing

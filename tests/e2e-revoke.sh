@@ -1,304 +1,122 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# Phase 5e: 4-peer revocation end-to-end test.
+# Roles and revocation, end to end, with three daemons on one host:
+# A is the Owner, B a Writer, C a Reader.
 #
-# Spins up peer A on the host (in a temp data dir, NOT the user's real
-# install) plus peers B, C, D as podman containers, all on `--network
-# host` with distinct BT ports. Walks through:
+#   1. A's files reach B and C.
+#   2. A Writer's edit (B) reaches A.
+#   3. A Reader's edit (C) stays local: A and B never get it.
+#   4. A revokes B. A new file from A reaches C but never B (B is refused
+#      at the connection and can't decrypt the new epoch anyway).
+#   5. B's edits after its revocation never reach A.
 #
-#   1. A creates a share, invites B/C/D as writers.
-#   2. All four daemons start. A drops a file into the share root.
-#   3. Verify B, C, D all receive the file (initial sync works).
-#   4. A revokes B. A's daemon restarts to broadcast the rotation.
-#   5. Verify keyring sizes after rotation:
-#        A=64B (epoch 2 appended), C=64B (received), D=64B (received),
-#        B=32B (revoked, no envelope addressed to B).
-#   6. A writes a new file under epoch 2.
-#   7. Verify C and D get the plaintext; B downloads the ciphertext
-#      shadow blob but cannot decrypt it (no plaintext lands in B's
-#      share root).
-#   8. Verify share-members shows {A, C, D} on each remaining peer.
-#
-# Exit code 0 = all assertions hold. Non-zero with a FAIL line on the
-# first violated assertion. The cleanup trap stops containers and wipes
-# scratch dirs so reruns don't collide.
-#
-# Usage (from repo root):
-#   ./tests/e2e-revoke.sh
-#
-# Requirements: podman, a `cargo build --release`-ready toolchain (the
-# script will build if `target/release/rust-peerdup` is missing). The
-# `containers/Containerfile` image must already be built — do that
-# once with:
-#   podman build -t rust-peerdup-peer -f containers/Containerfile .
+# Usage: tests/e2e-revoke.sh [path/to/rust-peerdup]   (default: target/debug)
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-cd "$REPO_ROOT"
+BIN="${1:-$REPO_ROOT/target/debug/rust-peerdup}"
+[ -x "$BIN" ] || { echo "no binary at $BIN" >&2; exit 1; }
 
-# Per-run unique suffix so reruns don't collide.
-RUN_ID="$$-$(date +%s)"
-DATA_A="/tmp/peerdup-e2e-a-${RUN_ID}"
-SHARE_A="/tmp/peerdup-e2e-a-share-${RUN_ID}"
-PEERS=(b c d)
-PORTS=(41001 41002 41003)
-TOPIC="e2e-revoke-${RUN_ID}"
-BIN="${REPO_ROOT}/target/release/rust-peerdup"
-
-# Phase 7 toggle (off by default). When set to 1, host-side peerdup
-# invocations skip --data-dir overrides and route through the running
-# daemon's session bus, exercising the IPC path alongside the gossip
-# convergence test. Currently a stub: the focused IPC coverage lives in
-# tests/e2e-dbus.sh; flipping this on while the activation file still
-# points at $DATA_A is a future refinement (would need wired-up bus
-# activation per-test data dir, which conflicts with a host install).
-USE_DBUS="${PEERDUP_E2E_USE_DBUS:-0}"
-if [ "$USE_DBUS" = "1" ]; then
-    printf '\033[1;33m warn\033[0m PEERDUP_E2E_USE_DBUS=1 is reserved for a future refinement; using direct on-disk path for this run.\n' >&2
-fi
-
-declare -A DATA_DIR SHARE_DIR PUBKEY
-for p in "${PEERS[@]}"; do
-    DATA_DIR[$p]="/tmp/peerdup-e2e-${p}-${RUN_ID}-data"
-    SHARE_DIR[$p]="/tmp/peerdup-e2e-${p}-${RUN_ID}-share"
-done
-
-DAEMON_A_PID=""
+SCRATCH="$(mktemp -d /tmp/peerdup-e2e-revoke.XXXXXX)"
+TIMEOUT="${PEERDUP_E2E_TIMEOUT:-90}"
+QUIET="${PEERDUP_E2E_QUIET:-20}"   # how long "never arrives" is watched
+declare -A PID
 
 ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
-fail() { printf '\033[1;31mFAIL\033[0m %s\n' "$*" >&2; exit 1; }
+fail() {
+    printf '\033[1;31mFAIL\033[0m %s\n' "$*" >&2
+    for p in a b c; do
+        echo "---- daemon ${p^^} log (tail) ----" >&2
+        tail -n 40 "$SCRATCH/$p.log" >&2 2>/dev/null || true
+    done
+    exit 1
+}
 
 cleanup() {
     set +e
-    # On failure, dump B's container logs to /tmp/ so the cause is visible
-    # after teardown. On success the test produced its own evidence.
-    if [ -n "${B_LOG_DUMP:-}" ]; then
-        podman logs "peer-b-${RUN_ID}" >"$B_LOG_DUMP" 2>&1 || true
-    fi
-    if [ -n "$DAEMON_A_PID" ] && kill -0 "$DAEMON_A_PID" 2>/dev/null; then
-        kill -TERM "$DAEMON_A_PID" 2>/dev/null
-        wait "$DAEMON_A_PID" 2>/dev/null
-    fi
-    for p in "${PEERS[@]}"; do
-        podman rm -f "peer-${p}-${RUN_ID}" 2>/dev/null
-    done
-    rm -rf "$DATA_A" "$SHARE_A"
-    for p in "${PEERS[@]}"; do
-        rm -rf "${DATA_DIR[$p]}" "${SHARE_DIR[$p]}"
-    done
+    for p in "${!PID[@]}"; do kill -TERM "${PID[$p]}" 2>/dev/null; done
+    for p in "${!PID[@]}"; do wait "${PID[$p]}" 2>/dev/null; done
+    if [ -n "${KEEP_SCRATCH:-}" ]; then echo "kept $SCRATCH"; else rm -rf "$SCRATCH"; fi
 }
 trap cleanup EXIT INT TERM
 
-# Wrapper around containers/run-peer.sh so the per-peer env-var
-# scaffolding is encapsulated and unique per run.
-peer() {
-    local p="$1"; shift
-    PEER_NAME="peer-${p}-${RUN_ID}" \
-    HOST_DATA="${DATA_DIR[$p]}" \
-    HOST_SHARE="${SHARE_DIR[$p]}" \
-    "${REPO_ROOT}/containers/run-peer.sh" "$@"
+data() { echo "$SCRATCH/data-$1"; }
+root() { echo "$SCRATCH/share-$1"; }
+pd() { local p="$1"; shift; "$BIN" --data-dir "$(data "$p")" "$@"; }
+start() { pd "$1" serve --no-dbus >>"$SCRATCH/$1.log" 2>&1 & PID[$1]=$!; }
+stop() { kill -TERM "${PID[$1]}"; wait "${PID[$1]}" 2>/dev/null || true; unset "PID[$1]"; }
+
+wait_for() {
+    local what="$1"; shift
+    local deadline=$((SECONDS + TIMEOUT))
+    until "$@" >/dev/null 2>&1; do
+        [ "$SECONDS" -lt "$deadline" ] || fail "timed out after ${TIMEOUT}s: $what"
+        sleep 1
+    done
+    ok "$what"
 }
 
-# ── Preflight ────────────────────────────────────────────────────────────────
+# never <description> <command...>: the command must stay false for $QUIET s.
+never() {
+    local what="$1"; shift
+    local deadline=$((SECONDS + QUIET))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if "$@" >/dev/null 2>&1; then fail "it happened: $what"; fi
+        sleep 1
+    done
+    ok "for ${QUIET}s, never: $what"
+}
 
-command -v podman >/dev/null 2>&1 || fail "podman is required"
-podman image exists rust-peerdup-peer \
-    || fail "container image 'rust-peerdup-peer' not built. Run: podman build -t rust-peerdup-peer -f containers/Containerfile ."
+has() { grep -q "$2" "$(root "$1")/$3" 2>/dev/null; }
+exists() { test -e "$(root "$1")/$2"; }
 
-if [ ! -x "$BIN" ]; then
-    info "Building release binary..."
-    if [ -f "$HOME/.cargo/env" ]; then
-        # shellcheck disable=SC1091
-        . "$HOME/.cargo/env"
-    fi
-    cargo build --release >/dev/null
-fi
-[ -x "$BIN" ] || fail "release binary missing at $BIN"
+export RUST_LOG="${RUST_LOG:-rust_peerdup=info}"
 
-# Make sure no stale containers from a previous failed run are around.
-for p in "${PEERS[@]}"; do
-    podman rm -f "peer-${p}-${RUN_ID}" 2>/dev/null || true
+info "A creates a share and invites B (writer) and C (reader)"
+mkdir -p "$(root a)" "$(root b)" "$(root c)"
+echo "hello from A" > "$(root a)/hello.txt"
+pd a share-add --topic "e2e-revoke-$$-$RANDOM" --path "$(root a)" --role sync >/dev/null
+share="$(pd a share-list | awk 'NR>1 {print $1; exit}')"
+pub_b="$(pd b whoami)"; pub_c="$(pd c whoami)"
+pd a share-invite "$share" "$pub_b" --auth-role writer 2>/dev/null | pd b share-join - --path "$(root b)" >/dev/null
+pd a share-invite "$share" "$pub_c" --auth-role reader 2>/dev/null | pd c share-join - --path "$(root c)" >/dev/null
+ok "share $share: A owner, B writer, C reader"
+
+start a; start b; start c
+wait_for "A's file reaches B" has b "hello from A" hello.txt
+wait_for "A's file reaches C" has c "hello from A" hello.txt
+
+info "B (writer) edits"
+echo "from B" >> "$(root b)/hello.txt"
+wait_for "B's edit reaches A" has a "from B" hello.txt
+wait_for "B's edit reaches C" has c "from B" hello.txt
+
+info "C (reader) edits"
+echo "from C" > "$(root c)/reader-note.txt"
+never "C's file reaches A" exists a reader-note.txt
+never "C's file reaches B" exists b reader-note.txt
+
+info "A revokes B"
+stop a
+pd a share-revoke "$share" "$pub_b" >/dev/null
+start a
+pd a share-members "$share" | grep -q "$pub_b" && fail "B still listed as a member"
+ok "B is no longer a member"
+
+info "A adds a file after the revocation"
+echo "after revoking B" > "$(root a)/secret.txt"
+wait_for "the new file reaches C" exists c secret.txt
+never "the new file reaches B" exists b secret.txt
+
+info "B (revoked) edits"
+echo "B after revocation" >> "$(root b)/hello.txt"
+never "B's post-revocation edit reaches A" has a "B after revocation" hello.txt
+
+for p in a b c; do
+    kill -0 "${PID[$p]}" 2>/dev/null || fail "daemon ${p^^} exited early"
 done
-
-# ── 1. Identities ────────────────────────────────────────────────────────────
-
-info "Generating identities for A, B, C, D..."
-mkdir -p "$DATA_A" "$SHARE_A"
-PUBKEY_A=$("$BIN" --data-dir "$DATA_A" whoami)
-[ "${#PUBKEY_A}" -eq 64 ] || fail "A pubkey wrong length: ${#PUBKEY_A}"
-ok "A: $PUBKEY_A"
-for p in "${PEERS[@]}"; do
-    PUBKEY[$p]=$(peer "$p" whoami)
-    [ "${#PUBKEY[$p]}" -eq 64 ] || fail "${p^^} pubkey wrong length: ${#PUBKEY[$p]}"
-    ok "${p^^}: ${PUBKEY[$p]}"
-done
-
-# ── 2. share-add + invite each ───────────────────────────────────────────────
-
-info "A creates share and invites B, C, D..."
-"$BIN" --data-dir "$DATA_A" share-add --topic "$TOPIC" --path "$SHARE_A" --role sync >/dev/null
-SHARE_ID=$("$BIN" --data-dir "$DATA_A" share-list | tail -1 | awk '{print $1}')
-[ -n "$SHARE_ID" ] || fail "could not capture SHARE_ID"
-ok "share id: $SHARE_ID"
-
-for p in "${PEERS[@]}"; do
-    TICKET=$("$BIN" --data-dir "$DATA_A" share-invite "$SHARE_ID" "${PUBKEY[$p]}" --auth-role writer 2>/dev/null | grep -v '^#' | grep -v '^$')
-    [ -n "$TICKET" ] || fail "ticket for ${p^^} was empty"
-    peer "$p" share-join "$TICKET" --path /share >/dev/null
-    ok "${p^^} joined"
-done
-
-# A authored every Add op locally, so its view is already complete. The
-# joiners' tickets only carried the log up to their own Add — peer B
-# doesn't yet know about C and D, etc. Cross-peer convergence happens
-# once daemons run and gossip the auth ops.
-A_MEMBERS=$("$BIN" --data-dir "$DATA_A" share-members "$SHARE_ID" | tail -n +2 | grep -c .)
-[ "$A_MEMBERS" -eq 4 ] || fail "A sees $A_MEMBERS members after all invites, expected 4"
-ok "A sees 4 members in the auth state (cross-peer convergence checked after daemons start)"
-
-# ── 3. Initial content + start daemons ──────────────────────────────────────
-
-echo "epoch1-content-${RUN_ID}" > "$SHARE_A/file1.txt"
-
-info "Starting daemons (A foreground via &; B/C/D detached)..."
-"$BIN" --data-dir "$DATA_A" serve --bt-port 41000 >/tmp/peerdup-a-${RUN_ID}.log 2>&1 &
-DAEMON_A_PID=$!
-
-for i in 0 1 2; do
-    p="${PEERS[$i]}"
-    port="${PORTS[$i]}"
-    peer "$p" -d serve --bt-port "$port" >/dev/null
-done
-
-# Give discovery + initial fetch room. 10s announce tick + transfer.
-sleep 12
-
-# ── 4. Initial sync assertions ───────────────────────────────────────────────
-
-for p in "${PEERS[@]}"; do
-    [ -f "${SHARE_DIR[$p]}/file1.txt" ] || fail "${p^^} did not receive file1.txt"
-done
-ok "B, C, D all received file1.txt"
-
-# Cross-peer auth convergence: now that all daemons have ticked at least
-# once, each peer should have learned the full membership via gossip.
-for who in A "${PEERS[@]}"; do
-    if [ "$who" = "A" ]; then
-        actual=$("$BIN" --data-dir "$DATA_A" share-members "$SHARE_ID" | tail -n +2 | grep -c .)
-    else
-        actual=$(peer "$who" share-members "$SHARE_ID" | tail -n +2 | grep -c .)
-    fi
-    [ "$actual" -eq 4 ] || fail "${who^^} sees $actual members after gossip, expected 4"
-done
-ok "post-gossip: all four peers converged on 4 members"
-
-# Pre-revoke keyring sizes: all 32B (single epoch 1 key).
-for who in A "${PEERS[@]}"; do
-    if [ "$who" = "A" ]; then
-        sz=$(stat -c '%s' "$DATA_A/shares/$SHARE_ID/keys.bin")
-    else
-        sz=$(stat -c '%s' "${DATA_DIR[$who]}/shares/$SHARE_ID/keys.bin")
-    fi
-    [ "$sz" -eq 32 ] || fail "${who^^} keys.bin pre-revoke is ${sz}B, expected 32"
-done
-ok "pre-revoke: all keyrings are 32B (single epoch 1)"
-
-# ── 5. A revokes B + restart daemon to broadcast ─────────────────────────────
-
-info "A revokes B and restarts daemon..."
-# Direct mode refuses to write while the daemon holds its lock (otherwise
-# the daemon's next save could overwrite the revocation), so stop A first,
-# revoke, then start it again to broadcast the new auth log and rotation.
-kill -TERM "$DAEMON_A_PID"
-wait "$DAEMON_A_PID" 2>/dev/null || true
-"$BIN" --data-dir "$DATA_A" share-revoke "$SHARE_ID" "${PUBKEY[b]}" >/dev/null
-"$BIN" --data-dir "$DATA_A" serve --bt-port 41000 >>/tmp/peerdup-a-${RUN_ID}.log 2>&1 &
-DAEMON_A_PID=$!
-
-# Wait long enough for at least one announce tick (10s) plus generous slack
-# for the rotation envelope to reach C and D and be installed.
-sleep 18
-
-# ── 6. Post-revoke keyring assertions ────────────────────────────────────────
-
-A_SZ=$(stat -c '%s' "$DATA_A/shares/$SHARE_ID/keys.bin")
-B_SZ=$(stat -c '%s' "${DATA_DIR[b]}/shares/$SHARE_ID/keys.bin")
-C_SZ=$(stat -c '%s' "${DATA_DIR[c]}/shares/$SHARE_ID/keys.bin")
-D_SZ=$(stat -c '%s' "${DATA_DIR[d]}/shares/$SHARE_ID/keys.bin")
-
-[ "$A_SZ" -eq 64 ] || fail "A keys.bin = ${A_SZ}B, expected 64 (rotation epoch 2 appended on revoke)"
-[ "$C_SZ" -eq 64 ] || fail "C keys.bin = ${C_SZ}B, expected 64 (rotation envelope received + installed)"
-[ "$D_SZ" -eq 64 ] || fail "D keys.bin = ${D_SZ}B, expected 64 (rotation envelope received + installed)"
-[ "$B_SZ" -eq 32 ] || fail "B keys.bin = ${B_SZ}B, expected 32 (revoked, no envelope addressed to B)"
-ok "post-revoke keyrings: A=64 B=32 C=64 D=64"
-
-# Membership view: A, C, D should see 3 members; B should see 3 members but
-# not include itself (B observed its own Remove via gossip).
-for who in A c d; do
-    if [ "$who" = "A" ]; then
-        actual=$("$BIN" --data-dir "$DATA_A" share-members "$SHARE_ID" | tail -n +2 | grep -c .)
-    else
-        actual=$(peer "$who" share-members "$SHARE_ID" | tail -n +2 | grep -c .)
-    fi
-    [ "$actual" -eq 3 ] || fail "${who^^} sees $actual members post-revoke, expected 3"
-done
-ok "A, C, D each see exactly 3 members"
-
-if peer b share-members "$SHARE_ID" | tail -n +2 | grep -q "${PUBKEY[b]}"; then
-    fail "B still sees itself as a member after revoke; auth gossip didn't propagate"
-fi
-ok "B no longer sees itself as a member"
-
-# ── 7. New content under epoch 2 ─────────────────────────────────────────────
-
-info "A writes new content (will be encrypted under epoch 2)..."
-echo "epoch2-secret-${RUN_ID}" > "$SHARE_A/secret.txt"
-sleep 12
-
-# Plaintext should reach C and D, NOT B.
-[ -f "${SHARE_DIR[c]}/secret.txt" ] || fail "C did not receive secret.txt plaintext"
-[ -f "${SHARE_DIR[d]}/secret.txt" ] || fail "D did not receive secret.txt plaintext"
-if [ -f "${SHARE_DIR[b]}/secret.txt" ]; then
-    fail "SECURITY: B received secret.txt plaintext after revoke"
-fi
-ok "C and D got plaintext; B did not"
-
-# Content equality check on the lucky two.
-diff -q "$SHARE_A/secret.txt" "${SHARE_DIR[c]}/secret.txt" >/dev/null || fail "C's plaintext differs from A's"
-diff -q "$SHARE_A/secret.txt" "${SHARE_DIR[d]}/secret.txt" >/dev/null || fail "D's plaintext differs from A's"
-ok "C and D plaintext byte-identical to A's"
-
-# B should still pull the ciphertext blob over BT (Phase 6 will block this);
-# the proof of correctness here is that B has the .bin but no plaintext.
-[ -f "${SHARE_DIR[b]}/.peerdup/encrypted/secret.txt.bin" ] || fail "B did not even receive the ciphertext blob — gossip path is broken"
-ok "B received ciphertext blob (will be plaintext-blocked in Phase 6)"
-
-# Confirm B logged a decrypt-related warning (any of several substrings — the
-# load-bearing assertion is "B has no plaintext", already passed). The
-# decrypt-failure log can lag the actual fetch by a few seconds depending on
-# how fast librqbit advertises completion; poll-with-timeout instead of
-# checking once.
-B_LOG_DUMP="/tmp/peerdup-e2e-b-${RUN_ID}.log"
-LOG_FOUND=0
-for _ in $(seq 1 15); do
-    if podman logs "peer-b-${RUN_ID}" 2>&1 \
-            | grep -E -q "no key for epoch|decrypting shadow|apply_remote failed"; then
-        LOG_FOUND=1
-        break
-    fi
-    sleep 1
-done
-if [ "$LOG_FOUND" -eq 1 ]; then
-    ok "B logged a decrypt-related warning (expected)"
-    B_LOG_DUMP=""  # success: don't keep the dump on cleanup
-else
-    podman logs "peer-b-${RUN_ID}" >"$B_LOG_DUMP" 2>&1 || true
-    fail "B's logs lack the expected decrypt failure markers after 15s; full log saved to $B_LOG_DUMP"
-fi
-
-# ── Done ────────────────────────────────────────────────────────────────────
-
-printf '\n\033[1;32mPhase 5e: all assertions passed.\033[0m\n'
+ok "all three daemons still running"
+info "e2e-revoke passed"
