@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: MIT
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/theronconrey/rust-peerdup/security/advisories/new
+    about: Privately, please. SECURITY.md says what to include.
+  - name: Copr builds and packages
+    url: https://copr.fedorainfracloud.org/coprs/theronconrey/peerdup/
+    about: Build logs and the package list for the theronconrey/peerdup Copr project.
