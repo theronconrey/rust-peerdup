@@ -2,8 +2,9 @@
 
 A folder-sync daemon built on [`p2panda`](https://p2panda.org/) for peer
 discovery and gossip, and [`librqbit`](https://github.com/ikatson/rqbit) for
-BitTorrent-based content transfer. End-to-end encrypted, multi-master,
-runs as a long-lived daemon managing multiple shares.
+BitTorrent-based content transfer. File contents are encrypted end to
+end (file names and sizes are not hidden yet), multi-master, and it runs
+as a long-lived daemon managing multiple shares.
 
 ## Why a separate Rust implementation
 
@@ -65,13 +66,23 @@ sudo dnf install rust-peerdup
 The package ships the binary, a man page, the `systemd --user` unit, the
 D-Bus activation file and a firewalld service. Nothing is enabled for you:
 the first CLI call starts the daemon over D-Bus, or enable it at login with
-`systemctl --user enable --now rust-peerdup`. To let peers reach you
-directly rather than through relays:
+`systemctl --user enable --now rust-peerdup`. File transfers are
+BitTorrent and need the port reachable on at least one side, so open it:
 
 ```bash
 sudo firewall-cmd --permanent --add-service=rust-peerdup
 sudo firewall-cmd --reload
 ```
+
+The port is per user (41000 by default). If two people use rust-peerdup on
+one machine, give the second a different one with
+`systemctl --user edit rust-peerdup` (`[Service]`,
+`Environment=PEERDUP_BT_PORT=41001`) and open that port instead.
+
+> **Not yet ready for syncing between machines.** Daemons on two different
+> hosts don't sync yet: each announces a loopback address (see
+> `INTEGRATION_NOTES.md`, "Announce a reachable address"). This is the next
+> piece of work.
 
 ### From source (development)
 
