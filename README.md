@@ -53,6 +53,28 @@ in particular saves an hour of unnecessary fixing.
 
 ## Install
 
+On Fedora, from the
+[theronconrey/peerdup](https://copr.fedorainfracloud.org/coprs/theronconrey/peerdup/)
+Copr project (the same place as tamarack):
+
+```bash
+sudo dnf copr enable theronconrey/peerdup
+sudo dnf install rust-peerdup
+```
+
+The package ships the binary, a man page, the `systemd --user` unit, the
+D-Bus activation file and a firewalld service. Nothing is enabled for you:
+the first CLI call starts the daemon over D-Bus, or enable it at login with
+`systemctl --user enable --now rust-peerdup`. To let peers reach you
+directly rather than through relays:
+
+```bash
+sudo firewall-cmd --permanent --add-service=rust-peerdup
+sudo firewall-cmd --reload
+```
+
+### From source (development)
+
 The repo ships a shell installer that builds a release binary, drops it
 at `~/.local/bin/rust-peerdup`, and installs a `systemd --user` unit:
 
@@ -157,6 +179,10 @@ src/
 
 systemd/rust-peerdup.service       systemd user unit installed by install.sh
 dbus-1/org.peerdup.Daemon1.service D-Bus session activation file
+firewalld/rust-peerdup.xml         firewalld service (BT port, mDNS)
+rust-peerdup.spec                  RPM spec (vendored crates; see CONTRIBUTING.md)
+packaging/vendor.sh                makes the RPM's source and vendor tarballs
+.packit.yaml                       Copr builds for PRs, main and releases
 install.sh                          build + install (binary + unit + activation)
 uninstall.sh                        remove binary + unit + activation (keeps data dir)
 ```
@@ -175,6 +201,13 @@ podman build -t rust-peerdup-peer -f containers/Containerfile .  # one-time
 ./tests/e2e-revoke.sh
 ```
 
+## Contributing
+
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md): everything here follows Fedora's
+packaging guidelines, and pull requests are built in Copr and checked in a
+Fedora container before they merge.
+
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT — see [`LICENSE`](LICENSE). The RPM also lists the licenses of the
+crates it is built from.

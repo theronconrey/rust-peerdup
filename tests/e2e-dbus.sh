@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
 # Phase 7: D-Bus IPC end-to-end smoke test.
 #
 # Spins up an isolated XDG_DATA_HOME that the daemon will use both for its

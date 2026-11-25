@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::data_dir;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -67,10 +68,9 @@ pub fn load_all(data_dir: &Path) -> Result<Vec<ShareConfig>> {
             tracing::warn!(dir = %id, "skipping share dir with no share.json");
             continue;
         }
-        let bytes =
-            fs::read(&path).with_context(|| format!("reading {path:?}"))?;
-        let cfg: ShareConfig = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parsing {path:?}"))?;
+        let bytes = fs::read(&path).with_context(|| format!("reading {path:?}"))?;
+        let cfg: ShareConfig =
+            serde_json::from_slice(&bytes).with_context(|| format!("parsing {path:?}"))?;
         if cfg.id != id {
             tracing::warn!(dir = %id, json_id = %cfg.id, "share id mismatch (using json)");
         }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Phase 7: D-Bus IPC surface.
 //!
 //! Exposes `org.peerdup.Daemon1` on the user session bus. Other processes
@@ -59,9 +60,7 @@ impl Daemon1Iface {
     /// is a subset of this list (shares may exist on disk but not yet be
     /// running, e.g. immediately after `share-add` before the spawn task
     /// has registered).
-    async fn share_list(
-        &self,
-    ) -> zbus::fdo::Result<Vec<(String, String, String, String, String)>> {
+    async fn share_list(&self) -> zbus::fdo::Result<Vec<(String, String, String, String, String)>> {
         let configs = share::load_all(&self.rt.data_dir).map_err(fdo_err)?;
         let mut out = Vec::with_capacity(configs.len());
         for c in configs {
@@ -84,12 +83,7 @@ impl Daemon1Iface {
     /// Add a new share to disk and spawn its share task. Returns the
     /// allocated share id. The share is bootstrapped with this daemon as
     /// auth-group Owner, mirroring the Phase 5c CLI's `share-add` body.
-    async fn share_add(
-        &self,
-        topic: &str,
-        path: &str,
-        role: &str,
-    ) -> zbus::fdo::Result<String> {
+    async fn share_add(&self, topic: &str, path: &str, role: &str) -> zbus::fdo::Result<String> {
         let role = ShareRole::from_str(role)
             .map_err(|e| fdo_err(anyhow::anyhow!("invalid role {role:?}: {e}")))?;
         let path = PathBuf::from(path);
@@ -242,9 +236,7 @@ impl Daemon1Iface {
             reply: reply_tx,
         })
         .await
-        .map_err(|_| {
-            zbus::fdo::Error::Failed("share task no longer running".to_string())
-        })?;
+        .map_err(|_| zbus::fdo::Error::Failed("share task no longer running".to_string()))?;
         let ticket = reply_rx
             .await
             .map_err(|_| zbus::fdo::Error::Failed("share task dropped reply".to_string()))?
@@ -265,9 +257,7 @@ impl Daemon1Iface {
             reply: reply_tx,
         })
         .await
-        .map_err(|_| {
-            zbus::fdo::Error::Failed("share task no longer running".to_string())
-        })?;
+        .map_err(|_| zbus::fdo::Error::Failed("share task no longer running".to_string()))?;
         let new_epoch = reply_rx
             .await
             .map_err(|_| zbus::fdo::Error::Failed("share task dropped reply".to_string()))?
@@ -277,17 +267,12 @@ impl Daemon1Iface {
 
     /// Current ACL members: `(hex_pubkey, role)`. Reads the local replay
     /// of the share's auth log via the share task.
-    async fn share_members(
-        &self,
-        id: &str,
-    ) -> zbus::fdo::Result<Vec<(String, String)>> {
+    async fn share_members(&self, id: &str) -> zbus::fdo::Result<Vec<(String, String)>> {
         let tx = self.share_sender(id).await?;
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(ShareCommand::Members { reply: reply_tx })
             .await
-            .map_err(|_| {
-                zbus::fdo::Error::Failed("share task no longer running".to_string())
-            })?;
+            .map_err(|_| zbus::fdo::Error::Failed("share task no longer running".to_string()))?;
         let members = reply_rx
             .await
             .map_err(|_| zbus::fdo::Error::Failed("share task dropped reply".to_string()))?
@@ -317,12 +302,8 @@ impl Daemon1Iface {
         let Some(state) = state else {
             return Ok(Vec::new());
         };
-        let mut peers: Vec<(String, u64)> = state
-            .clock
-            .0
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
+        let mut peers: Vec<(String, u64)> =
+            state.clock.0.iter().map(|(k, v)| (k.clone(), *v)).collect();
         peers.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         Ok(peers)
     }
@@ -333,9 +314,7 @@ impl Daemon1Iface {
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(ShareCommand::RotateKey { reply: reply_tx })
             .await
-            .map_err(|_| {
-                zbus::fdo::Error::Failed("share task no longer running".to_string())
-            })?;
+            .map_err(|_| zbus::fdo::Error::Failed("share task no longer running".to_string()))?;
         let new_epoch = reply_rx
             .await
             .map_err(|_| zbus::fdo::Error::Failed("share task dropped reply".to_string()))?
@@ -364,7 +343,11 @@ impl Daemon1Iface {
             let (reply_tx, reply_rx) = oneshot::channel();
             // If the task already exited, send may fail — treat as a
             // successful early shutdown.
-            if tx.send(ShareCommand::Shutdown { reply: reply_tx }).await.is_ok() {
+            if tx
+                .send(ShareCommand::Shutdown { reply: reply_tx })
+                .await
+                .is_ok()
+            {
                 let _ = reply_rx.await;
             }
         }
@@ -436,8 +419,11 @@ pub async fn register(rt: Arc<DaemonRuntime>) -> anyhow::Result<zbus::Connection
         .build()
         .await
         .context("building zbus connection")?;
-    tracing::info!(bus_name = BUS_NAME, object_path = OBJECT_PATH,
-        "registered on session bus");
+    tracing::info!(
+        bus_name = BUS_NAME,
+        object_path = OBJECT_PATH,
+        "registered on session bus"
+    );
     Ok(conn)
 }
 

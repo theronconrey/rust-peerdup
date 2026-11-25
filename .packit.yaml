@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: MIT
+#
+# Packit builds the RPM in Copr: every pull request (in Packit's own Copr
+# namespace, for testing), and every GitHub release into the
+# theronconrey/peerdup Copr project that users install from. Active once the
+# Packit GitHub app is installed on the repository, and the peerdup Copr
+# project lists github.com/theronconrey/rust-peerdup under
+# Settings > Integrations > "Packit allowed forge projects".
+# https://packit.dev/docs/guide
+
+specfile_path: rust-peerdup.spec
+upstream_package_name: rust-peerdup
+downstream_package_name: rust-peerdup
+upstream_tag_template: v{version}
+
+files_to_sync:
+  - rust-peerdup.spec
+  - .packit.yaml
+
+# The SRPM is made in Copr with network access: packaging/vendor.sh runs
+# cargo vendor-filterer to make the vendor tarball (Source1) next to the
+# spec file, and prints the source tarball (Source0) for Packit.
+srpm_build_deps:
+  - cargo
+  - cargo-vendor-filterer
+  - git-core
+  - xz
+
+actions:
+  # Cargo.toml is the one place the version lives; the spec must match it
+  # (CI checks that).
+  get-current-version:
+    - bash -c "sed -n 's/^version = \"\\(.*\\)\"$/\\1/p' Cargo.toml | head -n1"
+  create-archive:
+    - bash packaging/vendor.sh
+
+jobs:
+  - job: copr_build
+    trigger: pull_request
+    targets:
+      - fedora-all
+
+  # Snapshot builds of main, for trying fixes before a release.
+  - job: copr_build
+    trigger: commit
+    branch: main
+    targets:
+      - fedora-all
+
+  # Releases go to the Copr project users install from, next to tamarack.
+  - job: copr_build
+    trigger: release
+    owner: theronconrey
+    project: peerdup
+    targets:
+      - fedora-all

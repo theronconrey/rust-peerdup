@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Phase 7 CLI-side D-Bus client.
 //!
 //! Each CLI subcommand opens a session-bus `DaemonClient` and forwards
@@ -50,12 +51,7 @@ impl DaemonClient {
         self.call_no_args("ShareList").await
     }
 
-    pub async fn share_add(
-        &self,
-        topic: &str,
-        path: &Path,
-        role: &str,
-    ) -> Result<String> {
+    pub async fn share_add(&self, topic: &str, path: &Path, role: &str) -> Result<String> {
         let path_str = path.to_string_lossy().into_owned();
         self.proxy
             .call("ShareAdd", &(topic, path_str.as_str(), role))
@@ -121,9 +117,7 @@ impl DaemonClient {
 
     async fn call_no_args<R>(&self, method: &'static str) -> Result<R>
     where
-        R: for<'de> zbus::zvariant::Type
-            + for<'de> serde::Deserialize<'de>
-            + std::fmt::Debug,
+        R: zbus::zvariant::Type + for<'de> serde::Deserialize<'de> + std::fmt::Debug,
     {
         self.proxy.call(method, &()).await.map_err(map_call_err)
     }

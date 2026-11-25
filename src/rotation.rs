@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 //! Phase 5d: signed sealed-box envelopes that distribute a freshly-rotated
 //! per-share encryption key to remaining members after a revocation.
 //!
@@ -83,11 +84,7 @@ pub enum VerifyOutcome {
 
 /// Canonical bytes signed by the rotator. Order is part of the wire
 /// protocol — don't shuffle these fields.
-fn canonical_bytes(
-    epoch: u64,
-    rotator_pubkey: &MemberId,
-    envelopes: &[KeyEnvelope],
-) -> Vec<u8> {
+fn canonical_bytes(epoch: u64, rotator_pubkey: &MemberId, envelopes: &[KeyEnvelope]) -> Vec<u8> {
     bincode::serde::encode_to_vec(
         (&epoch, rotator_pubkey, envelopes),
         bincode::config::standard(),
@@ -99,8 +96,7 @@ fn canonical_bytes(
 /// suitable for `crypto_box::PublicKey`. Errors only on malformed Ed25519
 /// pubkeys (not on a valid curve point).
 fn ed25519_pub_to_box_pub(raw: &[u8; 32]) -> Result<BoxPublic> {
-    let vk = VerifyingKey::from_bytes(raw)
-        .map_err(|e| anyhow!("invalid Ed25519 pubkey: {e}"))?;
+    let vk = VerifyingKey::from_bytes(raw).map_err(|e| anyhow!("invalid Ed25519 pubkey: {e}"))?;
     Ok(BoxPublic::from(vk.to_montgomery().to_bytes()))
 }
 
@@ -236,15 +232,8 @@ pub fn save_pending(data_dir: &Path, share_id: &str, rotation: &SignedRotation) 
     let bytes = bincode::serde::encode_to_vec(rotation, bincode::config::standard())
         .context("encoding rotation")?;
     let path = dir.join(format!("{}.bin", rotation.epoch));
-    let tmp = path.with_extension("bin.tmp");
-    fs::write(&tmp, &bytes).with_context(|| format!("writing {tmp:?}"))?;
-    fs::rename(&tmp, &path).with_context(|| format!("renaming {tmp:?} -> {path:?}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 0600 {path:?}"))?;
-    }
+    crate::data_dir::write_private_atomic(&path, &bytes)
+        .with_context(|| format!("writing {path:?}"))?;
     Ok(())
 }
 
@@ -400,8 +389,7 @@ mod tests {
 
         let new_key: Key = [0x33u8; KEY_LEN];
         // Address only to charlie.
-        let rot =
-            build_signed_rotation(&alice, 2, &new_key, &[me_of(&charlie)]).unwrap();
+        let rot = build_signed_rotation(&alice, 2, &new_key, &[me_of(&charlie)]).unwrap();
 
         let mut bob_state = AuthState::empty();
         for op in state.ops() {

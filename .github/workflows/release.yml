@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: MIT
+#
+# On a GitHub release, attach the vendor tarball (the spec's Source1) so the
+# SRPM can be rebuilt from the release alone, by anyone, offline. Packit
+# makes its own copy for the Copr build from the same Cargo.lock.
+
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  vendor:
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:latest
+    steps:
+      - name: Install Fedora tooling
+        run: dnf -y install git-core cargo cargo-vendor-filterer xz gh rpm-build
+
+      - uses: actions/checkout@v5
+
+      - name: Tag, spec and Cargo.toml agree on the version
+        run: |
+          spec=$(rpmspec -q --srpm --qf '%{version}' rust-peerdup.spec)
+          test "v$spec" = "$GITHUB_REF_NAME"
+
+      - name: Make and attach the vendor tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          mkdir out
+          packaging/vendor.sh out
+          gh release upload "$GITHUB_REF_NAME" out/rust-peerdup-*-vendor.tar.xz \
+            --repo "$GITHUB_REPOSITORY" --clobber

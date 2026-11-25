@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::clock::VectorClock;
 use crate::data_dir;
 use anyhow::{Context, Result};
@@ -30,7 +31,9 @@ pub struct PersistedState {
 }
 
 fn state_path(data_dir: &Path, share_id: &str) -> std::path::PathBuf {
-    data_dir::shares_dir(data_dir).join(share_id).join("state.json")
+    data_dir::shares_dir(data_dir)
+        .join(share_id)
+        .join("state.json")
 }
 
 pub fn load(data_dir: &Path, share_id: &str) -> Result<Option<PersistedState>> {

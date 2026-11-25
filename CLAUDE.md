@@ -3,6 +3,35 @@
 Context for AI coding agents working in this repo. Read this file and
 [`INTEGRATION_NOTES.md`](INTEGRATION_NOTES.md) before making changes.
 
+## Fedora rules
+
+All code, packaging and unit-file changes must follow Fedora best practices
+as written in [`CONTRIBUTING.md`](CONTRIBUTING.md). Read it before making
+changes, and treat its rules as requirements, not suggestions. In short:
+
+- The RPM (`rust-peerdup.spec`) is how this ships, to the
+  `theronconrey/peerdup` Copr project. A change that breaks the RPM build,
+  rpmlint or the smoke test in `.github/workflows/fedora.yml` is not done.
+- Crates are vendored as a documented exception (CONTRIBUTING.md, section
+  3). A `Cargo.lock` change that brings in a new license means updating
+  `License:` in the spec; one that brings in C code means updating
+  `BuildRequires:` and saying so in the PR.
+- Build with Fedora's rustc: nothing newer than `fedora:latest` ships.
+- Assume SELinux enforcing; never suggest disabling it.
+- Before finishing: `cargo fmt --check`, `cargo clippy --all-targets -- -D
+  warnings` and `cargo test` must pass; new files get the SPDX header;
+  commits are signed off (`git commit -s`).
+- If a change can't follow a rule, stop and say so in the pull request
+  instead of working around it.
+
+Attribution:
+
+- Commits end with `Co-Authored-By: Claude <noreply@anthropic.com>` and the
+  `Signed-off-by:` line from `git commit -s`.
+- Pull request descriptions end with "Co-authored with Claude, reviewed by
+  Theron."
+- No session links and no "Generated with Claude Code" lines anywhere.
+
 ## What this is
 
 `rust-peerdup` is a Rust implementation of the peerdup folder-sync daemon,

@@ -1,14 +1,39 @@
+# SPDX-License-Identifier: MIT
+#
+# The per-user daemon. Shipped in /usr/lib/systemd/user by the RPM; install.sh
+# rewrites ExecStart for a ~/.local/bin install. The session bus starts it on
+# the first CLI call (org.peerdup.Daemon1.service), or enable it at login with
+#   systemctl --user enable --now rust-peerdup
+
 [Unit]
-Description=peerdup folder sync daemon (Rust)
+Description=rust-peerdup encrypted folder sync daemon
+Documentation=man:rust-peerdup(1) https://github.com/theronconrey/rust-peerdup
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/rust-peerdup serve --bt-port 41000
+ExecStart=/usr/bin/rust-peerdup serve --bt-port 41000
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=rust_peerdup=info
+
+# Sandboxing. A user unit can only use the options that need no privileges
+# (seccomp and friends): the mount-namespace ones (ProtectSystem=,
+# ProtectHome=, PrivateTmp=) are left out because share roots can be
+# anywhere in the user's home and the daemon must read and write them.
+NoNewPrivileges=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# AF_UNIX: the session bus. AF_INET/AF_INET6: peers. AF_NETLINK: iroh
+# watches network interfaces to pick addresses to announce.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]
 WantedBy=default.target

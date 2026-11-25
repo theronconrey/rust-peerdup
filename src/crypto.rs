@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 use crate::data_dir;
 use anyhow::{anyhow, Context, Result};
 use chacha20poly1305::aead::{Aead, KeyInit, OsRng};
@@ -44,7 +45,9 @@ impl KeyRing {
 }
 
 fn keys_path(data_dir: &Path, share_id: &str) -> PathBuf {
-    data_dir::shares_dir(data_dir).join(share_id).join("keys.bin")
+    data_dir::shares_dir(data_dir)
+        .join(share_id)
+        .join("keys.bin")
 }
 
 /// Load `keys.bin`, or generate epoch-1 if absent. Persists 0600 on Unix.
@@ -59,13 +62,11 @@ pub fn load_or_create_keyring(data_dir: &Path, share_id: &str) -> Result<KeyRing
                 KEY_LEN
             ));
         }
-        let mut keys = Vec::with_capacity(raw.len() / KEY_LEN);
-        for chunk in raw.chunks_exact(KEY_LEN) {
-            let mut k = [0u8; KEY_LEN];
-            k.copy_from_slice(chunk);
-            keys.push(k);
-        }
-        Ok(KeyRing { keys })
+        // The length check above means there is no remainder.
+        let (chunks, _) = raw.as_chunks::<KEY_LEN>();
+        Ok(KeyRing {
+            keys: chunks.to_vec(),
+        })
     } else {
         let mut k = [0u8; KEY_LEN];
         OsRng.fill_bytes(&mut k);
@@ -84,15 +85,8 @@ fn save_keyring(data_dir: &Path, share_id: &str, ring: &KeyRing) -> Result<()> {
     for k in &ring.keys {
         bytes.extend_from_slice(k);
     }
-    let tmp = path.with_extension("bin.tmp");
-    fs::write(&tmp, &bytes).with_context(|| format!("writing {tmp:?}"))?;
-    fs::rename(&tmp, &path).with_context(|| format!("renaming {tmp:?} -> {path:?}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("chmod 0600 {path:?}"))?;
-    }
+    crate::data_dir::write_private_atomic(&path, &bytes)
+        .with_context(|| format!("writing {path:?}"))?;
     Ok(())
 }
 
@@ -108,7 +102,9 @@ pub fn install_keyring(data_dir: &Path, share_id: &str, keys: &[Key]) -> Result<
     if keys.is_empty() {
         return Err(anyhow!("cannot install an empty keyring"));
     }
-    let ring = KeyRing { keys: keys.to_vec() };
+    let ring = KeyRing {
+        keys: keys.to_vec(),
+    };
     save_keyring(data_dir, share_id, &ring)
 }
 
@@ -326,8 +322,7 @@ mod tests {
     fn install_epoch_key_appends_when_epoch_is_next() {
         let td = fresh_ring_on_disk("share-install-1");
         let new_key = [9u8; KEY_LEN];
-        let outcome =
-            install_epoch_key(td.path(), "share-install-1", 2, &new_key).unwrap();
+        let outcome = install_epoch_key(td.path(), "share-install-1", 2, &new_key).unwrap();
         assert_eq!(outcome, InstallOutcome::Installed);
 
         let ring = load_or_create_keyring(td.path(), "share-install-1").unwrap();
@@ -341,8 +336,7 @@ mod tests {
         let ring = load_or_create_keyring(td.path(), "share-install-2").unwrap();
         let epoch1_key = *ring.key_for_epoch(1).unwrap();
 
-        let outcome =
-            install_epoch_key(td.path(), "share-install-2", 1, &epoch1_key).unwrap();
+        let outcome = install_epoch_key(td.path(), "share-install-2", 1, &epoch1_key).unwrap();
         assert_eq!(outcome, InstallOutcome::Idempotent);
 
         // Disk unchanged: still single-epoch ring.
@@ -367,8 +361,7 @@ mod tests {
     fn install_epoch_key_returns_gap_for_future_epoch() {
         let td = fresh_ring_on_disk("share-install-4");
         let key = [0x77u8; KEY_LEN];
-        let outcome =
-            install_epoch_key(td.path(), "share-install-4", 5, &key).unwrap();
+        let outcome = install_epoch_key(td.path(), "share-install-4", 5, &key).unwrap();
         assert_eq!(outcome, InstallOutcome::Gap { have: 1, got: 5 });
 
         // Disk unchanged.
@@ -384,8 +377,7 @@ mod tests {
         assert_eq!(new_epoch, 2);
 
         let stale = [0x55u8; KEY_LEN];
-        let outcome =
-            install_epoch_key(td.path(), "share-install-5", 1, &stale).unwrap();
+        let outcome = install_epoch_key(td.path(), "share-install-5", 1, &stale).unwrap();
         assert_eq!(outcome, InstallOutcome::Stale);
 
         // Disk still has the original epoch-1 key (overwrite didn't happen).

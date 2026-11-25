@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+#
+# Weekly pull requests for crate and GitHub Actions updates. Each one runs
+# the Fedora workflow and a Packit Copr build, so a dependency bump that
+# breaks the RPM (a new license, a new C library, a newer rustc than Fedora
+# ships) shows up before it is merged.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      # p2panda's crates move together; so do librqbit's.
+      p2panda:
+        patterns: ["p2panda-*"]
+      minor-and-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

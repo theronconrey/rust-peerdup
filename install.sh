@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# rust-peerdup installer
+# SPDX-License-Identifier: MIT
+#
+# rust-peerdup installer, for development builds. On Fedora, install the RPM
+# from Copr instead (README.md, "Install").
 #
 # Builds the release binary, installs it to ~/.local/bin/rust-peerdup, and
 # drops a systemd user unit at ~/.config/systemd/user/rust-peerdup.service
@@ -59,7 +62,9 @@ ok "Installed $BIN_DIR/$BIN_NAME"
 # ── install systemd user unit ────────────────────────────────────────────────
 
 mkdir -p "$UNIT_DIR"
-install -m 0644 "$REPO_ROOT/systemd/$UNIT_NAME" "$UNIT_DIR/$UNIT_NAME"
+# The unit ships pointing at /usr/bin (the RPM's path); point it at ours.
+sed "s|^ExecStart=/usr/bin/|ExecStart=$BIN_DIR/|" "$REPO_ROOT/systemd/$UNIT_NAME" > "$UNIT_DIR/$UNIT_NAME"
+chmod 0644 "$UNIT_DIR/$UNIT_NAME"
 ok "Installed $UNIT_DIR/$UNIT_NAME"
 
 if command -v systemctl >/dev/null 2>&1; then

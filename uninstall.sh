@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+#
 # rust-peerdup uninstaller
 #
 # Stops the systemd user service if running, removes the binary at
