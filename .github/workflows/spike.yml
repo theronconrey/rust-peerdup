@@ -58,3 +58,8 @@ jobs:
           cargo fmt --check
           cargo clippy --locked --all-targets --message-format=short -- -D warnings
           cargo test --locked
+
+      - name: Two daemons sync a share (e2e)
+        run: |
+          cargo build --locked
+          tests/e2e-sync.sh target/debug/rust-peerdup
