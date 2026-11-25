@@ -209,11 +209,12 @@ ok "pre-revoke: all keyrings are 32B (single epoch 1)"
 # ── 5. A revokes B + restart daemon to broadcast ─────────────────────────────
 
 info "A revokes B and restarts daemon..."
-"$BIN" --data-dir "$DATA_A" share-revoke "$SHARE_ID" "${PUBKEY[b]}" >/dev/null
-
-# Restart A's daemon so the in-memory state picks up the new auth log + pending rotation.
+# Direct mode refuses to write while the daemon holds its lock (otherwise
+# the daemon's next save could overwrite the revocation), so stop A first,
+# revoke, then start it again to broadcast the new auth log and rotation.
 kill -TERM "$DAEMON_A_PID"
 wait "$DAEMON_A_PID" 2>/dev/null || true
+"$BIN" --data-dir "$DATA_A" share-revoke "$SHARE_ID" "${PUBKEY[b]}" >/dev/null
 "$BIN" --data-dir "$DATA_A" serve --bt-port 41000 >>/tmp/peerdup-a-${RUN_ID}.log 2>&1 &
 DAEMON_A_PID=$!
 

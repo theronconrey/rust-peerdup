@@ -82,11 +82,27 @@ pub enum VerifyOutcome {
     DecryptFailed,
 }
 
+/// Domain tag for rotation signatures. v2 added the group id, so a
+/// rotation signed for one share can't be replayed into another share
+/// that has the same Owner and recipient.
+const ROTATION_SIG_DOMAIN: &[u8] = b"peerdup-rotation-v2";
+
 /// Canonical bytes signed by the rotator. Order is part of the wire
 /// protocol — don't shuffle these fields.
-fn canonical_bytes(epoch: u64, rotator_pubkey: &MemberId, envelopes: &[KeyEnvelope]) -> Vec<u8> {
+fn canonical_bytes(
+    group_id: &MemberId,
+    epoch: u64,
+    rotator_pubkey: &MemberId,
+    envelopes: &[KeyEnvelope],
+) -> Vec<u8> {
     bincode::serde::encode_to_vec(
-        (&epoch, rotator_pubkey, envelopes),
+        (
+            ROTATION_SIG_DOMAIN,
+            group_id,
+            &epoch,
+            rotator_pubkey,
+            envelopes,
+        ),
         bincode::config::standard(),
     )
     .expect("canonical encoding of in-memory rotation never fails")
@@ -119,6 +135,7 @@ fn ed25519_priv_to_box_priv(identity: &PrivateKey) -> BoxSecret {
 /// the same order).
 pub fn build_signed_rotation(
     rotator: &PrivateKey,
+    group_id: MemberId,
     epoch: u64,
     new_key: &Key,
     recipients: &[MemberId],
@@ -152,7 +169,7 @@ pub fn build_signed_rotation(
             ciphertext,
         });
     }
-    let canonical = canonical_bytes(epoch, &rotator_pubkey, &envelopes);
+    let canonical = canonical_bytes(&group_id, epoch, &rotator_pubkey, &envelopes);
     let sig = rotator.sign(&canonical);
     Ok(SignedRotation {
         epoch,
@@ -176,6 +193,7 @@ pub fn verify_and_decrypt(
     };
     let sig = Signature::from_bytes(&rotation.signature);
     let canonical = canonical_bytes(
+        &group_id,
         rotation.epoch,
         &rotation.rotator_pubkey,
         &rotation.envelopes,
@@ -283,7 +301,7 @@ mod tests {
 
         let new_key: Key = [0xCDu8; KEY_LEN];
         // Address an envelope to alice herself (round trip).
-        let rot = build_signed_rotation(&alice, 2, &new_key, &[me_of(&alice)]).unwrap();
+        let rot = build_signed_rotation(&alice, group, 2, &new_key, &[me_of(&alice)]).unwrap();
         match verify_and_decrypt(&rot, &state, group, &alice) {
             VerifyOutcome::OkForUs(k) => assert_eq!(k, new_key),
             other => panic!("expected OkForUs, got {other:?}"),
@@ -302,7 +320,7 @@ mod tests {
             .unwrap();
 
         let new_key: Key = [0x42u8; KEY_LEN];
-        let rot = build_signed_rotation(&alice, 2, &new_key, &[me_of(&bob)]).unwrap();
+        let rot = build_signed_rotation(&alice, group, 2, &new_key, &[me_of(&bob)]).unwrap();
 
         // Bob's local replay of the auth log:
         let mut bob_state = AuthState::empty();
@@ -331,7 +349,7 @@ mod tests {
 
         let new_key: Key = [0x99u8; KEY_LEN];
         // Mallory signs a rotation envelope for bob.
-        let rot = build_signed_rotation(&mallory, 2, &new_key, &[me_of(&bob)]).unwrap();
+        let rot = build_signed_rotation(&mallory, group, 2, &new_key, &[me_of(&bob)]).unwrap();
 
         // Bob applies the auth log and checks: rotator (mallory) is not a
         // manager, so reject.
@@ -357,7 +375,7 @@ mod tests {
             .unwrap();
 
         let new_key: Key = [0xAAu8; KEY_LEN];
-        let mut rot = build_signed_rotation(&alice, 2, &new_key, &[me_of(&bob)]).unwrap();
+        let mut rot = build_signed_rotation(&alice, group, 2, &new_key, &[me_of(&bob)]).unwrap();
         // Flip a bit inside an envelope's ciphertext. The outer signature
         // covers the envelope, so verification should fail.
         rot.envelopes[0].ciphertext[0] ^= 0x01;
@@ -389,7 +407,7 @@ mod tests {
 
         let new_key: Key = [0x33u8; KEY_LEN];
         // Address only to charlie.
-        let rot = build_signed_rotation(&alice, 2, &new_key, &[me_of(&charlie)]).unwrap();
+        let rot = build_signed_rotation(&alice, group, 2, &new_key, &[me_of(&charlie)]).unwrap();
 
         let mut bob_state = AuthState::empty();
         for op in state.ops() {
@@ -399,5 +417,30 @@ mod tests {
             VerifyOutcome::NotForUs => {}
             other => panic!("expected NotForUs, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rotation_for_one_share_is_rejected_in_another() {
+        // Same Owner, same recipient, two shares: a rotation signed for
+        // share A must not verify as share B's.
+        let alice = fresh();
+        let bob = fresh();
+        let group_a = group_id_for("rot-share-a");
+        let group_b = group_id_for("rot-share-b");
+        let mut bob_state = AuthState::empty();
+        let mut state = AuthState::empty();
+        state.create_group(&alice, group_b).unwrap();
+        state
+            .add_member(&alice, group_b, me_of(&bob), AuthRole::Writer)
+            .unwrap();
+        for op in state.ops() {
+            bob_state.apply_remote(op.clone()).unwrap();
+        }
+        let new_key: Key = [0x42u8; KEY_LEN];
+        let rot = build_signed_rotation(&alice, group_a, 2, &new_key, &[me_of(&bob)]).unwrap();
+        assert!(matches!(
+            verify_and_decrypt(&rot, &bob_state, group_b, &bob),
+            VerifyOutcome::BadSignature
+        ));
     }
 }

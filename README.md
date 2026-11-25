@@ -113,8 +113,9 @@ SHARE_ID=$(rust-peerdup share-list | tail -1 | awk '{print $1}')
 rust-peerdup share-invite "$SHARE_ID" <B-pubkey-hex> --auth-role writer
 #   prints the ticket string. Send it to B over a secure channel.
 
-# 3. On B: consume the ticket.
-rust-peerdup share-join <ticket-string> --path ~/Sync/mydemo
+# 3. On B: consume the ticket. "-" reads it from stdin (paste, then
+#    Ctrl-D), so it doesn't show up in /proc or your shell history.
+rust-peerdup share-join - --path ~/Sync/mydemo
 
 # 4. On both: start the daemon.
 systemctl --user enable --now rust-peerdup

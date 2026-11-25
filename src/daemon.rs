@@ -1065,6 +1065,7 @@ async fn handle_invite(
             config.id
         ));
     }
+    auth_state.require_owner(group_id, identity)?;
     if auth_state.is_member(group_id, invitee) {
         return Err(anyhow!(
             "{} is already a member of share {}",
@@ -1105,6 +1106,7 @@ async fn handle_revoke(
     if auth_state.is_empty() {
         return Err(anyhow!("share {} has no auth state on disk", config.id));
     }
+    auth_state.require_owner(group_id, identity)?;
     if !auth_state.is_member(group_id, target) {
         return Err(anyhow!(
             "{} is not a current member of share {}",
@@ -1137,7 +1139,7 @@ async fn handle_revoke(
     }
 
     let rotation_msg =
-        rotation::build_signed_rotation(identity, new_epoch, &new_key_bytes, &remaining)?;
+        rotation::build_signed_rotation(identity, group_id, new_epoch, &new_key_bytes, &remaining)?;
     rotation::save_pending(data_dir, &config.id, &rotation_msg)?;
     // Live broadcasting: append to the in-memory queue so the next announce
     // tick picks it up (no daemon restart needed).

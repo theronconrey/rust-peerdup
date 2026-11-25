@@ -648,3 +648,33 @@ with `O_CREAT|O_EXCL` and mode 0600, synced, then renamed into place. The
 earlier pattern (`fs::write` then `set_permissions(0o600)`) left each
 secret readable under the default umask (usually 0644) until the chmod ran.
 If you add another file that holds key material, write it the same way.
+
+## Rotation signatures are bound to the share (v2)
+
+Since review round 2 the bytes a rotator signs are
+`("peerdup-rotation-v2", group_id, epoch, rotator_pubkey, envelopes)`.
+Before, the group id wasn't signed, so an Owner's rotation for share A
+could be replayed into share B whenever the same recipient was in both
+(common: one person's devices), installing A's key as B's next epoch. This
+is a wire change: rotations signed by older builds no longer verify.
+Pre-release, so there is no compatibility shim.
+
+## AuthState: a rejected op must not empty the group
+
+`Crdt::process` takes the CRDT state by value, and p2panda-auth 0.5.2's
+`GroupCrdtState` is not `Clone`, so when it rejects an op the state it was
+given is gone. `AuthState::process` then rebuilds the state by replaying
+the ops already applied. Before, a rejected op left the share with an
+empty group, after which every rotation was rejected as `NotAManager`. An
+`AuthState` also only accepts ops for the group of its first op, buffers
+at most 256 ops with missing dependencies, and invite/revoke check that
+the local identity is an Owner before authoring anything.
+
+## Direct mode takes the daemon lock
+
+`--data-dir` with a client command writes the same files the daemon owns
+(`auth.log`, `keys.bin`, `share.json`). It now takes `daemon.lock` for the
+duration and refuses if a daemon holds it; before, a running daemon's next
+`auth::save` could silently overwrite a direct-mode revocation. Stop the
+daemon, run the command, start it again (as `tests/e2e-revoke.sh` does),
+or go through D-Bus.
