@@ -169,8 +169,8 @@ echo "hello" > $ROOT_A/test.txt
 TICKET=$(./target/debug/rust-peerdup --data-dir $PEER_A \
     share-invite "$(./target/debug/rust-peerdup --data-dir $PEER_A share-list | tail -1 | awk '{print $1}')")
 
-./target/debug/rust-peerdup --data-dir $PEER_B \
-    share-join "$TICKET" --path $ROOT_B
+printf '%s' "$TICKET" | ./target/debug/rust-peerdup --data-dir $PEER_B \
+    share-join - --path $ROOT_B
 
 # Run each in a separate terminal (or via & + wait):
 ./target/debug/rust-peerdup --data-dir $PEER_A serve --bt-port 41000 &

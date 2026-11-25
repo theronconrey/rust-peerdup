@@ -103,7 +103,10 @@ enum Cmd {
     /// Consume an invitation ticket: register the share locally, import
     /// its keyring, replay the auth log.
     ShareJoin {
-        /// Base64 ticket string from `share invite`.
+        /// Ticket from `share-invite`, or `-` to read it from standard
+        /// input (recommended). A ticket holds the share's keys, and on the
+        /// command line it is visible to other local users and lands in
+        /// shell history.
         ticket: String,
         /// Local folder where this peer's working copy lives.
         #[arg(long)]
@@ -166,10 +169,13 @@ async fn main() -> Result<()> {
             Some(dd) => cmd_share_invite_direct(dd, id, invitee_pubkey, role, auth_role),
             None => cmd_share_invite(id, invitee_pubkey, role, auth_role).await,
         },
-        Cmd::ShareJoin { ticket, path } => match direct_dir {
-            Some(dd) => cmd_share_join_direct(dd, ticket, path),
-            None => cmd_share_join(ticket, path).await,
-        },
+        Cmd::ShareJoin { ticket, path } => {
+            let ticket = resolve_ticket_arg(ticket)?;
+            match direct_dir {
+                Some(dd) => cmd_share_join_direct(dd, ticket, path),
+                None => cmd_share_join(ticket, path).await,
+            }
+        }
         Cmd::SharePeers { id } => match direct_dir {
             Some(dd) => cmd_share_peers_direct(dd, id),
             None => cmd_share_peers(id).await,
@@ -186,6 +192,40 @@ async fn main() -> Result<()> {
             Some(dd) => cmd_whoami_direct(dd),
             None => cmd_whoami().await,
         },
+    }
+}
+
+/// Direct mode (`--data-dir` with a client command) edits the same files
+/// the daemon owns. Take the daemon's lock for the duration, so a running
+/// daemon's next save can't silently overwrite the change.
+fn lock_for_direct_write(data_dir: &std::path::Path) -> Result<std::fs::File> {
+    lock::acquire(&data_dir::lock_path(data_dir)).map_err(|_| {
+        anyhow!(
+            "a rust-peerdup daemon is running on {data_dir:?}; run this without --data-dir to go through it, or stop the daemon first"
+        )
+    })
+}
+
+/// `-` reads the ticket from stdin; anything else is the ticket itself,
+/// with a warning, since argv is readable by other users via /proc.
+fn resolve_ticket_arg(arg: String) -> Result<String> {
+    if arg == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading ticket from stdin")?;
+        let ticket = buf.trim().to_string();
+        if ticket.is_empty() {
+            return Err(anyhow!("no ticket on stdin"));
+        }
+        Ok(ticket)
+    } else {
+        eprintln!(
+            "warning: the ticket was passed on the command line, where other local users can see it; \
+             next time use `share-join - --path ...` and paste it on stdin"
+        );
+        Ok(arg)
     }
 }
 
@@ -359,6 +399,7 @@ fn cmd_share_add_direct(
     path: PathBuf,
     role: ShareRole,
 ) -> Result<()> {
+    let _lock = lock_for_direct_write(&data_dir)?;
     let path = if path.is_absolute() {
         path
     } else {
@@ -405,6 +446,7 @@ fn cmd_share_list_direct(data_dir: PathBuf) -> Result<()> {
 }
 
 fn cmd_share_rotate_key_direct(data_dir: PathBuf, id: String) -> Result<()> {
+    let _lock = lock_for_direct_write(&data_dir)?;
     let configs = share::load_all(&data_dir)?;
     if !configs.iter().any(|c| c.id == id) {
         return Err(anyhow!("share {id} not found"));
@@ -471,6 +513,7 @@ fn cmd_share_members_direct(data_dir: PathBuf, id: String) -> Result<()> {
 }
 
 fn cmd_share_revoke_direct(data_dir: PathBuf, id: String, peer_pubkey_hex: String) -> Result<()> {
+    let _lock = lock_for_direct_write(&data_dir)?;
     let configs = share::load_all(&data_dir)?;
     if !configs.iter().any(|c| c.id == id) {
         return Err(anyhow!("share {id} not found"));
@@ -537,6 +580,7 @@ fn cmd_share_invite_direct(
     role: ShareRole,
     auth_role: auth::AuthRole,
 ) -> Result<()> {
+    let _lock = lock_for_direct_write(&data_dir)?;
     role.ensure_encrypted()?;
     let configs = share::load_all(&data_dir)?;
     let cfg = configs
@@ -584,6 +628,7 @@ fn cmd_share_invite_direct(
 }
 
 fn cmd_share_join_direct(data_dir: PathBuf, ticket_str: String, path: PathBuf) -> Result<()> {
+    let _lock = lock_for_direct_write(&data_dir)?;
     let ticket = ticket::Ticket::decode(&ticket_str)?;
     let configs = share::load_all(&data_dir)?;
     if configs.iter().any(|c| c.id == ticket.share_id) {
@@ -649,6 +694,7 @@ fn cmd_share_join_direct(data_dir: PathBuf, ticket_str: String, path: PathBuf) -
 }
 
 fn cmd_share_remove_direct(data_dir: PathBuf, id: String) -> Result<()> {
+    let _lock = lock_for_direct_write(&data_dir)?;
     let configs = share::load_all(&data_dir)?;
     let root = configs
         .iter()
