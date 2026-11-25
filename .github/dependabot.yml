@@ -18,6 +18,12 @@ updates:
       minor-and-patch:
         update-types: [minor, patch]
     open-pull-requests-limit: 5
+    ignore:
+      # chacha20poly1305 0.10, crypto_box 0.9 and ed25519-dalek 2 take
+      # rand_core 0.6 RNGs (rand 0.8). rand 0.9 doesn't satisfy their trait
+      # bounds; move together with those crates' next majors.
+      - dependency-name: rand
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: /
