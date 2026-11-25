@@ -24,7 +24,7 @@ directories = "5"
 fs2 = "0.4"
 blake3 = "1"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock", "std"] }
-notify = "6"
+notify = "9"
 chacha20poly1305 = "0.10"
 rand = "0.8"
 base64 = "0.22"
