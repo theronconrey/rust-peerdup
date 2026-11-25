@@ -70,14 +70,24 @@ the daemon over D-Bus, or enable it at login with
 
 No firewall changes are needed. Peers connect out over iroh (QUIC over
 UDP), punch through NATs where they can, and fall back to a relay where
-they can't. Relayed traffic is still end-to-end encrypted, but the relay
-sees that two nodes are talking. By default those are n0's public relays;
-see `INTEGRATION_NOTES.md`, "Transport: iroh-blobs".
+they can't. On one LAN they find each other by mDNS; across networks, an
+invite carries the inviter's address, so create invites while the
+inviter's daemon is running (or has run once).
 
-> **Same network only, for now.** Two daemons on one LAN find each other
-> (mDNS) and sync. Across the internet they don't find each other yet: an
-> invite doesn't carry the inviter's address. That is the next piece of
-> work (ROADMAP.md, phase 7.5).
+### Relays
+
+Relayed traffic stays end-to-end encrypted, but a relay sees which nodes
+talk to each other and how much. By default the daemon uses n0's public
+relays, which are rate-limited and meant for development. To use your own
+(for example a self-hosted `iroh-relay`), or none:
+
+```bash
+systemctl --user edit rust-peerdup
+# [Service]
+# ExecStart=
+# ExecStart=/usr/bin/rust-peerdup serve --relay-url https://relay.example.org
+#   (repeat --relay-url for more; --no-relay for none)
+```
 
 ### From source (development)
 

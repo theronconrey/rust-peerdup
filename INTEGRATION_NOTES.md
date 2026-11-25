@@ -42,26 +42,40 @@ almost none of BitTorrent: DHT off, no trackers, no UPnP, one known peer.
 production quality, and its suggested production version (0.35) needs a
 pre-1.0 iroh that can't talk to the iroh 1.x p2panda-net 0.8 runs on.
 
+**Reaching other networks** (`src/bootstrap.rs`): p2panda-net's
+`Endpoint::connect` only uses its address book (no DNS fallback; unknown
+nodes fail with `TransportInfoMissing`), and its iroh endpoint runs
+`RelayMode::Custom` with only the relays it was given, so by default none.
+So: `serve` passes relays (n0's public ones unless `--relay-url`/
+`--no-relay`); the daemon writes its own `EndpointAddr` to
+`<data_dir>/endpoint.json` once online; ticket v3 carries it and the
+joiner keeps it as `shares/<id>/bootstrap.json`; on share start the
+bootstrap goes into the address book (`NodeInfo::from(addr).bootstrap()`)
+and every member is `add_topic`ed. `tests/e2e-xnet.sh` checks two
+containers on isolated Docker networks sync (CI). p2panda also mixes the
+network id into every ALPN, so blobs must go through p2panda's
+`accept`/`connect`, not iroh-blobs' own downloader.
+
 **Known gaps (next steps):**
-- Peers on different networks don't find each other: an invite doesn't
-  carry the inviter's address, and nothing registers share members in the
-  address book. Plan: put the inviter's `NodeInfo` in the ticket and insert
-  it as a bootstrap (`AddressBook::insert_node_info(.. .bootstrap())`), and
-  `add_topic(member, topic)` for every member on share start.
 - The provider doesn't check that a fetching node is a share member. Blobs
   are ciphertext and found only through gossiped manifest hashes, but the
   gate belongs here: iroh-blobs' provider events can intercept connections
   by node id. This replaces ROADMAP phase 6 (the librqbit admission hook).
-- Relays: by default iroh uses n0's public relays (rate-limited, meant for
-  development). Bulk data goes through them when hole-punching fails.
-  Make the relay configurable and consider shipping a self-hosted
-  `iroh-relay`. Whether p2panda-net 0.8 publishes to n0's DNS by default
-  is unverified.
+- Relays: the default is n0's public relays (rate-limited, meant for
+  development); bulk data goes through them when hole-punching fails.
+  `--relay-url` is there; consider shipping a self-hosted `iroh-relay`
+  (a Copr subpackage). p2panda-net's endpoint uses iroh's minimal preset
+  with its own address-book lookup (per its source), so it shouldn't
+  publish to n0's DNS; confirm with a capture (spike check 8).
+- Invites made in direct mode use the address the daemon last wrote; if
+  the daemon has never run, the ticket has none and the joiner can only
+  find the inviter on the same LAN.
 
 **Spike checklist** (pass/fail, from the research pass):
 1. Cross-network: two hosts behind different NATs sync 1 GiB; direct path
-   when possible; relay fallback with UDP blocked. *Blocked on the
-   bootstrap work above.*
+   when possible; relay fallback with UDP blocked. *Two containers on
+   isolated networks sync through a relay in CI (`tests/e2e-xnet.sh`);
+   real NATs, 1 GiB and the UDP-blocked case are still to measure.*
 2. Revocation: a removed node's fetch is refused (needs the provider gate).
 3. Crash/resume: `kill -9` a receiver mid-fetch of a 2 GiB file and
    restart; measure how much is re-fetched (iroh-blobs #254).

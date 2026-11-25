@@ -106,3 +106,28 @@ jobs:
           systemd-analyze verify --man=no /usr/lib/systemd/user/rust-peerdup.service
           systemd-analyze security --offline=true --no-pager \
             /usr/lib/systemd/user/rust-peerdup.service || true
+
+      - name: Keep the installed binary for the cross-network test
+        if: matrix.image == 'fedora:latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-peerdup-rpm-binary
+          path: /usr/bin/rust-peerdup
+          retention-days: 3
+
+  # The binary from the RPM, in two Fedora containers on two isolated
+  # Docker networks: they can only meet through a relay or a hole-punched
+  # path, as two homes on the internet do.
+  cross-network:
+    needs: fedora
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-peerdup-rpm-binary
+          path: bin
+      - name: Two networks, one share (e2e)
+        run: |
+          chmod +x bin/rust-peerdup
+          tests/e2e-xnet.sh bin/rust-peerdup

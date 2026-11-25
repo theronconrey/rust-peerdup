@@ -34,8 +34,9 @@ fixes.
 These are known and tracked, so they don't need a report (new angles on
 them do):
 
-- Daemons on different networks don't find each other yet (an invite
-  doesn't carry the inviter's address); same-LAN sync works.
+- By default peers that can't connect directly meet through n0's public
+  relays, which see who talks to whom (not what). `--relay-url` changes
+  this.
 - Sync announces are not signed and write permission is not enforced on
   them, so a revoked member or a reader can still push changes.
 - A peer that fetches blobs isn't yet checked against share membership;
