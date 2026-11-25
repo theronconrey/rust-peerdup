@@ -24,15 +24,15 @@
 //! `to_scalar_bytes` / `to_montgomery` Ed25519 → X25519 conversion (see
 //! INTEGRATION_NOTES.md "Phase 5d key distribution" for the tradeoff).
 
+use crate::auth::SIGNATURE_LEN;
 use crate::auth::{self, AuthRole, AuthState, MemberId};
 use crate::crypto::{Key, KEY_LEN};
 use crate::data_dir;
 use anyhow::{anyhow, Context, Result};
 use crypto_box::aead::{Aead, AeadCore, OsRng};
 use crypto_box::{PublicKey as BoxPublic, SalsaBox, SecretKey as BoxSecret};
-use ed25519_dalek::{SigningKey, VerifyingKey};
-use p2panda_core::identity::SIGNATURE_LEN;
-use p2panda_core::{PrivateKey, PublicKey, Signature};
+use ed25519_dalek::{SigningKey as DalekSigningKey, VerifyingKey as DalekVerifyingKey};
+use p2panda_core::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -112,16 +112,17 @@ fn canonical_bytes(
 /// suitable for `crypto_box::PublicKey`. Errors only on malformed Ed25519
 /// pubkeys (not on a valid curve point).
 fn ed25519_pub_to_box_pub(raw: &[u8; 32]) -> Result<BoxPublic> {
-    let vk = VerifyingKey::from_bytes(raw).map_err(|e| anyhow!("invalid Ed25519 pubkey: {e}"))?;
+    let vk =
+        DalekVerifyingKey::from_bytes(raw).map_err(|e| anyhow!("invalid Ed25519 pubkey: {e}"))?;
     Ok(BoxPublic::from(vk.to_montgomery().to_bytes()))
 }
 
-/// Convert a `p2panda_core::PrivateKey` (Ed25519) to a `crypto_box::SecretKey`
+/// Convert a `p2panda_core::SigningKey` (Ed25519) to a `crypto_box::SecretKey`
 /// (X25519). Reuses the static identity key for KEM; see module docs for the
 /// tradeoff.
-fn ed25519_priv_to_box_priv(identity: &PrivateKey) -> BoxSecret {
+fn ed25519_priv_to_box_priv(identity: &SigningKey) -> BoxSecret {
     let sk_bytes: [u8; 32] = *identity.as_bytes();
-    let signing = SigningKey::from_bytes(&sk_bytes);
+    let signing = DalekSigningKey::from_bytes(&sk_bytes);
     let scalar_bytes = signing.to_scalar_bytes();
     BoxSecret::from(scalar_bytes)
 }
@@ -134,7 +135,7 @@ fn ed25519_priv_to_box_priv(identity: &PrivateKey) -> BoxSecret {
 /// rotating concurrently with the same input set produce envelope vectors in
 /// the same order).
 pub fn build_signed_rotation(
-    rotator: &PrivateKey,
+    rotator: &SigningKey,
     group_id: MemberId,
     epoch: u64,
     new_key: &Key,
@@ -144,7 +145,7 @@ pub fn build_signed_rotation(
     sorted.sort_by_key(|m| m.0);
     sorted.dedup_by_key(|m| m.0);
 
-    let rotator_pubkey = MemberId(*rotator.public_key().as_bytes());
+    let rotator_pubkey = MemberId(*rotator.verifying_key().as_bytes());
     let mut envelopes = Vec::with_capacity(sorted.len());
     for recipient in &sorted {
         let recipient_box_pub = ed25519_pub_to_box_pub(&recipient.0).with_context(|| {
@@ -184,10 +185,10 @@ pub fn verify_and_decrypt(
     rotation: &SignedRotation,
     auth_state: &AuthState,
     group_id: MemberId,
-    me_identity: &PrivateKey,
+    me_identity: &SigningKey,
 ) -> VerifyOutcome {
     // 1. Outer signature.
-    let pubkey = match PublicKey::from_bytes(&rotation.rotator_pubkey.0) {
+    let pubkey = match VerifyingKey::from_bytes(&rotation.rotator_pubkey.0) {
         Ok(p) => p,
         Err(_) => return VerifyOutcome::BadSignature,
     };
@@ -212,7 +213,7 @@ pub fn verify_and_decrypt(
     }
 
     // 3. Find our envelope.
-    let me = MemberId(*me_identity.public_key().as_bytes());
+    let me = MemberId(*me_identity.verifying_key().as_bytes());
     let envelope = match rotation.envelopes.iter().find(|e| e.recipient_pubkey == me) {
         Some(e) => e,
         None => return VerifyOutcome::NotForUs,
@@ -284,12 +285,12 @@ mod tests {
     use super::*;
     use crate::auth::{group_id_for, AuthRole, AuthState, MemberId};
 
-    fn fresh() -> PrivateKey {
-        PrivateKey::new()
+    fn fresh() -> SigningKey {
+        SigningKey::generate()
     }
 
-    fn me_of(k: &PrivateKey) -> MemberId {
-        MemberId(*k.public_key().as_bytes())
+    fn me_of(k: &SigningKey) -> MemberId {
+        MemberId(*k.verifying_key().as_bytes())
     }
 
     #[test]

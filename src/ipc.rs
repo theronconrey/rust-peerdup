@@ -51,7 +51,7 @@ fn fdo_err(e: anyhow::Error) -> zbus::fdo::Error {
 impl Daemon1Iface {
     /// Return the daemon's identity public key as 64-char hex.
     async fn whoami(&self) -> zbus::fdo::Result<String> {
-        Ok(self.rt.identity.public_key().to_hex())
+        Ok(self.rt.identity.verifying_key().to_hex())
     }
 
     /// Return all configured shares as `(id, topic, root_path, role,
@@ -145,12 +145,12 @@ impl Daemon1Iface {
                 .join(path)
         };
 
-        let me = *self.rt.identity.public_key().as_bytes();
+        let me = *self.rt.identity.verifying_key().as_bytes();
         if t.invitee_pubkey != me {
             return Err(fdo_err(anyhow::anyhow!(
                 "ticket was issued for a different public key (expected {}, this daemon is {})",
                 MemberId(t.invitee_pubkey).to_hex(),
-                self.rt.identity.public_key().to_hex()
+                self.rt.identity.verifying_key().to_hex()
             )));
         }
 

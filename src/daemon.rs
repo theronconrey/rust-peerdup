@@ -13,10 +13,10 @@ use librqbit::api::TorrentIdOrHash;
 use librqbit::{
     create_torrent, AddTorrent, AddTorrentOptions, CreateTorrentOptions, Session, SessionOptions,
 };
-use p2panda_core::{Hash, PrivateKey};
+use p2panda_core::{SigningKey, Topic};
 use p2panda_net::gossip::GossipHandle;
 use p2panda_net::iroh_mdns::MdnsDiscoveryMode;
-use p2panda_net::{AddressBook, Discovery, Endpoint, Gossip, MdnsDiscovery, TopicId};
+use p2panda_net::{AddressBook, Discovery, Endpoint, Gossip, MdnsDiscovery};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
@@ -151,7 +151,7 @@ fn apply_auth_ops(
 /// holds enough plumbing to spawn new ones and look up running ones.
 pub struct DaemonRuntime {
     pub data_dir: PathBuf,
-    pub identity: PrivateKey,
+    pub identity: SigningKey,
     pub bt_port: u16,
     pub session: Arc<Session>,
     pub gossip: Gossip,
@@ -170,11 +170,11 @@ pub struct DaemonRuntime {
 pub async fn start_runtime(
     data_dir: PathBuf,
     bt_port: u16,
-    identity: PrivateKey,
+    identity: SigningKey,
 ) -> Result<DaemonRuntime> {
     let address_book = AddressBook::builder().spawn().await?;
     let endpoint = Endpoint::builder(address_book.clone())
-        .private_key(identity.clone())
+        .signing_key(identity.clone())
         .spawn()
         .await?;
     // _mdns and _discovery are kept alive for the daemon's lifetime by being
@@ -253,7 +253,7 @@ pub async fn spawn_share_task(
     let identity = rt.identity.clone();
     let data_dir = rt.data_dir.clone();
     let bt_port = rt.bt_port;
-    let peer_id_hex = identity.public_key().to_hex();
+    let peer_id_hex = identity.verifying_key().to_hex();
     let share_id_for_ctx = config.id.clone();
 
     tasks_guard.spawn(async move {
@@ -282,11 +282,11 @@ pub async fn spawn_share_task(
 pub async fn serve(
     data_dir: PathBuf,
     bt_port: u16,
-    identity: PrivateKey,
+    identity: SigningKey,
     configs: Vec<ShareConfig>,
     register_dbus: bool,
 ) -> Result<()> {
-    let peer_id_hex = identity.public_key().to_hex();
+    let peer_id_hex = identity.verifying_key().to_hex();
     tracing::info!(peer_id = %peer_id_hex, share_count = configs.len(), "daemon starting");
 
     let rt = Arc::new(start_runtime(data_dir, bt_port, identity).await?);
@@ -451,13 +451,14 @@ async fn run_share(
     bt_port: u16,
     data_dir: PathBuf,
     peer_id_hex: String,
-    identity: PrivateKey,
+    identity: SigningKey,
     key: Arc<RwLock<KeyRing>>,
     auth_state: AuthState,
     pending_rotations: Vec<SignedRotation>,
     cmd_rx: mpsc::Receiver<ShareCommand>,
 ) -> Result<()> {
-    let topic = TopicId::from(Hash::new(config.topic.as_bytes()));
+    // BLAKE3 of the topic string, the same id p2panda-core 0.5's Hash::new gave.
+    let topic = Topic::from(*blake3::hash(config.topic.as_bytes()).as_bytes());
     tracing::info!(
         share_id = %config.id,
         topic = %config.topic,
@@ -524,10 +525,10 @@ async fn seed_loop(
     config: ShareConfig,
     session: Arc<Session>,
     gossip: Gossip,
-    topic: TopicId,
+    topic: Topic,
     bt_port: u16,
     data_dir: PathBuf,
-    identity: PrivateKey,
+    identity: SigningKey,
     key: Arc<RwLock<KeyRing>>,
     mut auth_state: AuthState,
     mut pending_rotations: Vec<SignedRotation>,
@@ -643,9 +644,9 @@ async fn leech_loop(
     config: ShareConfig,
     session: Arc<Session>,
     gossip: Gossip,
-    topic: TopicId,
+    topic: Topic,
     data_dir: PathBuf,
-    identity: PrivateKey,
+    identity: SigningKey,
     key: Arc<RwLock<KeyRing>>,
     mut auth_state: AuthState,
     mut pending_rotations: Vec<SignedRotation>,
@@ -792,11 +793,11 @@ async fn sync_loop(
     config: ShareConfig,
     session: Arc<Session>,
     gossip: Gossip,
-    topic: TopicId,
+    topic: Topic,
     bt_port: u16,
     data_dir: PathBuf,
     peer_id_hex: String,
-    identity: PrivateKey,
+    identity: SigningKey,
     key: Arc<RwLock<KeyRing>>,
     mut auth_state: AuthState,
     mut pending_rotations: Vec<SignedRotation>,
@@ -987,7 +988,7 @@ async fn handle_share_command(
     cmd: ShareCommand,
     config: &ShareConfig,
     data_dir: &Path,
-    identity: &PrivateKey,
+    identity: &SigningKey,
     key: &Arc<RwLock<KeyRing>>,
     auth_state: &mut AuthState,
     pending_rotations: &mut Vec<SignedRotation>,
@@ -1050,7 +1051,7 @@ async fn handle_share_command(
 async fn handle_invite(
     config: &ShareConfig,
     data_dir: &Path,
-    identity: &PrivateKey,
+    identity: &SigningKey,
     key: &Arc<RwLock<KeyRing>>,
     auth_state: &mut AuthState,
     invitee: MemberId,
@@ -1096,7 +1097,7 @@ async fn handle_invite(
 async fn handle_revoke(
     config: &ShareConfig,
     data_dir: &Path,
-    identity: &PrivateKey,
+    identity: &SigningKey,
     key: &Arc<RwLock<KeyRing>>,
     auth_state: &mut AuthState,
     pending_rotations: &mut Vec<SignedRotation>,
@@ -1752,7 +1753,7 @@ async fn apply_key_rotation(
     rotation: SignedRotation,
     auth_state: &AuthState,
     group_id: MemberId,
-    identity: &PrivateKey,
+    identity: &SigningKey,
     key: &Arc<RwLock<KeyRing>>,
     rotation_buffer: &mut Vec<SignedRotation>,
     data_dir: &Path,
@@ -1795,7 +1796,7 @@ async fn try_install_rotation(
     rotation: &SignedRotation,
     auth_state: &AuthState,
     group_id: MemberId,
-    identity: &PrivateKey,
+    identity: &SigningKey,
     key: &Arc<RwLock<KeyRing>>,
     data_dir: &Path,
     share_id: &str,
@@ -1869,7 +1870,7 @@ async fn try_install_rotation(
 async fn drain_rotation_buffer(
     auth_state: &AuthState,
     group_id: MemberId,
-    identity: &PrivateKey,
+    identity: &SigningKey,
     key: &Arc<RwLock<KeyRing>>,
     rotation_buffer: &mut Vec<SignedRotation>,
     data_dir: &Path,
@@ -1948,8 +1949,8 @@ mod tests {
         }
     }
 
-    fn me_of(k: &PrivateKey) -> MemberId {
-        MemberId(*k.public_key().as_bytes())
+    fn me_of(k: &SigningKey) -> MemberId {
+        MemberId(*k.verifying_key().as_bytes())
     }
 
     fn bootstrap(
@@ -1957,12 +1958,12 @@ mod tests {
     ) -> (
         TmpDir,
         ShareConfig,
-        PrivateKey,
+        SigningKey,
         AuthState,
         Arc<RwLock<KeyRing>>,
     ) {
         let td = TmpDir::new(label);
-        let identity = PrivateKey::new();
+        let identity = SigningKey::generate();
         let topic = format!("topic-{label}");
         let config = ShareConfig::new(topic, td.path().join("share-root"), ShareRole::Sync);
         config.save(td.path()).unwrap();
@@ -1983,7 +1984,7 @@ mod tests {
     #[tokio::test]
     async fn invite_handler_appends_op_and_returns_ticket() {
         let (td, config, identity, mut auth_state, key) = bootstrap("invite-1");
-        let bob = PrivateKey::new();
+        let bob = SigningKey::generate();
         let ticket = handle_invite(
             &config,
             td.path(),
@@ -2008,7 +2009,7 @@ mod tests {
     #[tokio::test]
     async fn revoke_handler_rotates_keyring_and_writes_pending() {
         let (td, config, identity, mut auth_state, key) = bootstrap("revoke-1");
-        let bob = PrivateKey::new();
+        let bob = SigningKey::generate();
         // First add bob.
         handle_invite(
             &config,

@@ -420,7 +420,7 @@ fn cmd_share_add_direct(
     println!("Added share {} ({})", config.id, config.topic);
     println!(
         "Auth group bootstrapped with {} as owner",
-        identity.public_key().to_hex()
+        identity.verifying_key().to_hex()
     );
     Ok(())
 }
@@ -467,7 +467,7 @@ fn cmd_share_peers_direct(data_dir: PathBuf, id: String) -> Result<()> {
         return Err(anyhow!("share {id} not found"));
     }
     let me = identity::load_or_create(&data_dir::identity_path(&data_dir))
-        .map(|k| k.public_key().to_hex())
+        .map(|k| k.verifying_key().to_hex())
         .ok();
     let state = share_state::load(&data_dir, &id)?;
     let Some(state) = state else {
@@ -500,7 +500,7 @@ fn cmd_share_members_direct(data_dir: PathBuf, id: String) -> Result<()> {
     }
     let group_id = auth::group_id_for(&id);
     let me = identity::load_or_create(&data_dir::identity_path(&data_dir))
-        .map(|k| auth::MemberId(*k.public_key().as_bytes()))
+        .map(|k| auth::MemberId(*k.verifying_key().as_bytes()))
         .ok();
     let mut members = auth_state.members(group_id);
     members.sort_by_key(|(m, _)| m.0);
@@ -569,7 +569,7 @@ fn cmd_share_revoke_direct(data_dir: PathBuf, id: String, peer_pubkey_hex: Strin
 fn cmd_whoami_direct(data_dir: PathBuf) -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
     let identity = identity::load_or_create(&data_dir::identity_path(&data_dir))?;
-    println!("{}", identity.public_key().to_hex());
+    println!("{}", identity.verifying_key().to_hex());
     Ok(())
 }
 
@@ -639,13 +639,13 @@ fn cmd_share_join_direct(data_dir: PathBuf, ticket_str: String, path: PathBuf) -
     }
 
     let identity = identity::load_or_create(&data_dir::identity_path(&data_dir))?;
-    let me = *identity.public_key().as_bytes();
+    let me = *identity.verifying_key().as_bytes();
     if ticket.invitee_pubkey != me {
         return Err(anyhow!(
             "ticket was issued for a different public key (expected {}, this peer is {}); \
              ask the inviter to re-run `share invite` with the correct key",
             auth::MemberId(ticket.invitee_pubkey).to_hex(),
-            identity.public_key().to_hex()
+            identity.verifying_key().to_hex()
         ));
     }
 

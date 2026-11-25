@@ -21,8 +21,10 @@ use p2panda_auth::group::{
 };
 use p2panda_auth::traits::{IdentityHandle, Operation, OperationId, Orderer};
 use p2panda_auth::{Access, AccessLevel};
-use p2panda_core::identity::SIGNATURE_LEN;
-use p2panda_core::{PrivateKey, PublicKey, Signature};
+use p2panda_core::{Signature, SigningKey, VerifyingKey};
+
+/// Ed25519 signature length. p2panda-core 0.8 no longer exports it.
+pub const SIGNATURE_LEN: usize = 64;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::convert::Infallible;
@@ -187,7 +189,7 @@ impl SignedOp {
     }
 
     pub fn verify(&self) -> Result<()> {
-        let pubkey = PublicKey::from_bytes(&self.author.0)
+        let pubkey = VerifyingKey::from_bytes(&self.author.0)
             .map_err(|e| anyhow!("invalid author pubkey: {e:?}"))?;
         let sig = Signature::from_bytes(&self.signature);
         if !pubkey.verify(&self.canonical_bytes(), &sig) {
@@ -288,14 +290,14 @@ impl AuthState {
     }
 
     /// Author and apply the group's `Create` operation. Self becomes manager.
-    pub fn create_group(&mut self, my_key: &PrivateKey, group_id: MemberId) -> Result<SignedOp> {
+    pub fn create_group(&mut self, my_key: &SigningKey, group_id: MemberId) -> Result<SignedOp> {
         if !self.ops.is_empty() {
             return Err(anyhow!(
                 "auth state already has {} operation(s); refusing to re-create group",
                 self.ops.len()
             ));
         }
-        let me = MemberId(*my_key.public_key().as_bytes());
+        let me = MemberId(*my_key.verifying_key().as_bytes());
         let action = GroupAction::Create {
             initial_members: vec![(GroupMember::Individual(me), Access::manage())],
         };
@@ -304,7 +306,7 @@ impl AuthState {
 
     pub fn add_member(
         &mut self,
-        my_key: &PrivateKey,
+        my_key: &SigningKey,
         group_id: MemberId,
         new_member: MemberId,
         role: AuthRole,
@@ -318,7 +320,7 @@ impl AuthState {
 
     pub fn remove_member(
         &mut self,
-        my_key: &PrivateKey,
+        my_key: &SigningKey,
         group_id: MemberId,
         member: MemberId,
     ) -> Result<SignedOp> {
@@ -331,11 +333,11 @@ impl AuthState {
     /// Construct, sign, and apply a locally-authored op.
     fn author(
         &mut self,
-        my_key: &PrivateKey,
+        my_key: &SigningKey,
         group_id: MemberId,
         action: GroupAction<MemberId, ()>,
     ) -> Result<SignedOp> {
-        let me = MemberId(*my_key.public_key().as_bytes());
+        let me = MemberId(*my_key.verifying_key().as_bytes());
         let deps: Vec<OpId> = self.crdt.inner.heads().into_iter().collect();
         let payload = GroupControlMessage { group_id, action };
         let canonical =
@@ -451,8 +453,8 @@ impl AuthState {
 
     /// Only Owners may invite or revoke. Checked before authoring, so a
     /// non-Owner gets a clear error rather than a CRDT rejection.
-    pub fn require_owner(&self, group_id: MemberId, identity: &PrivateKey) -> Result<()> {
-        let me = MemberId(*identity.public_key().as_bytes());
+    pub fn require_owner(&self, group_id: MemberId, identity: &SigningKey) -> Result<()> {
+        let me = MemberId(*identity.verifying_key().as_bytes());
         let is_owner = self
             .members(group_id)
             .into_iter()
@@ -560,12 +562,12 @@ mod from_hex_tests {
 mod tests {
     use super::*;
 
-    fn fresh_key() -> PrivateKey {
-        PrivateKey::new()
+    fn fresh_key() -> SigningKey {
+        SigningKey::generate()
     }
 
-    fn me_of(k: &PrivateKey) -> MemberId {
-        MemberId(*k.public_key().as_bytes())
+    fn me_of(k: &SigningKey) -> MemberId {
+        MemberId(*k.verifying_key().as_bytes())
     }
 
     #[test]

@@ -8,8 +8,8 @@ repository = "https://github.com/theronconrey/rust-peerdup"
 readme = "README.md"
 
 [dependencies]
-p2panda-net = "0.5.2"
-p2panda-core = "0.5.2"
+p2panda-net = "0.8.1"
+p2panda-core = "0.8.1"
 p2panda-auth = { version = "0.5.2", features = ["serde"] }
 librqbit = "8.1.1"
 tokio = { version = "1.0", features = ["full"] }

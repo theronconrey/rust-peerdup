@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 use anyhow::{anyhow, Context, Result};
-use p2panda_core::identity::PRIVATE_KEY_LEN;
-use p2panda_core::PrivateKey;
+use p2panda_core::SigningKey;
+
+/// Ed25519 private key length (p2panda-core 0.8 no longer exports it).
+const PRIVATE_KEY_LEN: usize = 32;
 use std::fs;
 use std::path::Path;
 
-pub fn load_or_create(path: &Path) -> Result<PrivateKey> {
+pub fn load_or_create(path: &Path) -> Result<SigningKey> {
     if path.exists() {
         let raw = fs::read(path).with_context(|| format!("reading {path:?}"))?;
         let bytes: [u8; PRIVATE_KEY_LEN] = raw.try_into().map_err(|v: Vec<u8>| {
@@ -15,9 +17,9 @@ pub fn load_or_create(path: &Path) -> Result<PrivateKey> {
                 PRIVATE_KEY_LEN
             )
         })?;
-        Ok(PrivateKey::from_bytes(&bytes))
+        Ok(SigningKey::from_bytes(&bytes))
     } else {
-        let key = PrivateKey::new();
+        let key = SigningKey::generate();
         let parent = path
             .parent()
             .ok_or_else(|| anyhow!("identity path has no parent: {path:?}"))?;

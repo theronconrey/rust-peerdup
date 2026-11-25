@@ -91,11 +91,11 @@ impl Ticket {
 mod tests {
     use super::*;
     use crate::auth::{group_id_for, AuthRole, AuthState, MemberId};
-    use p2panda_core::PrivateKey;
+    use p2panda_core::SigningKey;
 
-    fn make_log() -> (PrivateKey, PrivateKey, Vec<SignedOp>) {
-        let alice = PrivateKey::new();
-        let bob = PrivateKey::new();
+    fn make_log() -> (SigningKey, SigningKey, Vec<SignedOp>) {
+        let alice = SigningKey::generate();
+        let bob = SigningKey::generate();
         let group = group_id_for("ticket-test");
         let mut state = AuthState::empty();
         state.create_group(&alice, group).unwrap();
@@ -103,7 +103,7 @@ mod tests {
             .add_member(
                 &alice,
                 group,
-                MemberId(*bob.public_key().as_bytes()),
+                MemberId(*bob.verifying_key().as_bytes()),
                 AuthRole::Writer,
             )
             .unwrap();
@@ -119,7 +119,7 @@ mod tests {
             topic: "demo".into(),
             keys: vec![[1u8; KEY_LEN], [2u8; KEY_LEN]],
             auth_log: log.clone(),
-            invitee_pubkey: *bob.public_key().as_bytes(),
+            invitee_pubkey: *bob.verifying_key().as_bytes(),
             role: ShareRole::Sync,
         };
         let s = t.encode().unwrap();
@@ -151,7 +151,7 @@ mod tests {
             topic: "demo".into(),
             keys: vec![[1u8; KEY_LEN]],
             auth_log: log,
-            invitee_pubkey: *bob.public_key().as_bytes(),
+            invitee_pubkey: *bob.verifying_key().as_bytes(),
             role: ShareRole::Sync,
         };
         let s = t.encode().unwrap();
@@ -171,7 +171,7 @@ mod tests {
             topic: "demo".into(),
             keys: vec![[7u8; KEY_LEN]],
             auth_log: log,
-            invitee_pubkey: *bob.public_key().as_bytes(),
+            invitee_pubkey: *bob.verifying_key().as_bytes(),
             role: ShareRole::Sync,
         };
         let err = Ticket::decode(&t.encode().unwrap())
