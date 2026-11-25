@@ -16,14 +16,22 @@ guesses, not commitments. Add 50% if part-time, double for "with surprises."
 |---|---|---|
 | 1. Foundation | ✅ Done | — |
 | 2. Persistent state & daemon | ✅ Done | — |
-| 3. Multi-master sync | ✅ Done | — |
-| 4. Encryption at rest | ✅ Done (file-level; `p2panda-encryption` deferred — see notes) | — |
-| 5. ACL via p2panda-auth | ✅ Done | — |
-| 6. Swarm admission gate | ⏸️ Blocked on upstream librqbit ([ikatson/rqbit#582](https://github.com/ikatson/rqbit/issues/582)) | 2–3 weeks |
-| 7. D-Bus IPC surface | ✅ Done | — |
-| 8. Linux UI | 👉 Next available | 4–6 weeks |
-| 9. Cross-platform packaging | Planned | 4–8 weeks |
+| 3. Multi-master sync | ⚠️ Partial: works on one host; concurrent edits resolve by LWW and silently lose the other side (no conflict copies) | in 7.5 |
+| 4. Encryption at rest | ⚠️ Partial: file contents encrypted; file names and sizes visible in the swarm; `p2panda-encryption` deferred | in 7.5 |
+| 5. ACL via p2panda-auth | ⚠️ Partial: membership, invites, revocation and key rotation done; write permission is not enforced on sync announces, so revoked members and readers can still push | in 7.5 |
+| 6a. Transport decision | 👉 Next: spike, decides how 6 and 7.5 are built | 1–2 weeks |
+| 6. Swarm admission gate | ⏸️ Blocked on upstream librqbit ([ikatson/rqbit#582](https://github.com/ikatson/rqbit/issues/582)), or replaced by 6a | 2–3 weeks |
+| 7. D-Bus IPC surface | ⚠️ Partial: methods and activation done; no signals, bus name not final | 1 week |
+| 7.5. Make it real across machines | 👉 Next after 6a | 4–6 weeks |
+| 7.6. Formats and release engineering | Planned | 1–2 weeks |
+| 8. Linux UI (GTK4/libadwaita app) | Planned | 6–10 weeks |
+| 9. Other platforms (Linux Flatpak GUI; Windows, macOS) | Planned | 8–12 weeks |
 | 10. Production hardening | Planned | Ongoing |
+| F. Fedora packaging | ✅ Copr (theronconrey/peerdup), Fedora CI, Packit; Fedora proper is a parallel track | ongoing |
+
+"Partial" means the phase's own done criteria below aren't met yet, even
+where most of its deliverables have landed. The gaps are what Phase 7.5
+closes; a UI on top of them would show them to users.
 
 **Phase 5 substep tracking** (mirrors `README.md`):
 
@@ -35,8 +43,10 @@ guesses, not commitments. Add 50% if part-time, double for "with surprises."
 | 5d. Auto key rotation on revocation | ✅ Done |
 | 5e. 4-peer revocation e2e test | ✅ Done (`tests/e2e-revoke.sh`) |
 
-**Total to v1.0:** roughly 6–9 months of focused work, with phases 3–6 being
-the technically meatiest.
+**Total to v1.0:** roughly 10–14 months of focused work from here. The
+earlier 6–9 month figure left out cross-machine sync (7.5), format and
+release work (7.6), the transport decision, a security audit and the
+Fedora-proper track.
 
 ---
 
@@ -57,7 +67,7 @@ would be theoretical.
 
 ---
 
-### Phase 2 — Persistent state & daemon (NEXT)
+### Phase 2 — Persistent state & daemon (done)
 
 **Goal:** transform the one-shot demo into a long-running daemon that
 manages multiple shares across restarts.
@@ -206,6 +216,31 @@ Last bit becomes real in Phase 6.
 
 ---
 
+### Phase 6a — Transport decision (spike)
+
+**Goal:** decide, in writing, how file contents move between peers, before
+building more on librqbit.
+
+**Why now:** Phase 6 is blocked on a librqbit hook (rqbit#582), Phase 10
+plans NAT hole-punching "via iroh", and cross-machine sync (7.5) is broken
+today because BitTorrent endpoints are announced as `127.0.0.1`. iroh,
+which p2panda already runs, gives connections that are authenticated by
+Ed25519 node id (the same key as the member id), NAT-traversed and relayed.
+Moving bulk transfer onto iroh would give the admission gate, NAT traversal
+and relay fallback in one step.
+
+**Options to compare:**
+- Keep librqbit, announce reachable addresses, and push the PeerFilter hook
+  upstream (today's plan; Phase 6 as written).
+- BitTorrent over iroh QUIC streams (librqbit pieces, iroh connections).
+- `iroh-blobs` (content-addressed transfer over iroh) in place of librqbit.
+
+**Done criteria:** a short design note in `INTEGRATION_NOTES.md` with the
+choice, the reasons, and what it changes in 6, 7.5 and 10. Keep "upstream
+hook in librqbit" as plan B if iroh is chosen.
+
+---
+
 ### Phase 6 — Swarm admission gate (BEP-10)
 
 **Goal:** the auth layer actually enforces against the BT data plane.
@@ -256,6 +291,17 @@ extension is JS in gnome-shell's process — IPC is the only path).
   fork).
 - Stable `org.peerdup.Daemon` interface contract — versioned, documented.
 
+**Still to do (status: partial):**
+- Signals: `ShareStateChanged`, `Conflict`, `MemberChanged`, plus a
+  `Status` method. Phase 8 needs them.
+- Ship the introspection XML in `/usr/share/dbus-1/interfaces/`, as
+  tamarack does.
+- Pick the final bus name before anyone depends on it. `org.peerdup`
+  implies owning peerdup.org; Flatpak and Flathub want names under the
+  app id, e.g. `io.github.theronconrey.Peerdup1`. Decide together with the
+  final package name (Phase F).
+- An API stability policy (what may change before and after 1.0).
+
 **Out of scope:**
 - Non-D-Bus IPC for non-Linux platforms (Phase 9).
 - GraphQL or HTTP API.
@@ -263,6 +309,78 @@ extension is JS in gnome-shell's process — IPC is the only path).
 **Done criteria:** all CLI commands work against a running daemon over
 D-Bus. `busctl` introspection shows the API. The daemon emits signals
 for share state changes that a future client can subscribe to.
+
+---
+
+### Phase 7.5 — Make it real across machines
+
+**Goal:** two Fedora machines on different networks sync a share, and the
+membership rules from Phase 5 actually hold.
+
+**Why this phase:** Phases 3–5 were built and tested with every peer on one
+host. Across hosts, sync doesn't work at all, and several guarantees the
+README makes aren't enforced. This phase comes before the UI because a UI
+would put these gaps in front of users.
+
+**Key deliverables:**
+- Announce reachable addresses, or move transfer onto iroh (Phase 6a).
+- Timeouts on every fetch, run off the share's select loop, so one bad
+  announce can't stall a share.
+- Signed announces: each announce signed with `identity.key` over the share,
+  info-hash, version hash, clock and timestamp; only current Writers and
+  Owners are applied. New versions under old key epochs are refused.
+- Decrypt into a staging directory and check the version hash before
+  anything is renamed into the share root.
+- Conflict copies (`name (conflict from <peer> <date>).ext`) instead of
+  silent last-write-wins.
+- Random 32-byte share topics generated at `share-add` and carried in the
+  ticket; the human-readable name becomes a label. Today's user-chosen
+  topics collide and are guessable.
+- Bind rotation signatures to the share (group id in the signed bytes).
+- Auth CRDT: process remote ops on a copy and commit only on success; cap
+  the pending buffer; check the group id; check the local role before
+  authoring invites or revocations.
+- Tickets read from stdin or a file, not the command line (`/proc` and
+  shell history expose them).
+- Hide file names and sizes from the swarm (hashed or encrypted shadow
+  paths).
+- Bring Seed and Leech back through the encrypted path, or drop them.
+  (They are disabled for now because they transfer plaintext.)
+- A written threat model (moved here from Phase 10, since the README makes
+  security claims).
+
+**Done criteria:** tmt multihost plans on Testing Farm, run by Packit
+against the Copr build: two Fedora VMs on different subnets plus one behind
+NAT sync a share; a Reader's and a revoked member's changes are refused by
+every peer; concurrent edits produce conflict copies; the daemon runs under
+the shipped user unit (so its sandboxing is exercised) and
+`tests/e2e-dbus.sh` passes.
+
+---
+
+### Phase 7.6 — Formats and release engineering
+
+**Goal:** once people install from Copr, changes to formats and APIs don't
+strand them.
+
+**Key deliverables:**
+- A version field on every on-disk format (`auth.log`, `keys.bin`,
+  `state.json`, `share.json`) and on every gossip message, with a migration
+  path.
+- Replace `bincode` (unmaintained, RUSTSEC-2025-0141), which today defines
+  the signed bytes and the wire and disk formats. Define the canonical
+  signing bytes explicitly. This invalidates existing signatures, so it
+  has to happen before 1.0. Until then, set decode size limits on
+  everything that comes from peers and tickets.
+- `cargo deny` (advisories, licenses, bans) in CI.
+- Fuzzing (`cargo fuzz`) for the ticket, gossip and auth decoders.
+- Release process: semver policy, NEWS file, signed tags, rpmautospec
+  (`%autorelease`, `%autochangelog`), releases cut from tags and built by
+  Packit into Copr. Later: Packit `propose_downstream`, `koji_build`,
+  `bodhi_update` for Fedora proper.
+- `SECURITY.md` with a response process (done) and an advisory workflow.
+- `rust-version` (MSRV) in `Cargo.toml`, kept at or below the rustc in the
+  oldest supported Fedora.
 
 ---
 
@@ -277,24 +395,33 @@ GNOME shell extension is what makes peerdup feel like a system feature
 rather than an app.
 
 **Key deliverables:**
-- GNOME Shell extension (JavaScript, in gnome-shell's GJS runtime).
-  - Status indicator in the top bar.
-  - Per-share list with sync state.
-  - Notifications for conflicts, completed syncs, member changes.
-  - All state via D-Bus (Phase 7's interface).
-- Optional GTK4 + libadwaita app for heavier UI.
-  - Share management (add/remove, change root path).
-  - Member management UI.
-  - Conflict resolution UI.
-  - Could ship later than the extension; not v1-blocking.
+- A GTK4 + libadwaita app as the primary UI (changed from "optional"):
+  share management, member management with invite and revoke, conflict
+  resolution, per-share sync state. All state over D-Bus (Phase 7).
+  It is also the UI Phase 9 reuses on Windows and macOS.
+- GNOME platform integration, not custom mechanisms:
+  - Run in the background and start at login through the Background portal
+    (`org.freedesktop.portal.Background`).
+  - Notifications through the notification portal.
+  - A `.desktop` file, AppStream metainfo, icons.
+  - i18n with gettext from day one (CLI strings too), translations later
+    through Fedora Weblate.
+  - User help (Mallard or a docs site).
+- GNOME Shell extension as an optional, later status indicator only.
+  Extensions break with every GNOME release (every six months, which
+  Fedora ships right away) and don't work on other desktops, so they
+  shouldn't be the only way in.
+
+Estimate raised from 4–6 to 6–10 weeks for the app plus integration.
 
 **Out of scope:**
 - KDE / other desktop integrations.
 - Mobile.
 
-**Done criteria:** install peerdup, install the extension, see the
-status indicator. Add a share via the indicator menu. Watch the icon
-update during sync. Get a notification when a peer joins.
+**Done criteria:** install the app, add a share and invite a second
+machine from it, see sync state change live, get a notification when a
+peer joins and when a conflict copy is made. Passes the GNOME HIG basics
+and `appstreamcli validate`.
 
 ---
 
@@ -312,8 +439,11 @@ stack would have allowed.
   signed installer (MSI via `cargo-wix`), winget manifest.
 - macOS: x64 and arm64 builds, signed and notarized `.app` bundle, dmg
   installer or Homebrew formula.
-- Linux: Flatpak via Flathub for non-distro-managed installs, in
-  addition to whatever the distro packagers do.
+- Linux: the daemon stays an RPM (or host install), because a sandboxed
+  sync engine needs `--filesystem=home`, and folders granted through the
+  document portal don't suit an inotify-based watcher. The GUI can go to
+  Flathub, talking to the host daemon with `--talk-name`, which needs the
+  bus name under the app id (Phase 7).
 - Per-platform UI choice:
   - Windows/macOS: GTK4 app (Phase 8) is the primary UI; no shell
     extension equivalent.
@@ -321,6 +451,9 @@ stack would have allowed.
     toolkit. Decide before this phase starts.
 - Code-signing infrastructure (Authenticode certificate for Windows,
   Apple Developer ID for macOS).
+
+Estimate raised from 4–8 to 8–12 weeks: code signing and notarization for
+two platforms is most of it.
 
 **Out of scope:**
 - Mobile platforms.
@@ -341,25 +474,59 @@ across all three.
 - Hole-punching coordination via panda's iroh layer for peers behind
   NATs (replaces the BEP-55 we decided not to implement).
 - Relay fallback for symmetric NATs (small self-hostable relay component).
-- Telemetry: opt-in metrics for sync performance, error rates.
-- Crash reporting (opt-in).
-- Documentation: user docs, operator docs, API reference, threat model.
+- Telemetry: off by default, opt-in only, and always possible to turn off.
+- Crash reporting: rely on systemd-coredump and ABRT, which Fedora already
+  runs, rather than a custom reporter.
+- Documentation: user docs, operator docs, API reference. (The threat
+  model moved to Phase 7.5.)
+- Privacy disclosure: say in the README and man page which third-party
+  servers the daemon contacts (iroh relays, DNS/pkarr publishing), whether
+  it asks the router to open ports (UPnP/NAT-PMP), and that mDNS announces
+  it on every LAN it joins, with options to turn each off.
+- SELinux: no policy is needed while this is a user daemon in
+  `unconfined_t` with files in `$HOME`; add a run as a confined user
+  (`staff_u`/`user_u`) to the test matrix.
 - Performance tuning: memory usage with many shares, large folders,
   many peers.
 - Migration tooling for users coming from Syncthing or other tools.
 - Security audit before any "stable" release.
 
 **Done criteria:** define when v1.0 ships. Suggested bar:
+- An external security audit of the protocol and code.
 - 100+ users running for a month with no data-loss bug reports.
 - All Phase 1–9 deliverables landed.
 - Documented security model reviewed externally.
 
 ---
 
-# Phase 2 detailed instructions
+### Track F — Fedora packaging (parallel)
 
-This is the next milestone. Goal is to turn the demo into a daemon
-managing multiple shares across restarts. Estimated 2–3 weeks.
+**Done:** the RPM spec (Fedora Rust guidelines, vendored crates), Packit
+builds into the `theronconrey/peerdup` Copr project, Fedora CI on
+`fedora:latest` and rawhide (rpmlint, install smoke test), Dependabot, and a
+weekly upkeep check. See `CONTRIBUTING.md`.
+
+**Toward Fedora proper (upstream-first):**
+- Settle the final package name before units, the bus name, the data
+  directory and the firewalld service lock in. `rust-` is Fedora's prefix
+  for crate library packages, and a reviewer will question an application
+  named `rust-peerdup`.
+- Ask the Fedora Rust SIG about packaging the p2panda, iroh/n0 and librqbit
+  crate stacks as `rust-*` packages. iroh is pre-1.0 and ships breaking
+  releases every few weeks; that churn is the main obstacle. Contribute
+  packaging-friendliness and stability requests upstream.
+- Until those exist, a package review can argue vendoring as the
+  guidelines' "last resort"; the spec already uses the guidelines'
+  vendoring macros.
+- Needs a sponsor and a committed maintainer. Leaf package: consider
+  `ExcludeArch: %{ix86}`.
+
+---
+
+# Appendix: Phase 2 build notes (historical)
+
+These were the step-by-step notes for Phase 2, kept for reference. Phase 2
+is done; the code is the source of truth where they differ.
 
 ## Step 0 — pick a state directory
 
