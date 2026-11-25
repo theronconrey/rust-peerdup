@@ -74,6 +74,15 @@ impl Ticket {
         if ticket.auth_log.is_empty() {
             return Err(anyhow!("ticket has no auth log"));
         }
+        // share_id becomes a directory name; it must be the one the topic
+        // derives, which also makes it 16 hex characters.
+        if ticket.share_id != crate::share::id_from_topic(&ticket.topic) {
+            return Err(anyhow!(
+                "ticket share id {:?} does not match its topic",
+                ticket.share_id
+            ));
+        }
+        ticket.role.ensure_encrypted()?;
         Ok(ticket)
     }
 }
@@ -106,7 +115,7 @@ mod tests {
         let (_alice, bob, log) = make_log();
         let t = Ticket {
             version: TICKET_VERSION,
-            share_id: "abcd1234".into(),
+            share_id: crate::share::id_from_topic("demo"),
             topic: "demo".into(),
             keys: vec![[1u8; KEY_LEN], [2u8; KEY_LEN]],
             auth_log: log.clone(),
@@ -138,7 +147,7 @@ mod tests {
         let (_alice, bob, log) = make_log();
         let mut t = Ticket {
             version: 1,
-            share_id: "abcd1234".into(),
+            share_id: crate::share::id_from_topic("demo"),
             topic: "demo".into(),
             keys: vec![[1u8; KEY_LEN]],
             auth_log: log,
@@ -151,5 +160,23 @@ mod tests {
         // Sanity: bumping to current version makes it accept.
         t.version = TICKET_VERSION;
         assert!(Ticket::decode(&t.encode().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn rejects_share_id_that_does_not_match_topic() {
+        let (_alice, bob, log) = make_log();
+        let t = Ticket {
+            version: TICKET_VERSION,
+            share_id: "../../../../tmp/evil".into(),
+            topic: "demo".into(),
+            keys: vec![[7u8; KEY_LEN]],
+            auth_log: log,
+            invitee_pubkey: *bob.public_key().as_bytes(),
+            role: ShareRole::Sync,
+        };
+        let err = Ticket::decode(&t.encode().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match its topic"), "{err}");
     }
 }

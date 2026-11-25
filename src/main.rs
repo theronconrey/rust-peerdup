@@ -25,7 +25,7 @@ use std::path::PathBuf;
     about = "p2panda + librqbit folder sync"
 )]
 struct Cli {
-    /// Override data directory. Default: $XDG_DATA_HOME/peerdup on Linux.
+    /// Override data directory. Default: $XDG_DATA_HOME/rust-peerdup on Linux.
     ///
     /// **Routing semantics (Phase 7):**
     ///
@@ -69,11 +69,11 @@ enum Cmd {
         /// must use the same topic to find each other.
         #[arg(long)]
         topic: String,
-        /// Path to the folder this share covers. For seeders, this is the
-        /// source. For leechers, this is where files will be written.
+        /// Path to the folder this share covers.
         #[arg(long)]
         path: PathBuf,
-        /// Role for this peer in the share.
+        /// Role for this peer in the share. Only sync runs; seed and leech
+        /// are disabled because they are not encrypted.
         #[arg(long, value_enum)]
         role: ShareRole,
     },
@@ -92,7 +92,8 @@ enum Cmd {
         /// Invitee's 64-char hex public key (from `peerdup whoami` on their
         /// machine). The new `Add` op binds this key as a member.
         invitee_pubkey: String,
-        /// Transport role to suggest for the receiving peer (Seed/Leech/Sync).
+        /// Transport role to suggest for the receiving peer. Only sync runs;
+        /// seed and leech are disabled because they are not encrypted.
         #[arg(long, value_enum, default_value = "sync")]
         role: ShareRole,
         /// Auth-level role: owner (manage), writer, or reader. Default writer.
@@ -534,6 +535,7 @@ fn cmd_share_invite_direct(
     role: ShareRole,
     auth_role: auth::AuthRole,
 ) -> Result<()> {
+    role.ensure_encrypted()?;
     let configs = share::load_all(&data_dir)?;
     let cfg = configs
         .iter()

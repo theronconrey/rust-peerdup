@@ -466,6 +466,7 @@ async fn run_share(
         pending_rotations = pending_rotations.len(),
         "starting share"
     );
+    config.role.ensure_encrypted()?;
     match config.role {
         ShareRole::Seed => {
             seed_loop(
@@ -1056,6 +1057,7 @@ async fn handle_invite(
     auth_role: AuthRole,
     suggested_role: ShareRole,
 ) -> Result<String> {
+    suggested_role.ensure_encrypted()?;
     let group_id = auth::group_id_for(&config.id);
     if auth_state.is_empty() {
         return Err(anyhow!(
