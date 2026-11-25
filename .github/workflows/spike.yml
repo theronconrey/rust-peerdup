@@ -11,6 +11,10 @@ on:
   push:
     branches: ["spike/**"]
 
+env:
+  # Link Fedora's SQLite, as the spec does, not libsqlite3-sys's bundled copy.
+  LIBSQLITE3_SYS_USE_PKG_CONFIG: "1"
+
 permissions:
   contents: write
 

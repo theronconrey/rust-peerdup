@@ -1,10 +1,10 @@
 # rust-peerdup
 
 A folder-sync daemon built on [`p2panda`](https://p2panda.org/) for peer
-discovery and gossip, and [`librqbit`](https://github.com/ikatson/rqbit) for
-BitTorrent-based content transfer. File contents are encrypted end to
-end (file names and sizes are not hidden yet), multi-master, and it runs
-as a long-lived daemon managing multiple shares.
+discovery and gossip, and [`iroh-blobs`](https://github.com/n0-computer/iroh-blobs)
+over [iroh](https://iroh.computer/) for content transfer. File contents and
+names are encrypted end to end, multi-master, and it runs as a long-lived
+daemon managing multiple shares.
 
 ## Why a separate Rust implementation
 
@@ -25,7 +25,7 @@ side rather than replacing it, for two reasons:
    per-platform variants.
 
 The Python `peerdup` keeps moving on its own track; this repo is free to
-make different design calls (e.g. librqbit instead of libtorrent, p2panda
+make different design calls (e.g. iroh-blobs instead of libtorrent, p2panda
 instead of a custom transport).
 
 ## Status
@@ -47,7 +47,7 @@ writing:
 | 7. D-Bus IPC surface | ✅ Done (CLI talks to the daemon over `org.peerdup.Daemon1` on the session bus) |
 | 6, 8+ | Per ROADMAP.md |
 
-Detailed design notes, including non-obvious gotchas about librqbit and
+Detailed design notes, including non-obvious gotchas about iroh and
 p2panda, live in [`INTEGRATION_NOTES.md`](INTEGRATION_NOTES.md). Read it
 before making changes — the "Things that look wrong but aren't" section
 in particular saves an hour of unnecessary fixing.
@@ -63,26 +63,21 @@ sudo dnf copr enable theronconrey/peerdup
 sudo dnf install rust-peerdup
 ```
 
-The package ships the binary, a man page, the `systemd --user` unit, the
-D-Bus activation file and a firewalld service. Nothing is enabled for you:
-the first CLI call starts the daemon over D-Bus, or enable it at login with
-`systemctl --user enable --now rust-peerdup`. File transfers are
-BitTorrent and need the port reachable on at least one side, so open it:
+The package ships the binary, a man page, the `systemd --user` unit and the
+D-Bus activation file. Nothing is enabled for you: the first CLI call starts
+the daemon over D-Bus, or enable it at login with
+`systemctl --user enable --now rust-peerdup`.
 
-```bash
-sudo firewall-cmd --permanent --add-service=rust-peerdup
-sudo firewall-cmd --reload
-```
+No firewall changes are needed. Peers connect out over iroh (QUIC over
+UDP), punch through NATs where they can, and fall back to a relay where
+they can't. Relayed traffic is still end-to-end encrypted, but the relay
+sees that two nodes are talking. By default those are n0's public relays;
+see `INTEGRATION_NOTES.md`, "Transport: iroh-blobs".
 
-The port is per user (41000 by default). If two people use rust-peerdup on
-one machine, give the second a different one with
-`systemctl --user edit rust-peerdup` (`[Service]`,
-`Environment=PEERDUP_BT_PORT=41001`) and open that port instead.
-
-> **Not yet ready for syncing between machines.** Daemons on two different
-> hosts don't sync yet: each announces a loopback address (see
-> `INTEGRATION_NOTES.md`, "Announce a reachable address"). This is the next
-> piece of work.
+> **Same network only, for now.** Two daemons on one LAN find each other
+> (mDNS) and sync. Across the internet they don't find each other yet: an
+> invite doesn't carry the inviter's address. That is the next piece of
+> work (ROADMAP.md, phase 7.5).
 
 ### From source (development)
 
@@ -124,12 +119,12 @@ journalctl --user -u rust-peerdup -f  # watch sync events live
 
 Edits in either share root propagate within ~1–2 seconds.
 
-For two daemons on the **same** machine (e.g. local smoke testing),
-override the data dir and BT port to avoid collisions:
+For two daemons on the **same** machine (e.g. local smoke testing), give
+each its own data dir (`tests/e2e-sync.sh` does exactly this):
 
 ```bash
-rust-peerdup --data-dir /tmp/peerdup-a serve --bt-port 41000 &
-rust-peerdup --data-dir /tmp/peerdup-b serve --bt-port 41001 &
+rust-peerdup --data-dir /tmp/peerdup-a serve --no-dbus &
+rust-peerdup --data-dir /tmp/peerdup-b serve --no-dbus &
 ```
 
 Inspect membership and revoke peers:
@@ -178,6 +173,7 @@ src/
 ├── daemon.rs         DaemonRuntime, per-share sync_loop, JoinSet, ShareCommand dispatch
 ├── ipc.rs            org.peerdup.Daemon1 D-Bus interface (Phase 7)
 ├── client.rs         Thin DaemonClient wrapping zbus::Proxy (Phase 7)
+├── transfer.rs       iroh-blobs store, encrypted manifests, fetch + verify
 ├── share.rs          ShareConfig, ShareRole, on-disk layout
 ├── share_state.rs    Per-share runtime state (vhash, clock, manifest, timestamp)
 ├── clock.rs          VectorClock + ClockOrdering
@@ -191,7 +187,6 @@ src/
 
 systemd/rust-peerdup.service       systemd user unit installed by install.sh
 dbus-1/org.peerdup.Daemon1.service D-Bus session activation file
-firewalld/rust-peerdup.xml         firewalld service (BT port, mDNS)
 rust-peerdup.spec                  RPM spec (vendored crates; see CONTRIBUTING.md)
 packaging/vendor.sh                makes the RPM's source and vendor tarballs
 .packit.yaml                       Copr builds for PRs, main and releases

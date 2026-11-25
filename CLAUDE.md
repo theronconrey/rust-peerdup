@@ -35,7 +35,7 @@ Attribution:
 ## What this is
 
 `rust-peerdup` is a Rust implementation of the peerdup folder-sync daemon,
-built on `p2panda` (gossip, identity) and `librqbit` (BitTorrent transfer).
+built on `p2panda` (gossip, identity) and `iroh-blobs` over iroh (transfer).
 It is a parallel implementation to the Python `peerdup` repo — both follow
 the same [`ROADMAP.md`](ROADMAP.md) but make different technology choices.
 See [`README.md`](README.md) for the user-facing rationale.
@@ -43,10 +43,10 @@ See [`README.md`](README.md) for the user-facing rationale.
 ## Where to read first
 
 1. **[`INTEGRATION_NOTES.md`](INTEGRATION_NOTES.md)** — the source of truth
-   for non-obvious crate behavior (librqbit's non-deterministic info-hash,
-   the wire-only encryption threat model, librqbit's lack of a public
-   state-change event channel, etc.). The "Things that look wrong but
-   aren't" section in particular catches three design choices that
+   for non-obvious crate behavior (the iroh-blobs transfer design, the
+   wire-only encryption threat model, p2panda's auth CRDT, etc.). Its
+   librqbit sections are history: transfer moved to iroh-blobs. The
+   "Things that look wrong but aren't" section catches design choices that
    commonly get "fixed" by readers unfamiliar with the constraints.
 2. **[`ROADMAP.md`](ROADMAP.md)** — phase plan. The phases are in strict
    dependency order; skipping ahead generally doesn't work.
@@ -55,26 +55,29 @@ See [`README.md`](README.md) for the user-facing rationale.
 
 ## Behaviors worth knowing
 
-### Don't trust librqbit's info-hash for content equality
-`librqbit::create_torrent` walks directories in filesystem order, which
-varies per host. Two peers with byte-identical content compute different
-info-hashes. This repo carries its own `version_hash` (blake3 over sorted
-`(rel_path, blake3(content))` pairs) for "is this the same content?"
-comparisons; info-hash is used only as the BitTorrent magnet for
-fetching. Don't merge changes that compare info-hashes to mean "same
-content."
+### Versions are compared by `version_hash`
+`version_hash` is blake3 over sorted `(rel_path, blake3(content))` pairs
+(`transfer::version_hash_of`); same content gives the same hash on every
+peer. Sync compares versions with it, and a receiver checks a fetched
+manifest against the announced `version_hash` and every decrypted file
+against its manifest hash before anything touches the share root. Don't
+add a path that writes fetched data into the root before those checks.
 
-### Encryption boundary
-The user-visible share root holds **plaintext** (apps need to read/write
-files normally). `<root>/.peerdup/encrypted/` holds **ciphertext** that
-librqbit operates on. Two filters keep these from interfering:
+### Transfer and the encryption boundary
+The share root holds **plaintext**. What leaves the machine is blobs in
+the iroh-blobs store under `<data_dir>/blobs`: one ciphertext blob per
+file and one encrypted manifest (`transfer.rs`). Gossip carries only the
+manifest hash and the provider's node id. The store is a cache, rebuilt
+from the plaintext on start. Unchanged files reuse their ciphertext
+(`BlobCache`) so their blob hash is stable; don't "simplify" that away, or
+every edit re-sends the whole share.
 
-- The notify watcher skips events whose paths all pass through `.peerdup`.
-- `collect_files` skips any directory entry named `.peerdup`.
-
-If you add another filesystem walk or watcher, apply the same filter or
-you'll either feedback-loop the watcher or hash ciphertext alongside
-plaintext.
+`.peerdup` is peerdup's own name at any depth: `collect_files` and the
+notify watcher skip it, and manifest paths containing it (or `..`, or
+absolute ones) are refused. Fetched files are staged as
+`*.peerdup-tmp` beside their destination and renamed in only after every
+check passes; the walk skips those too. If you add another filesystem walk
+or watcher, apply the same filters.
 
 ### Vector clocks need a stable peer identity
 The daemon's identity (`<data_dir>/identity.key`, an Ed25519 private key)
@@ -152,7 +155,13 @@ cargo test               # unit tests (~10 currently, in clock/crypto/ticket)
 cargo check              # quick type-check without codegen
 ```
 
-End-to-end smoke test (two daemons on one machine):
+End-to-end test (two daemons on one machine; CI runs it against the RPM):
+
+```bash
+tests/e2e-sync.sh target/debug/rust-peerdup
+```
+
+The same by hand:
 
 ```bash
 PEER_A=/tmp/peerdup-a
@@ -173,8 +182,8 @@ printf '%s' "$TICKET" | ./target/debug/rust-peerdup --data-dir $PEER_B \
     share-join - --path $ROOT_B
 
 # Run each in a separate terminal (or via & + wait):
-./target/debug/rust-peerdup --data-dir $PEER_A serve --bt-port 41000 &
-./target/debug/rust-peerdup --data-dir $PEER_B serve --bt-port 41001 &
+./target/debug/rust-peerdup --data-dir $PEER_A serve --no-dbus &
+./target/debug/rust-peerdup --data-dir $PEER_B serve --no-dbus &
 
 sleep 5 && diff -r $ROOT_A $ROOT_B --exclude=.peerdup
 ```
@@ -185,7 +194,7 @@ sleep 5 && diff -r $ROOT_A $ROOT_B --exclude=.peerdup
 `rust_peerdup=info`. Useful settings:
 
 - `RUST_LOG=rust_peerdup=info` — peerdup events only (the default)
-- `RUST_LOG=rust_peerdup=info,librqbit=info` — peerdup + librqbit progress
+- `RUST_LOG=rust_peerdup=info,iroh_blobs=info` — peerdup + transfer progress
 - `RUST_LOG=rust_peerdup=debug` — verbose per-share announce/poll detail
 
 The crate's tracing target is `rust_peerdup` (with underscore — Cargo

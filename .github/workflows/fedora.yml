@@ -11,6 +11,10 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  # Link Fedora's SQLite, as the spec does, not libsqlite3-sys's bundled copy.
+  LIBSQLITE3_SYS_USE_PKG_CONFIG: "1"
+
 permissions:
   contents: read
 
@@ -29,7 +33,7 @@ jobs:
         run: >
           dnf -y install glibc-langpack-en git-core rpm-build rpmdevtools rpmlint
           cargo rust clippy rustfmt cargo-rpm-macros cargo-vendor-filterer xz
-          systemd firewalld
+          systemd
 
       - uses: actions/checkout@v7
 
@@ -79,6 +83,10 @@ jobs:
       - name: Install and smoke-test the package
         run: |
           dnf -y install "$HOME"/rpmbuild/RPMS/*/rust-peerdup-[0-9]*.rpm
+          # Two installed daemons sync a share over iroh-blobs.
+          tests/e2e-sync.sh /usr/bin/rust-peerdup
+          # Linked against Fedora's SQLite, not a bundled copy.
+          ldd /usr/bin/rust-peerdup | grep -q libsqlite3
           cd /
           rust-peerdup --version
           rust-peerdup --help
@@ -98,4 +106,3 @@ jobs:
           systemd-analyze verify --man=no /usr/lib/systemd/user/rust-peerdup.service
           systemd-analyze security --offline=true --no-pager \
             /usr/lib/systemd/user/rust-peerdup.service || true
-          firewall-offline-cmd --info-service=rust-peerdup

@@ -23,7 +23,7 @@ Where this file and those disagree, those win; open an issue to fix this file.
 | Run the daemon | A systemd user unit, started by D-Bus activation or at login | Forking, PID files, autostart scripts |
 | CLI to daemon | D-Bus on the session bus (`org.peerdup.Daemon1`) | A private socket protocol or HTTP server |
 | Logging | stdout/stderr to the journal (`journalctl --user -u rust-peerdup`) | Log files, ad-hoc rotation |
-| Firewall | The shipped firewalld service (`rust-peerdup`), opt-in | iptables/nftables rules written by us |
+| Network reach | iroh: outbound QUIC, hole-punching, relay fallback; no inbound port | Fixed ports that need firewall rules, UPnP |
 | Per-user state | `$XDG_DATA_HOME/rust-peerdup` | Dotfiles in `$HOME`, anything system-wide |
 | TLS | System OpenSSL (crypto-policies) wherever a crate gives us the choice | Hard-coded protocols or ciphers |
 
@@ -51,7 +51,7 @@ Where this file and those disagree, those win; open an issue to fix this file.
   `%cargo_install`, `%cargo_test`), so it gets Fedora's compiler flags and
   hardening.
 - **Vendored crates, as a documented exception.** Fedora prefers every crate
-  as its own `rust-*` package. p2panda, iroh and librqbit, and many of
+  as its own `rust-*` package. p2panda and iroh, and many of
   the crates under them, are not packaged, so the spec builds from a vendor
   tarball, the way the Rust guidelines allow when there is no other way:
   - `packaging/vendor.sh` makes it, filtered to Linux targets with
@@ -69,15 +69,16 @@ Where this file and those disagree, those win; open an issue to fix this file.
   change adds a license, update `License:` in the same pull request.
 - Known gaps against crypto-policies and system trust, all from vendored
   crates and all needing upstream changes; prefer crate features that use
-  the system OpenSSL and CA store whenever upstream offers them:
-  - `aws-lc-sys` and `ring` (TLS for iroh and rustls) compile their own
-    crypto.
-  - The `openssl` crate sets its own cipher list on top of the system
-    policy (rpmlint's `crypto-policy-non-compliance-openssl`, filtered in
-    `rust-peerdup.rpmlintrc` for this reason).
-  - `webpki-roots` builds Mozilla's CA list into the binary instead of
-    reading `ca-certificates` (it is where `CDLA-Permissive-2.0` in
-    `License:` comes from).
+  system libraries whenever upstream offers them:
+  - `ring` (rustls, under iroh's QUIC) compiles its own crypto, and
+    rustls doesn't follow crypto-policies.
+  - `webpki-roots` (via iroh's relay and DNS clients) builds Mozilla's CA
+    list into the binary instead of reading `ca-certificates` (it is where
+    `CDLA-Permissive-2.0` in `License:` comes from).
+- SQLite is linked from the system: `libsqlite3-sys` (under p2panda-net's
+  address book) would compile its own copy, so the spec sets
+  `LIBSQLITE3_SYS_USE_PKG_CONFIG=1` and `packaging/vendor.sh` drops the
+  bundled sources. CI checks the installed binary links `libsqlite3`.
 - Builds work offline (as in `mock` and Copr's build step). `rpmlint` must
   be clean, or each remaining warning explained in `rust-peerdup.rpmlintrc`.
 - The version lives in `Cargo.toml`; the spec's `Version:` must match it (CI

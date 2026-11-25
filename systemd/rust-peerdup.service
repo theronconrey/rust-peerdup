@@ -6,11 +6,8 @@
 #   systemctl --user enable --now rust-peerdup
 
 #
-# The BitTorrent port is per user: two people logged in to one machine need
-# different ones. Change it with `systemctl --user edit rust-peerdup`:
-#   [Service]
-#   Environment=PEERDUP_BT_PORT=41001
-# (and open that port instead of the firewalld service's default).
+# No inbound port is needed: iroh connects out, hole-punches, and falls back
+# to a relay. Several users on one machine don't collide.
 
 [Unit]
 Description=rust-peerdup encrypted folder sync daemon
@@ -24,8 +21,7 @@ Documentation=man:rust-peerdup(1) https://github.com/theronconrey/rust-peerdup
 # without IPC.
 Type=dbus
 BusName=org.peerdup.Daemon1
-Environment=PEERDUP_BT_PORT=41000
-ExecStart=/usr/bin/rust-peerdup serve --bt-port ${PEERDUP_BT_PORT}
+ExecStart=/usr/bin/rust-peerdup serve
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=rust_peerdup=info

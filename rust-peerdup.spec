@@ -4,7 +4,7 @@
 # https://docs.fedoraproject.org/en-US/packaging-guidelines/Rust/
 #
 # Vendored dependencies: an exception, on purpose. rust-peerdup is built on
-# p2panda, iroh and librqbit, and none of them (nor many of the crates
+# p2panda and iroh, and none of them (nor many of the crates
 # they pull in) are packaged in Fedora, so the crates come from a vendor
 # tarball made by packaging/vendor.sh. This is the guidelines' own vendoring
 # path: %%cargo_prep -v, no %%cargo_generate_buildrequires, no -devel
@@ -30,30 +30,26 @@ ExclusiveArch:  %{rust_arches}
 
 BuildRequires:  cargo-rpm-macros >= 26
 BuildRequires:  systemd-rpm-macros
-# %%firewalld_reload, so the shipped service is known to a running firewalld.
-BuildRequires:  firewalld-filesystem
 # Generates the man page from --help (kept ASCII; a unit test checks).
 BuildRequires:  help2man
-# native-tls (through reqwest) links the system OpenSSL, so TLS made that
-# way follows the system crypto-policies.
-BuildRequires:  pkgconfig(openssl)
-# aws-lc-sys and ring (TLS for iroh's QUIC and rustls) compile C code.
+# ring (rustls, under iroh's QUIC) and blake3 compile C and assembly.
 BuildRequires:  gcc
-BuildRequires:  gcc-c++
-BuildRequires:  cmake
-BuildRequires:  clang
+# p2panda-net's address book uses SQLite through sqlx. Link the system
+# library instead of the copy libsqlite3-sys would compile
+# (LIBSQLITE3_SYS_USE_PKG_CONFIG below; vendor.sh also drops its sources).
+BuildRequires:  pkgconfig(sqlite3)
 
 # The session bus, which starts the daemon on the first CLI call.
 Requires:       dbus-common
-Requires:       firewalld-filesystem
-Requires(post): firewalld-filesystem
 %{?systemd_requires}
 
 %description
 rust-peerdup keeps folders in sync between your machines without a central
-server. Peers find each other and exchange metadata over p2panda gossip, move
-file contents over BitTorrent with librqbit, and encrypt everything that
-leaves the machine with per-share keys that rotate when a member is removed.
+server. Peers find each other and exchange metadata over p2panda gossip and
+move file contents as content-addressed blobs over iroh, which connects
+peers directly where it can and through a relay where it can't. Everything
+that leaves the machine, file names included, is encrypted with per-share
+keys that rotate when a member is removed.
 
 It runs as a per-user service with a D-Bus API on the session bus, started
 on demand; the rust-peerdup command drives it.
@@ -63,6 +59,7 @@ on demand; the rust-peerdup command drives it.
 %cargo_prep -v vendor
 
 %build
+export LIBSQLITE3_SYS_USE_PKG_CONFIG=1
 %cargo_build
 %{cargo_license_summary}
 %{cargo_license} > LICENSE.dependencies
@@ -78,15 +75,13 @@ install -Dpm 0644 systemd/rust-peerdup.service \
     %{buildroot}%{_userunitdir}/rust-peerdup.service
 install -Dpm 0644 dbus-1/org.peerdup.Daemon1.service \
     %{buildroot}%{_datadir}/dbus-1/services/org.peerdup.Daemon1.service
-install -Dpm 0644 firewalld/rust-peerdup.xml \
-    %{buildroot}%{_prefix}/lib/firewalld/services/rust-peerdup.xml
 
 %check
+export LIBSQLITE3_SYS_USE_PKG_CONFIG=1
 %cargo_test
 
 %post
 %systemd_user_post rust-peerdup.service
-%firewalld_reload
 
 %preun
 %systemd_user_preun rust-peerdup.service
@@ -101,7 +96,6 @@ install -Dpm 0644 firewalld/rust-peerdup.xml \
 %{_mandir}/man1/rust-peerdup.1*
 %{_userunitdir}/rust-peerdup.service
 %{_datadir}/dbus-1/services/org.peerdup.Daemon1.service
-%{_prefix}/lib/firewalld/services/rust-peerdup.xml
 
 %changelog
 * Tue Nov 24 2026 Theron Conrey <theron@conrey.org> - 0.1.0-1

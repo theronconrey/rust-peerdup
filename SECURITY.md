@@ -34,12 +34,13 @@ fixes.
 These are known and tracked, so they don't need a report (new angles on
 them do):
 
-- Daemons on different machines don't sync yet (each announces a loopback
-  address).
+- Daemons on different networks don't find each other yet (an invite
+  doesn't carry the inviter's address); same-LAN sync works.
 - Sync announces are not signed and write permission is not enforced on
   them, so a revoked member or a reader can still push changes.
-- File names and sizes are visible to anyone in the BitTorrent swarm; file
-  contents are encrypted.
+- A peer that fetches blobs isn't yet checked against share membership;
+  everything it can fetch is ciphertext, and it needs a manifest hash from
+  gossip to find anything.
 - Some vendored crates bring their own crypto and CA list instead of
   following Fedora's crypto-policies (CONTRIBUTING.md, section 3).
 

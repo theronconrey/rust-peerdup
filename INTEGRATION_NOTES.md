@@ -1,9 +1,110 @@
-# Integration notes: librqbit 8.1 + p2panda-net 0.5.2
+# Integration notes: p2panda-net 0.8 + iroh-blobs 0.105
 
-Verified against the crate sources in `~/.cargo/registry/src/index.crates.io-*/`
-for the exact versions pinned in `Cargo.lock`.
+Notes on non-obvious crate behavior and load-bearing design choices. The
+sections on librqbit (marked *history*) describe the transport this project
+used until the move to iroh-blobs; they stay for context.
+
+## Transport: iroh-blobs (ROADMAP phase 6a decision)
+
+**Decision.** File contents move as content-addressed blobs with
+`iroh-blobs` over the same iroh endpoint p2panda-net runs on, replacing
+librqbit. Chosen over keeping librqbit (and fixing its announced
+`127.0.0.1` endpoints, its open swarm and its file-name leak) and over
+tunnelling BitTorrent through iroh. A research pass found the project used
+almost none of BitTorrent: DHT off, no trackers, no UPnP, one known peer.
+
+**Design** (`src/transfer.rs`):
+- One iroh-blobs `FsStore` per daemon at `<data_dir>/blobs`, served with
+  `BlobsProtocol` through `p2panda_net::Endpoint::accept(iroh_blobs::ALPN, ..)`.
+  Fetches open a connection with `Endpoint::connect(node_id, ALPN)` and
+  run `store.remote().fetch(conn, hash)`, which only requests what isn't
+  local yet.
+- A version = one ciphertext blob per file (`crypto::encrypt`, epoch header
+  included) plus one encrypted JSON manifest of `(path, plaintext blake3,
+  blob hash)`. Gossip (`share_announce_v2`) carries the manifest hash, the
+  provider's node id (= identity key hex; p2panda's `NodeId` is
+  `VerifyingKey`), the version hash, clock and timestamp.
+- Receive: connect (30 s timeout), fetch the manifest, decrypt, refuse
+  paths that are absolute, contain `..` or `.peerdup`, check the manifest
+  against the announced version hash, then fetch (300 s timeout per blob),
+  decrypt and blake3-check each file and stage it as `*.peerdup-tmp` beside
+  its destination. Only when everything passes are the files renamed in
+  and orphans deleted.
+- `BlobCache` (`shares/<id>/blobs.json`) maps `path -> (plaintext hash,
+  blob hash, epoch)`. Unchanged files reuse their ciphertext, so their blob
+  hash is stable and receivers fetch nothing for them. Receivers record
+  what they fetched too, so a re-announce of the same version is free.
+- The store is a cache: on start every share republishes from its
+  plaintext. It is shut down cleanly on exit (`Transfer::shutdown`), since
+  an unflushed store can lose its last writes.
+
+**Pinned:** `iroh-blobs = "=0.105.0"`. Upstream says this line is not yet
+production quality, and its suggested production version (0.35) needs a
+pre-1.0 iroh that can't talk to the iroh 1.x p2panda-net 0.8 runs on.
+
+**Known gaps (next steps):**
+- Peers on different networks don't find each other: an invite doesn't
+  carry the inviter's address, and nothing registers share members in the
+  address book. Plan: put the inviter's `NodeInfo` in the ticket and insert
+  it as a bootstrap (`AddressBook::insert_node_info(.. .bootstrap())`), and
+  `add_topic(member, topic)` for every member on share start.
+- The provider doesn't check that a fetching node is a share member. Blobs
+  are ciphertext and found only through gossiped manifest hashes, but the
+  gate belongs here: iroh-blobs' provider events can intercept connections
+  by node id. This replaces ROADMAP phase 6 (the librqbit admission hook).
+- Relays: by default iroh uses n0's public relays (rate-limited, meant for
+  development). Bulk data goes through them when hole-punching fails.
+  Make the relay configurable and consider shipping a self-hosted
+  `iroh-relay`. Whether p2panda-net 0.8 publishes to n0's DNS by default
+  is unverified.
+
+**Spike checklist** (pass/fail, from the research pass):
+1. Cross-network: two hosts behind different NATs sync 1 GiB; direct path
+   when possible; relay fallback with UDP blocked. *Blocked on the
+   bootstrap work above.*
+2. Revocation: a removed node's fetch is refused (needs the provider gate).
+3. Crash/resume: `kill -9` a receiver mid-fetch of a 2 GiB file and
+   restart; measure how much is re-fetched (iroh-blobs #254).
+4. Store durability: 500 change cycles, kill, restart; no panic or
+   deadlock (#233, #252, #260); RSS flat (#266); disk bounded with GC off.
+5. Dedup: change one file in a 1,000-file share; bytes on the wire are
+   about that file. *Designed for (`BlobCache`); not yet measured.*
+6. Multi-provider: kill the active provider mid-transfer; the fetch
+   completes from another. *Today a fetch uses only the announcing
+   provider; failover is future work.*
+7. Packaging: RPM builds and passes rpmlint and the smoke test on
+   `fedora:latest`; no OpenSSL; `License:` recomputed. *OpenSSL, native-tls,
+   aws-lc-sys and librqbit are gone from `Cargo.lock`.*
+8. Defaults audit: what does the daemon contact with no configuration
+   (n0 relays, DNS)?
+9. Version skew: can a node on the next iroh-blobs release fetch from
+   0.105? Decide an ALPN versioning policy.
+- Done: two daemons on one network sync initial content, an edit back, a
+  new nested file and a deletion (`tests/e2e-sync.sh`, in CI against the
+  installed RPM).
+
+## p2panda 0.8 (core, net) with p2panda-auth 0.5
+
+p2panda-net 0.8 runs on iroh 1.x, which iroh-blobs needs. Our code moved to
+p2panda-core 0.8 (`SigningKey`/`VerifyingKey`, `Topic`); p2panda-auth stays
+at 0.5.2 because 0.8 removed `GroupControlMessage`, which the membership
+code is built on. Nothing passes p2panda-core types into p2panda-auth, so
+the two core versions never meet. Gossip topics are still
+`blake3(topic string)`, the value p2panda-core 0.5's `Hash::new` produced,
+so share topic ids didn't change.
+
+p2panda-net 0.8's address book stores data in SQLite through sqlx, and
+`libsqlite3-sys` would compile its bundled copy. The spec sets
+`LIBSQLITE3_SYS_USE_PKG_CONFIG=1` (checked first in its build script, so it
+overrides the `bundled` feature) and links Fedora's SQLite;
+`packaging/vendor.sh` drops the bundled sources.
 
 ## Encryption (Phase 4) design notes
+
+*Partly history:* since the move to iroh-blobs there is no ciphertext
+shadow inside the share root; ciphertext lives in the blob store (see
+"Transport: iroh-blobs"). The threat model, ciphertext format and keyring
+below still apply.
 
 ### Threat model: wire-only
 peerdup encrypts **what librqbit sees and what goes over the wire**. The
@@ -302,8 +403,9 @@ the broadcast tick doesn't lose the rotation.
 
 ## Things that look wrong but aren't
 
-Three things in `src/main.rs` are deliberate and should not be "fixed" without
-reading the linked rationale below.
+*History:* the three items below were about the librqbit session, which no
+longer exists. For the current equivalents see "Transport: iroh-blobs"
+(the blob cache, the staging step, and the `.peerdup` path filters).
 
 ### `disable_dht: true` in `SessionOptions`
 Looks like we crippled BitTorrent's peer discovery. We didn't — for this demo
@@ -329,7 +431,7 @@ already returns `Arc<Session>`, and `add_torrent` is defined on `&Arc<Self>`.
 Wrapping it again gives `Arc<Arc<Session>>` and the call won't typecheck.
 See "Session" below.
 
-## librqbit
+## librqbit (history)
 
 ### `create_torrent`
 - Lives in `librqbit::create_torrent_file` and is **re-exported from the crate
