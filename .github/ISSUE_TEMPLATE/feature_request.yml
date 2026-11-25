@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: MIT
+name: Feature request
+description: Suggest a change or a new capability.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: The problem or use case, before any particular solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like rust-peerdup to do?
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Related ROADMAP.md phase, if you know it
+      options:
+        - Not sure
+        - Sync and conflicts (3)
+        - Encryption (4)
+        - Membership and access (5, 6)
+        - D-Bus API (7)
+        - Desktop UI (8)
+        - Packaging and other platforms (9)
+        - Hardening (10)
+  - type: checkboxes
+    id: fedora
+    attributes:
+      label: Fedora fit
+      description: CONTRIBUTING.md asks that features use the Fedora component that owns the job.
+      options:
+        - label: This can be done with what Fedora already ships (systemd, D-Bus, firewalld, portals, ...)

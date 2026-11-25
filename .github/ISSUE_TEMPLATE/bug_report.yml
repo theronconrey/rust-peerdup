@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: MIT
+name: Bug report
+description: Something in rust-peerdup or its RPM doesn't work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problems go to a private advisory instead (see SECURITY.md),
+        not here. Don't paste invite tickets, identity keys or keys.bin:
+        they are secrets.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. rust-peerdup share-add --topic ... --path ... --role sync
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Package version
+      description: Output of `rpm -q rust-peerdup`, or the git commit for a source build.
+    validations:
+      required: true
+  - type: input
+    id: fedora
+    attributes:
+      label: Fedora release
+      description: Output of `rpm -E %fedora`, plus Workstation, Silverblue or Server.
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How is it installed?
+      options:
+        - RPM from the theronconrey/peerdup Copr project
+        - Copr test build from a pull request
+        - install.sh (source build)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Daemon log
+      description: |
+        `journalctl --user -u rust-peerdup -b --no-pager | tail -n 100`.
+        For more detail, rerun with `systemctl --user edit rust-peerdup`,
+        set `Environment=RUST_LOG=rust_peerdup=debug`, and restart.
+      render: text
+  - type: textarea
+    id: selinux
+    attributes:
+      label: SELinux denials, if any
+      description: Output of `sudo ausearch -m AVC -ts recent`. Please don't disable SELinux to work around a problem; report the denial instead.
+      render: text
