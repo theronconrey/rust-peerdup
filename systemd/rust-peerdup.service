@@ -5,15 +5,27 @@
 # the first CLI call (org.peerdup.Daemon1.service), or enable it at login with
 #   systemctl --user enable --now rust-peerdup
 
+#
+# The BitTorrent port is per user: two people logged in to one machine need
+# different ones. Change it with `systemctl --user edit rust-peerdup`:
+#   [Service]
+#   Environment=PEERDUP_BT_PORT=41001
+# (and open that port instead of the firewalld service's default).
+
 [Unit]
 Description=rust-peerdup encrypted folder sync daemon
 Documentation=man:rust-peerdup(1) https://github.com/theronconrey/rust-peerdup
-After=network-online.target
-Wants=network-online.target
+# No network-online.target: a user unit can't order against system units.
+# The daemon copes with the network coming and going on its own.
 
 [Service]
-Type=simple
-ExecStart=/usr/bin/rust-peerdup serve --bt-port 41000
+# systemd tracks the bus name, so D-Bus activation waits for the daemon to
+# claim it, and a daemon that can't claim it fails instead of running
+# without IPC.
+Type=dbus
+BusName=org.peerdup.Daemon1
+Environment=PEERDUP_BT_PORT=41000
+ExecStart=/usr/bin/rust-peerdup serve --bt-port ${PEERDUP_BT_PORT}
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=rust_peerdup=info

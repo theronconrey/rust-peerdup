@@ -30,6 +30,8 @@ ExclusiveArch:  %{rust_arches}
 
 BuildRequires:  cargo-rpm-macros >= 26
 BuildRequires:  systemd-rpm-macros
+# %%firewalld_reload, so the shipped service is known to a running firewalld.
+BuildRequires:  firewalld-filesystem
 # Generates the man page from --help (kept ASCII; a unit test checks).
 BuildRequires:  help2man
 # native-tls (through reqwest) links the system OpenSSL, so TLS made that
@@ -44,6 +46,7 @@ BuildRequires:  clang
 # The session bus, which starts the daemon on the first CLI call.
 Requires:       dbus-common
 Requires:       firewalld-filesystem
+Requires(post): firewalld-filesystem
 %{?systemd_requires}
 
 %description
@@ -83,6 +86,7 @@ install -Dpm 0644 firewalld/rust-peerdup.xml \
 
 %post
 %systemd_user_post rust-peerdup.service
+%firewalld_reload
 
 %preun
 %systemd_user_preun rust-peerdup.service
