@@ -66,7 +66,8 @@ Where this file and those disagree, those win; open an issue to fix this file.
     *all* of them are, switch to `%cargo_generate_buildrequires`.
 - `License:` is an SPDX expression covering rust-peerdup **and** every
   vendored crate. CI prints `%cargo_license_summary`; when a `Cargo.lock`
-  change adds a license, update `License:` in the same pull request.
+  change adds or removes a license, regenerate `License:` in the same pull
+  request with `packaging/license-tag.py <build log>`.
 - Known gaps against crypto-policies and system trust, all from vendored
   crates and all needing upstream changes; prefer crate features that use
   system libraries whenever upstream offers them:
