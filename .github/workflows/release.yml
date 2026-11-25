@@ -21,7 +21,7 @@ jobs:
       - name: Install Fedora tooling
         run: dnf -y install git-core cargo cargo-vendor-filterer xz gh rpm-build
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Tag, spec and Cargo.toml agree on the version
         run: |
