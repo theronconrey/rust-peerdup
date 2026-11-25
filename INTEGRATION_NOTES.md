@@ -57,10 +57,15 @@ network id into every ALPN, so blobs must go through p2panda's
 `accept`/`connect`, not iroh-blobs' own downloader.
 
 **Known gaps (next steps):**
-- The provider doesn't check that a fetching node is a share member. Blobs
-  are ciphertext and found only through gossiped manifest hashes, but the
-  gate belongs here: iroh-blobs' provider events can intercept connections
-  by node id. This replaces ROADMAP phase 6 (the librqbit admission hook).
+- Members-only connections (done, `src/access.rs`): the endpoint runs
+  p2panda-net's `ConnectionBlockList` in restrictive mode. Allowed = the
+  union of every running share's members; recomputed at share start,
+  after auth ops apply, after invite/revoke, and when a share stops.
+  Blocked nodes are refused after the TLS handshake with code 403 for
+  every ALPN, so a revoked member gets neither blobs nor gossip.
+  `allow()` lifts a block, so re-inviting works. Not yet per share: a
+  member of share A could fetch share B's blobs if it learned their
+  hashes (they are ciphertext under B's key).
 - Relays: the default is n0's public relays (rate-limited, meant for
   development); bulk data goes through them when hole-punching fails.
   `--relay-url` is there; consider shipping a self-hosted `iroh-relay`
@@ -76,7 +81,9 @@ network id into every ALPN, so blobs must go through p2panda's
    when possible; relay fallback with UDP blocked. *Two containers on
    isolated networks sync through a relay in CI (`tests/e2e-xnet.sh`);
    real NATs, 1 GiB and the UDP-blocked case are still to measure.*
-2. Revocation: a removed node's fetch is refused (needs the provider gate).
+2. Revocation: a removed node's fetch is refused. *Gate in place
+   (`access.rs`, unit-tested); an e2e revoke over iroh is still to add
+   (`tests/e2e-revoke.sh` predates iroh-blobs).*
 3. Crash/resume: `kill -9` a receiver mid-fetch of a 2 GiB file and
    restart; measure how much is re-fetched (iroh-blobs #254).
 4. Store durability: 500 change cycles, kill, restart; no panic or

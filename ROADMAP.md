@@ -17,12 +17,12 @@ guesses, not commitments. Add 50% if part-time, double for "with surprises."
 | 1. Foundation | ✅ Done | — |
 | 2. Persistent state & daemon | ✅ Done | — |
 | 3. Multi-master sync | ⚠️ Partial: works on one host; concurrent edits resolve by LWW and silently lose the other side (no conflict copies) | in 7.5 |
-| 4. Encryption at rest | ⚠️ Partial: file contents encrypted; file names and sizes visible in the swarm; `p2panda-encryption` deferred | in 7.5 |
+| 4. Encryption at rest | ⚠️ Partial: file contents and names encrypted (iroh-blobs manifests); sizes of individual blobs visible to members; `p2panda-encryption` deferred | in 7.5 |
 | 5. ACL via p2panda-auth | ⚠️ Partial: membership, invites, revocation and key rotation done; write permission is not enforced on sync announces, so revoked members and readers can still push | in 7.5 |
-| 6a. Transport decision | 👉 Next: spike, decides how 6 and 7.5 are built | 1–2 weeks |
-| 6. Swarm admission gate | ⏸️ Blocked on upstream librqbit ([ikatson/rqbit#582](https://github.com/ikatson/rqbit/issues/582)), or replaced by 6a | 2–3 weeks |
+| 6a. Transport decision | ✅ Decided: iroh-blobs over iroh (see `INTEGRATION_NOTES.md`, "Transport: iroh-blobs"); spike checks open | — |
+| 6. Swarm admission gate | ✅ Replaced: members-only connection gate on the iroh endpoint (`access.rs`); no librqbit hook needed | — |
 | 7. D-Bus IPC surface | ⚠️ Partial: methods and activation done; no signals, bus name not final | 1 week |
-| 7.5. Make it real across machines | 👉 Next after 6a | 4–6 weeks |
+| 7.5. Make it real across machines | 👉 In progress: cross-network sync works in CI (relays, invite bootstrap); signed announces, conflict copies, random topics still to do | 3–4 weeks left |
 | 7.6. Formats and release engineering | Planned | 1–2 weeks |
 | 8. Linux UI (GTK4/libadwaita app) | Planned | 6–10 weeks |
 | 9. Other platforms (Linux Flatpak GUI; Windows, macOS) | Planned | 8–12 weeks |
@@ -218,6 +218,10 @@ Last bit becomes real in Phase 6.
 
 ### Phase 6a — Transport decision (spike)
 
+**Status: decided — iroh-blobs.** The design, the research behind it and
+the spike's pass/fail list are in `INTEGRATION_NOTES.md`, "Transport:
+iroh-blobs". The text below is the original framing.
+
 **Goal:** decide, in writing, how file contents move between peers, before
 building more on librqbit.
 
@@ -242,6 +246,12 @@ hook in librqbit" as plan B if iroh is chosen.
 ---
 
 ### Phase 6 — Swarm admission gate (BEP-10)
+
+**Status: replaced.** With transfer on iroh, every connection is
+authenticated by node id, which is the member's identity key. The daemon's
+endpoint runs p2panda-net's `ConnectionBlockList` in restrictive mode with
+the union of all shares' members allowed (`src/access.rs`), so a revoked
+member is refused for every protocol. The BEP-10 plan below is history.
 
 **Goal:** the auth layer actually enforces against the BT data plane.
 Revoked peers are dropped from the swarm, not just denied the new key.

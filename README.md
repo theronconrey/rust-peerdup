@@ -38,7 +38,7 @@ writing:
 | 1. Foundation (Hello-World transfer) | ✅ Done |
 | 2. Persistent state & daemon | ✅ Done |
 | 3. Multi-master sync (watcher, vector clocks, LWW, orphan deletion) | ⚠️ Partial: single host; no conflict copies |
-| 4. Encryption at rest (file-level, KeyRing with epoch tagging, key rotation) | ⚠️ Partial: names and sizes visible |
+| 4. Encryption at rest (file-level, KeyRing with epoch tagging, key rotation) | ✅ Contents and names encrypted on the wire |
 | 5a. Invite/join via copy-paste tickets | ✅ Done |
 | 5b. Peer activity listing (`share peers`) | ✅ Done |
 | 5c. `p2panda-auth` group CRDT integration | ✅ Done |
@@ -46,7 +46,9 @@ writing:
 | 5e. 4-peer revocation e2e test | ✅ Done |
 | Write permission enforced on sync announces (readers, revoked members) | ❌ Not yet (Phase 7.5) |
 | 7. D-Bus IPC surface | ⚠️ Partial: CLI talks to the daemon over `org.peerdup.Daemon1`; no signals yet |
-| Next: 6a transport decision, 7.5 cross-machine sync and enforced ACLs | Per ROADMAP.md |
+| 6a. Transport: iroh-blobs over iroh | ✅ Done (spike checks open) |
+| 6. Only members can connect (replaces the BitTorrent admission gate) | ✅ Done |
+| 7.5. Sync across networks | ⚠️ In progress: works via relays; signed announces next |
 
 Detailed design notes, including non-obvious gotchas about iroh and
 p2panda, live in [`INTEGRATION_NOTES.md`](INTEGRATION_NOTES.md). Read it

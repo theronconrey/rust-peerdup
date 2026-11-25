@@ -37,11 +37,10 @@ them do):
 - By default peers that can't connect directly meet through n0's public
   relays, which see who talks to whom (not what). `--relay-url` changes
   this.
-- Sync announces are not signed and write permission is not enforced on
-  them, so a revoked member or a reader can still push changes.
-- A peer that fetches blobs isn't yet checked against share membership;
-  everything it can fetch is ciphertext, and it needs a manifest hash from
-  gossip to find anything.
+- Only current share members can connect at all (gossip, discovery or
+  blob transfer). But announces are applied without checking the
+  announcer's role, so a Reader can still push changes; signed,
+  role-checked announces are next (ROADMAP phase 7.5).
 - Some vendored crates bring their own crypto and CA list instead of
   following Fedora's crypto-policies (CONTRIBUTING.md, section 3).
 

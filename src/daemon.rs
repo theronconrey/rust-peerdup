@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+use crate::access::Access;
 use crate::auth::{self, AuthRole, AuthState, MemberId, SignedOp};
 use crate::clock::{ClockOrdering, VectorClock};
 use crate::crypto::{self, InstallOutcome, KeyRing};
@@ -156,6 +157,8 @@ pub struct DaemonRuntime {
     /// Where p2panda-net looks up peers' addresses; seeded per share from
     /// its bootstrap and member list (`seed_address_book`).
     pub address_book: AddressBook,
+    /// Members-only connection gate on the endpoint (`access.rs`).
+    pub access: Arc<Access>,
     /// `share_id -> mpsc tx for ShareCommand`. Populated when a share task is
     /// spawned, removed on shutdown / `share-remove`.
     pub shares: Arc<Mutex<HashMap<String, mpsc::Sender<ShareCommand>>>>,
@@ -174,7 +177,10 @@ pub async fn start_runtime(
     relays: Vec<RelayUrl>,
 ) -> Result<DaemonRuntime> {
     let address_book = AddressBook::builder().spawn().await?;
-    let mut builder = Endpoint::builder(address_book.clone()).signing_key(identity.clone());
+    let access = Arc::new(Access::new(*identity.verifying_key().as_bytes()));
+    let mut builder = Endpoint::builder(address_book.clone())
+        .signing_key(identity.clone())
+        .hooks(access.hook());
     if relays.is_empty() {
         tracing::info!("no relay configured; peers on other networks need a routable address");
     }
@@ -218,6 +224,7 @@ pub async fn start_runtime(
         transfer,
         gossip,
         address_book,
+        access,
         shares: Arc::new(Mutex::new(HashMap::new())),
         tasks: Arc::new(Mutex::new(JoinSet::new())),
     })
@@ -244,6 +251,14 @@ fn spawn_own_addr_writer(endpoint: Endpoint, data_dir: PathBuf) {
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
     });
+}
+
+fn member_ids(auth_state: &AuthState, group_id: MemberId) -> Vec<MemberId> {
+    auth_state
+        .members(group_id)
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect()
 }
 
 /// Tell p2panda-net where this share's peers are: the inviter's address
@@ -309,6 +324,7 @@ pub async fn spawn_share_task(
     let transfer = rt.transfer.clone();
     let gossip = rt.gossip.clone();
     let address_book = rt.address_book.clone();
+    let access = rt.access.clone();
     let identity = rt.identity.clone();
     let data_dir = rt.data_dir.clone();
     let peer_id_hex = identity.verifying_key().to_hex();
@@ -320,6 +336,7 @@ pub async fn spawn_share_task(
             transfer,
             gossip,
             address_book,
+            access,
             data_dir,
             peer_id_hex,
             identity,
@@ -508,6 +525,7 @@ async fn run_share(
     transfer: Arc<Transfer>,
     gossip: Gossip,
     address_book: AddressBook,
+    access: Arc<Access>,
     data_dir: PathBuf,
     peer_id_hex: String,
     identity: SigningKey,
@@ -537,6 +555,7 @@ async fn run_share(
                 transfer,
                 gossip,
                 address_book,
+                access,
                 topic,
                 data_dir,
                 peer_id_hex,
@@ -563,6 +582,7 @@ async fn sync_loop(
     transfer: Arc<Transfer>,
     gossip: Gossip,
     address_book: AddressBook,
+    access: Arc<Access>,
     topic: Topic,
     data_dir: PathBuf,
     peer_id_hex: String,
@@ -593,6 +613,9 @@ async fn sync_loop(
         &peer_id_hex,
     )
     .await;
+    access
+        .set_members(&config.id, member_ids(&auth_state, group_id))
+        .await;
     let topic_handle = gossip.stream(topic).await?;
     let mut sub = topic_handle.subscribe();
     tracing::info!(share_id = %config.id, root = %root.display(), "sync started");
@@ -651,7 +674,7 @@ async fn sync_loop(
                 publish_pending_rotations(&topic_handle, &pending_rotations, &config.id).await;
             }
             Some(cmd) = cmd_rx.recv() => {
-                if handle_share_command(
+                let exit = handle_share_command(
                     cmd,
                     &config,
                     &data_dir,
@@ -659,9 +682,13 @@ async fn sync_loop(
                     &key,
                     &mut auth_state,
                     &mut pending_rotations,
-                ).await {
+                ).await;
+                if exit {
+                    access.remove_share(&config.id).await;
                     return Ok(());
                 }
+                // An invite or a revocation may have changed who's in.
+                access.set_members(&config.id, member_ids(&auth_state, group_id)).await;
             }
             item = sub.next() => {
                 let Some(item) = item else { break Ok(()) };
@@ -677,8 +704,10 @@ async fn sync_loop(
                     ShareMsg::Announce { manifest, provider, version_hash, clock, timestamp } =>
                         (manifest, provider, version_hash, clock, timestamp),
                     ShareMsg::AuthOps { ops } => {
-                        if let Err(e) = apply_auth_ops(&mut auth_state, ops, &data_dir, &config.id) {
-                            tracing::warn!(error = ?e, share_id = %config.id, "auth apply failed");
+                        match apply_auth_ops(&mut auth_state, ops, &data_dir, &config.id) {
+                            Ok(0) => {}
+                            Ok(_) => access.set_members(&config.id, member_ids(&auth_state, group_id)).await,
+                            Err(e) => tracing::warn!(error = ?e, share_id = %config.id, "auth apply failed"),
                         }
                         continue;
                     }
