@@ -395,13 +395,32 @@ impl AuthState {
     }
 
     fn process(&mut self, op: SignedOp) -> Result<()> {
-        // Crdt::process consumes the state it's given. Give it a copy, so a
-        // rejected op leaves the current membership intact instead of an
-        // empty group (which would then reject every rotation).
-        let next =
-            Crdt::process(self.crdt.clone(), &op).map_err(|e| anyhow!("auth crdt error: {e:?}"))?;
-        self.crdt = next;
-        self.ops.push(op);
+        // Crdt::process takes the state by value, and GroupCrdtState isn't
+        // Clone, so on failure the state it was given is gone. Rebuild it
+        // from the ops already applied (they applied once, so they apply
+        // again) rather than leaving an empty group behind, which would then
+        // reject every rotation.
+        let prev = std::mem::replace(&mut self.crdt, CrdtState::new(()));
+        match Crdt::process(prev, &op) {
+            Ok(next) => {
+                self.crdt = next;
+                self.ops.push(op);
+                Ok(())
+            }
+            Err(e) => {
+                self.rebuild_from_log()?;
+                Err(anyhow!("auth crdt error: {e:?}"))
+            }
+        }
+    }
+
+    fn rebuild_from_log(&mut self) -> Result<()> {
+        let mut crdt = CrdtState::new(());
+        for op in &self.ops {
+            crdt = Crdt::process(crdt, op)
+                .map_err(|e| anyhow!("rebuilding auth state from its log: {e:?}"))?;
+        }
+        self.crdt = crdt;
         Ok(())
     }
 

@@ -659,12 +659,13 @@ could be replayed into share B whenever the same recipient was in both
 is a wire change: rotations signed by older builds no longer verify.
 Pre-release, so there is no compatibility shim.
 
-## AuthState: copy, then commit
+## AuthState: a rejected op must not empty the group
 
-`Crdt::process` takes the CRDT state by value. `AuthState::process` hands
-it a clone and only replaces its state on success; replacing first (with
-an empty state) and then failing used to leave the share with an empty
-group, after which every rotation was rejected as `NotAManager`. An
+`Crdt::process` takes the CRDT state by value, and p2panda-auth 0.5.2's
+`GroupCrdtState` is not `Clone`, so when it rejects an op the state it was
+given is gone. `AuthState::process` then rebuilds the state by replaying
+the ops already applied. Before, a rejected op left the share with an
+empty group, after which every rotation was rejected as `NotAManager`. An
 `AuthState` also only accepts ops for the group of its first op, buffers
 at most 256 ops with missing dependencies, and invite/revoke check that
 the local identity is an Owner before authoring anything.
