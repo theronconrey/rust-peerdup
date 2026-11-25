@@ -482,6 +482,7 @@ fn cmd_share_revoke_direct(data_dir: PathBuf, id: String, peer_pubkey_hex: Strin
     if auth_state.is_empty() {
         return Err(anyhow!("share {id} has no auth state on disk"));
     }
+    auth_state.require_owner(group_id, &identity)?;
     if !auth_state.is_member(group_id, target) {
         return Err(anyhow!(
             "{} is not a current member of share {id}",
@@ -507,7 +508,8 @@ fn cmd_share_revoke_direct(data_dir: PathBuf, id: String, peer_pubkey_hex: Strin
             .ok_or_else(|| anyhow!("rotated keyring missing epoch {new_epoch}"))?
     };
 
-    let rotation_msg = rotation::build_signed_rotation(&identity, new_epoch, &new_key, &remaining)?;
+    let rotation_msg =
+        rotation::build_signed_rotation(&identity, group_id, new_epoch, &new_key, &remaining)?;
     rotation::save_pending(&data_dir, &id, &rotation_msg)?;
 
     println!("Revoked {} from share {id}", peer_pubkey_hex);
@@ -552,6 +554,7 @@ fn cmd_share_invite_direct(
             "share {id} has no auth state on disk; can only invite from the creator's machine"
         ));
     }
+    auth_state.require_owner(group_id, &identity)?;
     if auth_state.is_member(group_id, invitee) {
         return Err(anyhow!(
             "{} is already a member of share {id}",

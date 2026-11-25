@@ -254,6 +254,9 @@ impl Orderer<MemberId, OpId, GroupControlMessage<MemberId, ()>> for NoOpOrderer 
     }
 }
 
+/// Cap on ops buffered while their dependencies are missing.
+const MAX_PENDING_OPS: usize = 256;
+
 type Resolver = StrongRemove<MemberId, OpId, (), SignedOp>;
 type Crdt = GroupCrdt<MemberId, OpId, (), Resolver, NoOpOrderer>;
 type CrdtState = GroupCrdtState<MemberId, OpId, (), NoOpOrderer>;
@@ -356,6 +359,17 @@ impl AuthState {
     /// arrival. Returns `true` if the op was newly applied.
     pub fn apply_remote(&mut self, op: SignedOp) -> Result<bool> {
         op.verify().context("verifying remote auth op")?;
+        // One AuthState is one share's group. Ops for any other group are
+        // someone else's (or an attempt to mix logs) and are refused.
+        if let Some(group) = self.group_id() {
+            if op.payload.group_id != group {
+                return Err(anyhow!(
+                    "auth op is for a different group ({:?}, this share is {:?})",
+                    op.payload.group_id,
+                    group
+                ));
+            }
+        }
         let op_id = op.id();
         if self.ops.iter().any(|o| o.id() == op_id) || self.pending.iter().any(|o| o.id() == op_id)
         {
@@ -364,6 +378,13 @@ impl AuthState {
 
         let known: HashSet<OpId> = self.ops.iter().map(|o| o.id()).collect();
         if !op.deps.iter().all(|d| known.contains(d)) {
+            // Anyone with a keypair can sign ops with made-up deps; don't
+            // let them grow this without bound.
+            if self.pending.len() >= MAX_PENDING_OPS {
+                return Err(anyhow!(
+                    "too many auth ops waiting for dependencies ({MAX_PENDING_OPS}); dropping"
+                ));
+            }
             self.pending.push(op);
             return Ok(false);
         }
@@ -374,8 +395,11 @@ impl AuthState {
     }
 
     fn process(&mut self, op: SignedOp) -> Result<()> {
-        let prev = std::mem::replace(&mut self.crdt, CrdtState::new(()));
-        let next = Crdt::process(prev, &op).map_err(|e| anyhow!("auth crdt error: {e:?}"))?;
+        // Crdt::process consumes the state it's given. Give it a copy, so a
+        // rejected op leaves the current membership intact instead of an
+        // empty group (which would then reject every rotation).
+        let next =
+            Crdt::process(self.crdt.clone(), &op).map_err(|e| anyhow!("auth crdt error: {e:?}"))?;
         self.crdt = next;
         self.ops.push(op);
         Ok(())
@@ -395,6 +419,31 @@ impl AuthState {
                 }
                 None => return Ok(()),
             }
+        }
+    }
+
+    /// The group this state belongs to: the group of its first op.
+    fn group_id(&self) -> Option<MemberId> {
+        self.ops
+            .first()
+            .or_else(|| self.pending.first())
+            .map(|op| op.payload.group_id)
+    }
+
+    /// Only Owners may invite or revoke. Checked before authoring, so a
+    /// non-Owner gets a clear error rather than a CRDT rejection.
+    pub fn require_owner(&self, group_id: MemberId, identity: &PrivateKey) -> Result<()> {
+        let me = MemberId(*identity.public_key().as_bytes());
+        let is_owner = self
+            .members(group_id)
+            .into_iter()
+            .any(|(m, role)| m == me && role == AuthRole::Owner);
+        if is_owner {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "only an Owner of this share can invite or revoke members"
+            ))
         }
     }
 
@@ -498,6 +547,52 @@ mod tests {
 
     fn me_of(k: &PrivateKey) -> MemberId {
         MemberId(*k.public_key().as_bytes())
+    }
+
+    #[test]
+    fn a_rejected_op_does_not_empty_the_group() {
+        let alice = fresh_key();
+        let bob = fresh_key();
+        let carol = fresh_key();
+        let group = group_id_for("share-reject");
+        let mut state = AuthState::empty();
+        state.create_group(&alice, group).unwrap();
+        state
+            .add_member(&alice, group, me_of(&bob), AuthRole::Writer)
+            .unwrap();
+        // A Writer can't add members. Whether the CRDT errors or ignores
+        // the op, the existing membership must survive.
+        let _ = state.add_member(&bob, group, me_of(&carol), AuthRole::Writer);
+        assert!(state.is_member(group, me_of(&alice)));
+        assert!(state.is_member(group, me_of(&bob)));
+        assert!(!state.is_member(group, me_of(&carol)));
+    }
+
+    #[test]
+    fn ops_for_another_group_are_refused() {
+        let alice = fresh_key();
+        let group_a = group_id_for("share-a");
+        let group_b = group_id_for("share-b");
+        let mut a = AuthState::empty();
+        a.create_group(&alice, group_a).unwrap();
+        let mut b = AuthState::empty();
+        let op_b = b.create_group(&alice, group_b).unwrap();
+        let err = a.apply_remote(op_b).unwrap_err().to_string();
+        assert!(err.contains("different group"), "{err}");
+    }
+
+    #[test]
+    fn only_owners_may_invite_or_revoke() {
+        let alice = fresh_key();
+        let bob = fresh_key();
+        let group = group_id_for("share-owner");
+        let mut state = AuthState::empty();
+        state.create_group(&alice, group).unwrap();
+        state
+            .add_member(&alice, group, me_of(&bob), AuthRole::Writer)
+            .unwrap();
+        state.require_owner(group, &alice).unwrap();
+        assert!(state.require_owner(group, &bob).is_err());
     }
 
     #[test]
