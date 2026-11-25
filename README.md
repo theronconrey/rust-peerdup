@@ -36,15 +36,16 @@ writing:
 |---|---|
 | 1. Foundation (Hello-World transfer) | ✅ Done |
 | 2. Persistent state & daemon | ✅ Done |
-| 3. Multi-master sync (watcher, vector clocks, LWW, orphan deletion) | ✅ Done |
-| 4. Encryption at rest (file-level, KeyRing with epoch tagging, key rotation) | ✅ Done |
+| 3. Multi-master sync (watcher, vector clocks, LWW, orphan deletion) | ⚠️ Partial: single host; no conflict copies |
+| 4. Encryption at rest (file-level, KeyRing with epoch tagging, key rotation) | ⚠️ Partial: names and sizes visible |
 | 5a. Invite/join via copy-paste tickets | ✅ Done |
 | 5b. Peer activity listing (`share peers`) | ✅ Done |
 | 5c. `p2panda-auth` group CRDT integration | ✅ Done |
 | 5d. Auto key rotation on revocation | ✅ Done |
 | 5e. 4-peer revocation e2e test | ✅ Done |
-| 7. D-Bus IPC surface | ✅ Done (CLI talks to the daemon over `org.peerdup.Daemon1` on the session bus) |
-| 6, 8+ | Per ROADMAP.md |
+| Write permission enforced on sync announces (readers, revoked members) | ❌ Not yet (Phase 7.5) |
+| 7. D-Bus IPC surface | ⚠️ Partial: CLI talks to the daemon over `org.peerdup.Daemon1`; no signals yet |
+| Next: 6a transport decision, 7.5 cross-machine sync and enforced ACLs | Per ROADMAP.md |
 
 Detailed design notes, including non-obvious gotchas about librqbit and
 p2panda, live in [`INTEGRATION_NOTES.md`](INTEGRATION_NOTES.md). Read it
