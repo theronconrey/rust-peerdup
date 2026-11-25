@@ -46,6 +46,11 @@ impl MemberId {
         if s.len() != 64 {
             return Err(anyhow!("member id hex must be 64 chars (got {})", s.len()));
         }
+        // Slicing by byte offsets below panics on a multi-byte character, and
+        // this string arrives over D-Bus and the CLI.
+        if !s.is_ascii() {
+            return Err(anyhow!("member id hex must be ASCII"));
+        }
         let mut out = [0u8; 32];
         for i in 0..32 {
             out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
@@ -462,6 +467,25 @@ pub fn save(data_dir: &Path, share_id: &str, state: &AuthState) -> Result<()> {
     crate::data_dir::write_private_atomic(&path, &bytes)
         .with_context(|| format!("writing {path:?}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod from_hex_tests {
+    use super::MemberId;
+
+    #[test]
+    fn non_ascii_of_the_right_length_is_an_error_not_a_panic() {
+        // 64 bytes, but 'é' is two bytes, so byte offsets split it.
+        let s = format!("{}é{}", "a".repeat(31), "b".repeat(31));
+        assert_eq!(s.len(), 64);
+        assert!(MemberId::from_hex(&s).is_err());
+    }
+
+    #[test]
+    fn round_trips() {
+        let id = MemberId([0xab; 32]);
+        assert_eq!(MemberId::from_hex(&id.to_hex()).unwrap(), id);
+    }
 }
 
 #[cfg(test)]

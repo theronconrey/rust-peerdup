@@ -20,8 +20,10 @@ impl VectorClock {
     }
 
     pub fn increment(&mut self, peer: &str) {
+        // Saturating: a remote clock can carry any value (u64::MAX would
+        // otherwise panic in debug builds and wrap to 0 in release).
         let counter = self.0.entry(peer.to_string()).or_insert(0);
-        *counter += 1;
+        *counter = counter.saturating_add(1);
     }
 
     pub fn merge(&mut self, other: &VectorClock) {
@@ -58,6 +60,14 @@ impl VectorClock {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn increment_saturates_instead_of_overflowing() {
+        let mut c = super::VectorClock::new();
+        c.0.insert("peer".into(), u64::MAX);
+        c.increment("peer");
+        assert_eq!(c.0["peer"], u64::MAX);
+    }
+
     use super::*;
 
     #[test]
