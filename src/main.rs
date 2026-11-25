@@ -12,6 +12,7 @@ mod rotation;
 mod share;
 mod share_state;
 mod ticket;
+mod transfer;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -46,14 +47,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run the daemon: bring up panda + librqbit, run all configured shares
-    /// concurrently until SIGINT/SIGTERM. Registers `org.peerdup.Daemon1`
-    /// on the session bus so the CLI can drive it live.
+    /// Run the daemon: bring up p2panda gossip and the blob store, run all
+    /// configured shares concurrently until SIGINT/SIGTERM. Registers
+    /// `org.peerdup.Daemon1` on the session bus so the CLI can drive it live.
     Serve {
-        /// BitTorrent listen port. Defaults to 41000. Pick distinct ports
-        /// for two daemons on one machine.
-        #[arg(long, default_value_t = 41000)]
-        bt_port: u16,
+        /// Ignored. File transfer no longer uses a BitTorrent port; kept so
+        /// existing units and scripts that pass it keep working.
+        #[arg(long, hide = true)]
+        bt_port: Option<u16>,
         /// Skip D-Bus session-bus registration. Useful for headless test
         /// rigs that don't have a session bus or want to avoid bus-name
         /// collisions across multiple in-process daemons. The daemon also
@@ -141,8 +142,11 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Serve { bt_port, no_dbus } => {
+            if bt_port.is_some() {
+                tracing::warn!("--bt-port is ignored: file transfer now runs over iroh");
+            }
             let data_dir = data_dir::resolve(direct_dir)?;
-            cmd_serve(data_dir, bt_port, !no_dbus).await
+            cmd_serve(data_dir, !no_dbus).await
         }
         Cmd::ShareAdd { topic, path, role } => match direct_dir {
             Some(dd) => cmd_share_add_direct(dd, topic, path, role),
@@ -229,12 +233,12 @@ fn resolve_ticket_arg(arg: String) -> Result<String> {
     }
 }
 
-async fn cmd_serve(data_dir: PathBuf, bt_port: u16, register_dbus: bool) -> Result<()> {
+async fn cmd_serve(data_dir: PathBuf, register_dbus: bool) -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
     let lock_file = lock::acquire(&data_dir::lock_path(&data_dir))?;
     let identity = identity::load_or_create(&data_dir::identity_path(&data_dir))?;
     let configs = share::load_all(&data_dir)?;
-    let result = daemon::serve(data_dir, bt_port, identity, configs, register_dbus).await;
+    let result = daemon::serve(data_dir, identity, configs, register_dbus).await;
     drop(lock_file);
     result
 }

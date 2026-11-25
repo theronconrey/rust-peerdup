@@ -3,7 +3,7 @@ name = "rust-peerdup"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Folder-sync daemon built on p2panda + librqbit"
+description = "Encrypted peer-to-peer folder-sync daemon built on p2panda and iroh"
 repository = "https://github.com/theronconrey/rust-peerdup"
 readme = "README.md"
 
@@ -11,7 +11,10 @@ readme = "README.md"
 p2panda-net = "0.8.1"
 p2panda-core = "0.8.1"
 p2panda-auth = { version = "0.5.2", features = ["serde"] }
-librqbit = "8.1.1"
+# Pinned exactly: 0.105 is not yet production quality upstream, and the
+# blob store's on-disk format may change between releases.
+iroh-blobs = { version = "=0.105.0", features = ["fs-store"] }
+iroh = "1"
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 anyhow = "1.0"

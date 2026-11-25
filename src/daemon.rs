@@ -6,13 +6,10 @@ use crate::rotation::{self, SignedRotation, VerifyOutcome};
 use crate::share::{ShareConfig, ShareRole};
 use crate::share_state::{self, PersistedState};
 use crate::ticket::{self, Ticket, TICKET_VERSION};
+use crate::transfer::{self, BlobCache, FileHash, Transfer, PEERDUP_DIR_NAME};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
-use librqbit::api::TorrentIdOrHash;
-use librqbit::{
-    create_torrent, AddTorrent, AddTorrentOptions, CreateTorrentOptions, Session, SessionOptions,
-};
 use p2panda_core::{SigningKey, Topic};
 use p2panda_net::gossip::GossipHandle;
 use p2panda_net::iroh_mdns::MdnsDiscoveryMode;
@@ -20,7 +17,6 @@ use p2panda_net::{AddressBook, Discovery, Endpoint, Gossip, MdnsDiscovery};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,18 +31,18 @@ const ROTATION_BUFFER_CAP: usize = 64;
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "kind")]
 enum ShareMsg {
-    #[serde(rename = "share_announce")]
+    /// A version of the share. v2 (iroh-blobs): `manifest` is the hash of
+    /// the encrypted manifest blob and `provider` the node id (= identity
+    /// public key, hex) to fetch it from. v1 announces (librqbit info-hash
+    /// plus BitTorrent endpoints) carried a different tag and are ignored.
+    #[serde(rename = "share_announce_v2")]
     Announce {
-        info_hash: String,
-        bt_endpoints: Vec<(String, u16)>,
-        /// Deterministic hash over the share's file contents, sorted by path.
-        /// Two peers with the same content compute the same `version_hash`,
-        /// even though their librqbit `info_hash` will differ (librqbit's
-        /// `create_torrent` walks dirs in filesystem order, which is
-        /// host-specific). Sync uses `version_hash` for "is this the same
-        /// content as we have?" comparisons; `info_hash` is used only as the
-        /// BitTorrent magnet for fetching the bytes. Optional for back-compat
-        /// with the Phase 2 leech path.
+        manifest: String,
+        provider: String,
+        /// Deterministic hash over the share's file contents, sorted by
+        /// path. Same content gives the same hash on every peer; sync
+        /// compares versions with it, and receivers check the fetched
+        /// manifest against it before applying anything.
         #[serde(default)]
         version_hash: Option<String>,
         /// Vector clock identifying the version. Required by Sync receivers
@@ -152,8 +148,8 @@ fn apply_auth_ops(
 pub struct DaemonRuntime {
     pub data_dir: PathBuf,
     pub identity: SigningKey,
-    pub bt_port: u16,
-    pub session: Arc<Session>,
+    /// Blob store and fetcher (iroh-blobs on the p2panda endpoint).
+    pub transfer: Arc<Transfer>,
     pub gossip: Gossip,
     /// `share_id -> mpsc tx for ShareCommand`. Populated when a share task is
     /// spawned, removed on shutdown / `share-remove`.
@@ -164,14 +160,10 @@ pub struct DaemonRuntime {
     pub tasks: Arc<Mutex<JoinSet<Result<()>>>>,
 }
 
-/// Bring up the panda layer, the librqbit session, and an empty runtime.
+/// Bring up the panda layer, the blob store, and an empty runtime.
 /// No share tasks have been spawned yet — the caller (typically `serve()`)
 /// loads the on-disk share configs and calls `spawn_share_task` for each.
-pub async fn start_runtime(
-    data_dir: PathBuf,
-    bt_port: u16,
-    identity: SigningKey,
-) -> Result<DaemonRuntime> {
+pub async fn start_runtime(data_dir: PathBuf, identity: SigningKey) -> Result<DaemonRuntime> {
     let address_book = AddressBook::builder().spawn().await?;
     let endpoint = Endpoint::builder(address_book.clone())
         .signing_key(identity.clone())
@@ -200,22 +192,16 @@ pub async fn start_runtime(
         std::future::pending::<()>().await;
     });
 
-    let session = Session::new_with_opts(
-        data_dir.clone(),
-        SessionOptions {
-            listen_port_range: Some(bt_port..bt_port + 1),
-            disable_dht: true,
-            ..Default::default()
-        },
-    )
-    .await
-    .context("creating librqbit session")?;
+    let transfer = Arc::new(
+        Transfer::start(&data_dir, endpoint.clone())
+            .await
+            .context("starting the blob store")?,
+    );
 
     Ok(DaemonRuntime {
         data_dir,
         identity,
-        bt_port,
-        session,
+        transfer,
         gossip,
         shares: Arc::new(Mutex::new(HashMap::new())),
         tasks: Arc::new(Mutex::new(JoinSet::new())),
@@ -248,20 +234,18 @@ pub async fn spawn_share_task(
             Vec::new()
         }
     };
-    let session = rt.session.clone();
+    let transfer = rt.transfer.clone();
     let gossip = rt.gossip.clone();
     let identity = rt.identity.clone();
     let data_dir = rt.data_dir.clone();
-    let bt_port = rt.bt_port;
     let peer_id_hex = identity.verifying_key().to_hex();
     let share_id_for_ctx = config.id.clone();
 
     tasks_guard.spawn(async move {
         run_share(
             config,
-            session,
+            transfer,
             gossip,
-            bt_port,
             data_dir,
             peer_id_hex,
             identity,
@@ -281,7 +265,6 @@ pub async fn spawn_share_task(
 /// on top by the caller in `cmd_serve`.
 pub async fn serve(
     data_dir: PathBuf,
-    bt_port: u16,
     identity: SigningKey,
     configs: Vec<ShareConfig>,
     register_dbus: bool,
@@ -289,7 +272,7 @@ pub async fn serve(
     let peer_id_hex = identity.verifying_key().to_hex();
     tracing::info!(peer_id = %peer_id_hex, share_count = configs.len(), "daemon starting");
 
-    let rt = Arc::new(start_runtime(data_dir, bt_port, identity).await?);
+    let rt = Arc::new(start_runtime(data_dir, identity).await?);
     let no_shares_at_start = configs.is_empty();
     if no_shares_at_start {
         tracing::warn!("no shares configured; daemon will idle. Add some with `peerdup share-add` (or via D-Bus).");
@@ -406,6 +389,7 @@ async fn finish_shutdown(rt: Arc<DaemonRuntime>) -> Result<()> {
     tracing::info!("aborting remaining tasks");
     let mut tasks = rt.tasks.lock().await;
     tasks.shutdown().await;
+    rt.transfer.shutdown().await;
     Ok(())
 }
 
@@ -446,9 +430,8 @@ async fn wait_for_shutdown_signal() -> &'static str {
 #[allow(clippy::too_many_arguments)]
 async fn run_share(
     config: ShareConfig,
-    session: Arc<Session>,
+    transfer: Arc<Transfer>,
     gossip: Gossip,
-    bt_port: u16,
     data_dir: PathBuf,
     peer_id_hex: String,
     identity: SigningKey,
@@ -469,44 +452,15 @@ async fn run_share(
     );
     config.role.ensure_encrypted()?;
     match config.role {
-        ShareRole::Seed => {
-            seed_loop(
-                config,
-                session,
-                gossip,
-                topic,
-                bt_port,
-                data_dir,
-                identity,
-                key,
-                auth_state,
-                pending_rotations,
-                cmd_rx,
-            )
-            .await
-        }
-        ShareRole::Leech => {
-            leech_loop(
-                config,
-                session,
-                gossip,
-                topic,
-                data_dir,
-                identity,
-                key,
-                auth_state,
-                pending_rotations,
-                cmd_rx,
-            )
-            .await
+        ShareRole::Seed | ShareRole::Leech => {
+            Err(anyhow!("role {:?} is not supported", config.role))
         }
         ShareRole::Sync => {
             sync_loop(
                 config,
-                session,
+                transfer,
                 gossip,
                 topic,
-                bt_port,
                 data_dir,
                 peer_id_hex,
                 identity,
@@ -520,268 +474,6 @@ async fn run_share(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn seed_loop(
-    config: ShareConfig,
-    session: Arc<Session>,
-    gossip: Gossip,
-    topic: Topic,
-    bt_port: u16,
-    data_dir: PathBuf,
-    identity: SigningKey,
-    key: Arc<RwLock<KeyRing>>,
-    mut auth_state: AuthState,
-    mut pending_rotations: Vec<SignedRotation>,
-    mut cmd_rx: mpsc::Receiver<ShareCommand>,
-) -> Result<()> {
-    let root = config
-        .root_path
-        .canonicalize()
-        .with_context(|| format!("canonicalize {:?}", config.root_path))?;
-    let result = create_torrent(root.as_path(), Default::default())
-        .await
-        .context("create_torrent")?;
-    let info_hash = result.info_hash();
-    let torrent_bytes = result.as_bytes()?;
-    tracing::info!(
-        share_id = %config.id,
-        root = %root.display(),
-        info_hash = %info_hash.as_string(),
-        "created torrent"
-    );
-
-    let add = AddTorrent::from_bytes(torrent_bytes);
-    let opts = AddTorrentOptions {
-        output_folder: Some(root.to_string_lossy().into_owned()),
-        overwrite: true,
-        paused: false,
-        ..Default::default()
-    };
-    let _handle = session
-        .add_torrent(add, Some(opts))
-        .await?
-        .into_handle()
-        .ok_or_else(|| anyhow!("add_torrent returned no handle"))?;
-    tracing::info!(share_id = %config.id, port = bt_port, "seeding");
-
-    let bt_endpoints = vec![("127.0.0.1".to_string(), bt_port)];
-    let announce = ShareMsg::Announce {
-        info_hash: info_hash.as_string(),
-        bt_endpoints,
-        version_hash: None,
-        clock: None,
-        timestamp: None,
-    };
-    let announce_bytes = serde_json::to_vec(&announce)?;
-
-    let group_id = auth::group_id_for(&config.id);
-    let mut rotation_buffer: Vec<SignedRotation> = Vec::new();
-
-    let handle = gossip.stream(topic).await?;
-    let mut sub = handle.subscribe();
-    let mut tick = tokio::time::interval(Duration::from_secs(10));
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    tick.tick().await;
-
-    loop {
-        tokio::select! {
-            _ = tick.tick() => {
-                if let Err(e) = handle.publish(announce_bytes.clone()).await {
-                    tracing::warn!(share_id = %config.id, error = %e, "gossip publish failed");
-                }
-                publish_auth_ops(&handle, &auth_state, &config.id).await;
-                publish_pending_rotations(&handle, &pending_rotations, &config.id).await;
-            }
-            Some(cmd) = cmd_rx.recv() => {
-                if handle_share_command(
-                    cmd,
-                    &config,
-                    &data_dir,
-                    &identity,
-                    &key,
-                    &mut auth_state,
-                    &mut pending_rotations,
-                ).await {
-                    return Ok(());
-                }
-            }
-            item = sub.next() => {
-                let Some(item) = item else { break Ok(()) };
-                let payload = match item {
-                    Ok(p) => p,
-                    Err(e) => { tracing::debug!(error = %e, "gossip lag"); continue; }
-                };
-                match serde_json::from_slice::<ShareMsg>(&payload) {
-                    Ok(ShareMsg::AuthOps { ops }) => {
-                        if let Err(e) = apply_auth_ops(&mut auth_state, ops, &data_dir, &config.id) {
-                            tracing::warn!(error = ?e, share_id = %config.id, "auth apply failed");
-                        }
-                    }
-                    Ok(ShareMsg::KeyRotation(rot)) => {
-                        if let Err(e) = apply_key_rotation(
-                            rot,
-                            &auth_state,
-                            group_id,
-                            &identity,
-                            &key,
-                            &mut rotation_buffer,
-                            &data_dir,
-                            &config.id,
-                        ).await {
-                            tracing::warn!(error = ?e, share_id = %config.id, "key rotation handler failed");
-                        }
-                    }
-                    Ok(ShareMsg::Announce { .. }) => {} // seeds ignore other peers' announces
-                    Err(_) => {} // unknown payload, drop
-                }
-            }
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn leech_loop(
-    config: ShareConfig,
-    session: Arc<Session>,
-    gossip: Gossip,
-    topic: Topic,
-    data_dir: PathBuf,
-    identity: SigningKey,
-    key: Arc<RwLock<KeyRing>>,
-    mut auth_state: AuthState,
-    mut pending_rotations: Vec<SignedRotation>,
-    mut cmd_rx: mpsc::Receiver<ShareCommand>,
-) -> Result<()> {
-    let root = config.root_path.clone();
-    tokio::fs::create_dir_all(&root)
-        .await
-        .with_context(|| format!("create_dir_all {root:?}"))?;
-    let root_string = root
-        .canonicalize()
-        .with_context(|| format!("canonicalize {root:?}"))?
-        .to_string_lossy()
-        .into_owned();
-
-    let group_id = auth::group_id_for(&config.id);
-    let mut rotation_buffer: Vec<SignedRotation> = Vec::new();
-
-    let handle = gossip.stream(topic).await?;
-    let mut sub = handle.subscribe();
-    tracing::info!(share_id = %config.id, "subscribed; waiting for announce");
-
-    // Drain any pending rotations queued by the CLI on this peer (rare for a
-    // pure leech, but keep symmetry with sync_loop / seed_loop).
-    publish_pending_rotations(&handle, &pending_rotations, &config.id).await;
-
-    let mut completed = false;
-    loop {
-        tokio::select! {
-            Some(cmd) = cmd_rx.recv() => {
-                if handle_share_command(
-                    cmd,
-                    &config,
-                    &data_dir,
-                    &identity,
-                    &key,
-                    &mut auth_state,
-                    &mut pending_rotations,
-                ).await {
-                    return Ok(());
-                }
-            }
-            item = sub.next() => {
-                let Some(item) = item else { break };
-                let payload = match item {
-                    Ok(p) => p,
-                    Err(e) => { tracing::debug!(error = %e, "gossip subscription lag"); continue; }
-                };
-                let msg = match serde_json::from_slice::<ShareMsg>(&payload) {
-                    Ok(m) => m,
-                    Err(_) => { tracing::debug!("ignoring non-ShareMsg payload"); continue; }
-                };
-                match msg {
-                    ShareMsg::Announce { info_hash, bt_endpoints, .. } if !completed => {
-                        if let Err(e) = leech_apply_announce(
-                            &session, &root_string, &info_hash, &bt_endpoints, &config.id,
-                        ).await {
-                            tracing::warn!(error = ?e, share_id = %config.id, "leech apply failed");
-                        } else {
-                            completed = true;
-                        }
-                    }
-                    ShareMsg::Announce { .. } => {} // already done
-                    ShareMsg::AuthOps { ops } => {
-                        if let Err(e) = apply_auth_ops(&mut auth_state, ops, &data_dir, &config.id) {
-                            tracing::warn!(error = ?e, share_id = %config.id, "auth apply failed");
-                        }
-                    }
-                    ShareMsg::KeyRotation(rot) => {
-                        if let Err(e) = apply_key_rotation(
-                            rot,
-                            &auth_state,
-                            group_id,
-                            &identity,
-                            &key,
-                            &mut rotation_buffer,
-                            &data_dir,
-                            &config.id,
-                        ).await {
-                            tracing::warn!(error = ?e, share_id = %config.id, "key rotation handler failed");
-                        }
-                    }
-                }
-            }
-        }
-        if completed && cmd_rx.is_closed() {
-            break;
-        }
-    }
-    Ok(())
-}
-
-async fn leech_apply_announce(
-    session: &Arc<Session>,
-    root_string: &str,
-    info_hash: &str,
-    bt_endpoints: &[(String, u16)],
-    share_id: &str,
-) -> Result<()> {
-    tracing::info!(share_id = %share_id, %info_hash, peers = ?bt_endpoints,
-        "received announce");
-    let initial_peers: Vec<SocketAddr> = bt_endpoints
-        .iter()
-        .filter_map(|(host, port)| {
-            format!("{}:{}", host, port)
-                .parse::<SocketAddr>()
-                .map_err(|e| tracing::warn!(host, port, error = %e, "skipping unparseable peer"))
-                .ok()
-        })
-        .collect();
-    if initial_peers.is_empty() {
-        return Err(anyhow!("announce had no usable peers"));
-    }
-    let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
-    let opts = AddTorrentOptions {
-        output_folder: Some(root_string.to_string()),
-        initial_peers: Some(initial_peers),
-        overwrite: true,
-        ..Default::default()
-    };
-    let add = AddTorrent::from_url(magnet);
-    let torrent_handle = session
-        .add_torrent(add, Some(opts))
-        .await?
-        .into_handle()
-        .ok_or_else(|| anyhow!("add_torrent returned no handle"))?;
-    tracing::info!(share_id = %share_id, "added torrent, waiting for completion");
-    torrent_handle
-        .wait_until_completed()
-        .await
-        .context("wait_until_completed failed")?;
-    tracing::info!(share_id = %share_id, "download completed");
-    Ok(())
-}
-
 /// Bidirectional sync. Both peers run this for the same share.
 ///
 /// 3.3: vector clocks decide which announces dominate. Sequential edits in
@@ -791,10 +483,9 @@ async fn leech_apply_announce(
 #[allow(clippy::too_many_arguments)]
 async fn sync_loop(
     config: ShareConfig,
-    session: Arc<Session>,
+    transfer: Arc<Transfer>,
     gossip: Gossip,
     topic: Topic,
-    bt_port: u16,
     data_dir: PathBuf,
     peer_id_hex: String,
     identity: SigningKey,
@@ -818,12 +509,22 @@ async fn sync_loop(
     let mut sub = topic_handle.subscribe();
     tracing::info!(share_id = %config.id, root = %root.display(), "sync started");
 
+    let mut cache = BlobCache::load(&data_dir, &config.id);
     let mut state = {
         let k = key.read().await;
-        reconcile_on_start(&config, &session, &root, &data_dir, &peer_id_hex, &k).await?
+        reconcile_on_start(
+            &config,
+            &transfer,
+            &root,
+            &data_dir,
+            &peer_id_hex,
+            &k,
+            &mut cache,
+        )
+        .await?
     };
     if let Some(s) = &state {
-        publish_sync_announce(&topic_handle, s, bt_port).await;
+        publish_sync_announce(&topic_handle, s, &peer_id_hex).await;
     }
 
     let (_watcher, mut watch_rx) =
@@ -837,7 +538,7 @@ async fn sync_loop(
             Some(()) = debounce(&mut watch_rx, Duration::from_millis(500)) => {
                 let outcome = {
                     let k = key.read().await;
-                    handle_local_change(&config, &session, &root, &data_dir, &peer_id_hex, &k, state.as_ref()).await
+                    handle_local_change(&config, &transfer, &root, &data_dir, &peer_id_hex, &k, state.as_ref(), &mut cache).await
                 };
                 match outcome {
                     Ok(Some(new_state)) => {
@@ -847,7 +548,7 @@ async fn sync_loop(
                             clock = ?new_state.clock.0,
                             "local change detected"
                         );
-                        publish_sync_announce(&topic_handle, &new_state, bt_port).await;
+                        publish_sync_announce(&topic_handle, &new_state, &peer_id_hex).await;
                         state = Some(new_state);
                     }
                     Ok(None) => {}
@@ -856,7 +557,7 @@ async fn sync_loop(
             }
             _ = announce_tick.tick() => {
                 if let Some(s) = &state {
-                    publish_sync_announce(&topic_handle, s, bt_port).await;
+                    publish_sync_announce(&topic_handle, s, &peer_id_hex).await;
                 }
                 publish_auth_ops(&topic_handle, &auth_state, &config.id).await;
                 publish_pending_rotations(&topic_handle, &pending_rotations, &config.id).await;
@@ -884,9 +585,9 @@ async fn sync_loop(
                     Ok(m) => m,
                     Err(_) => continue,
                 };
-                let (info_hash, bt_endpoints, version_hash, clock, timestamp) = match msg {
-                    ShareMsg::Announce { info_hash, bt_endpoints, version_hash, clock, timestamp } =>
-                        (info_hash, bt_endpoints, version_hash, clock, timestamp),
+                let (manifest, provider, version_hash, clock, timestamp) = match msg {
+                    ShareMsg::Announce { manifest, provider, version_hash, clock, timestamp } =>
+                        (manifest, provider, version_hash, clock, timestamp),
                     ShareMsg::AuthOps { ops } => {
                         if let Err(e) = apply_auth_ops(&mut auth_state, ops, &data_dir, &config.id) {
                             tracing::warn!(error = ?e, share_id = %config.id, "auth apply failed");
@@ -940,7 +641,7 @@ async fn sync_loop(
                             if let Err(e) = persist(&data_dir, &config.id, &new_state) {
                                 tracing::warn!(error = ?e, "could not persist state");
                             }
-                            publish_sync_announce(&topic_handle, &new_state, bt_port).await;
+                            publish_sync_announce(&topic_handle, &new_state, &peer_id_hex).await;
                             state = Some(new_state);
                             continue;
                         }
@@ -958,21 +659,24 @@ async fn sync_loop(
                 tracing::info!(
                     share_id = %config.id,
                     %remote_vhash,
-                    %info_hash,
+                    %manifest,
+                    %provider,
                     remote_clock = ?remote_clock.0,
-                    peers = ?bt_endpoints,
                     "received remote announce; applying"
                 );
                 let apply_outcome = {
                     let k = key.read().await;
-                    apply_remote_sync(&session, &root, &info_hash, &remote_vhash, &remote_clock, remote_ts, &bt_endpoints, &k, state.as_ref()).await
+                    apply_remote_sync(&transfer, &root, &provider, &manifest, &remote_vhash, &remote_clock, remote_ts, &k, state.as_ref(), &mut cache).await
                 };
                 match apply_outcome {
                     Ok(new_state) => {
                         if let Err(e) = persist(&data_dir, &config.id, &new_state) {
                             tracing::warn!(error = ?e, "could not persist state");
                         }
-                        publish_sync_announce(&topic_handle, &new_state, bt_port).await;
+                        if let Err(e) = cache.save(&data_dir, &config.id) {
+                            tracing::warn!(error = ?e, "could not save blob cache");
+                        }
+                        publish_sync_announce(&topic_handle, &new_state, &peer_id_hex).await;
                         state = Some(new_state);
                     }
                     Err(e) => tracing::warn!(error = ?e, share_id = %config.id, "apply_remote failed"),
@@ -1164,13 +868,9 @@ async fn handle_rotate_key(
 struct ShareState {
     /// Deterministic, content-derived. Same content → same hash on every peer.
     version_hash: String,
-    /// librqbit's hash for our local copy of this content. Differs across
-    /// peers even for identical content (librqbit's `create_torrent` walks
-    /// dirs in filesystem order). Used only as the BT magnet for fetches.
-    info_hash: String,
-    /// librqbit's internal id; needed to remove the previous torrent when
-    /// we replace it.
-    torrent_id: usize,
+    /// Hash of this version's encrypted manifest blob in our store; what we
+    /// announce. Peers that fetched the version announce the same one.
+    manifest_hash: String,
     /// Per-peer counters. Identifies the logical version across peers.
     clock: VectorClock,
     /// When this version was created. Tiebreaker for LWW conflict resolution.
@@ -1198,128 +898,106 @@ fn persist(data_dir: &Path, share_id: &str, s: &ShareState) -> Result<()> {
 /// - content present, no persisted state → first run; clock = {our_peer: 1}
 /// - content matches persisted vhash → resume cleanly at persisted clock
 /// - content differs from persisted vhash → out-of-band edit; bump our counter
+///
+/// Every case with content (re)publishes it to the blob store, which is a
+/// cache and may have been wiped.
 async fn reconcile_on_start(
     config: &ShareConfig,
-    session: &Arc<Session>,
+    transfer: &Transfer,
     root: &Path,
     data_dir: &Path,
     peer_id_hex: &str,
     key: &KeyRing,
+    cache: &mut BlobCache,
 ) -> Result<Option<ShareState>> {
     let persisted = share_state::load(data_dir, &config.id)?;
-
-    match persisted {
-        None if !has_content(root)? => Ok(None),
-        None => {
-            let (disk_vh, manifest) = snapshot_content(root)?;
-            let mut clock = VectorClock::new();
-            clock.increment(peer_id_hex);
-            sync_plaintext_to_shadow(root, key, &manifest)?;
-            let (info_hash, torrent_id) =
-                create_and_add_shadow_torrent(config, session, root).await?;
-            let state = ShareState {
-                version_hash: disk_vh,
-                info_hash,
-                torrent_id,
-                clock,
-                timestamp: Utc::now(),
-                manifest,
-            };
-            persist(data_dir, &config.id, &state)?;
-            tracing::info!(
-                share_id = %config.id,
-                clock = ?state.clock.0,
-                version_hash = %state.version_hash,
-                "first run: adopted local content"
-            );
-            Ok(Some(state))
-        }
-        Some(p) if !has_content(root)? => {
+    if !has_content(root)? {
+        if persisted.is_some() {
             tracing::warn!(
                 share_id = %config.id,
                 "persisted state exists but share root is empty; waiting for content"
             );
-            let _ = p;
-            Ok(None)
+        }
+        return Ok(None);
+    }
+
+    let (disk_vh, manifest, files) = snapshot_content(root)?;
+    let manifest_hash = transfer.publish(root, &files, key, cache).await?;
+    cache.save(data_dir, &config.id)?;
+
+    let state = match persisted {
+        Some(p) if p.version_hash == disk_vh => {
+            tracing::info!(
+                share_id = %config.id,
+                clock = ?p.clock.0,
+                version_hash = %disk_vh,
+                "resumed at persisted clock"
+            );
+            return Ok(Some(ShareState {
+                version_hash: disk_vh,
+                manifest_hash,
+                clock: p.clock,
+                timestamp: p.timestamp,
+                manifest,
+            }));
         }
         Some(p) => {
-            let (disk_vh, manifest) = snapshot_content(root)?;
-            if p.version_hash == disk_vh {
-                sync_plaintext_to_shadow(root, key, &manifest)?;
-                let (info_hash, torrent_id) =
-                    create_and_add_shadow_torrent(config, session, root).await?;
-                tracing::info!(
-                    share_id = %config.id,
-                    clock = ?p.clock.0,
-                    version_hash = %disk_vh,
-                    "resumed at persisted clock"
-                );
-                Ok(Some(ShareState {
-                    version_hash: disk_vh,
-                    info_hash,
-                    torrent_id,
-                    clock: p.clock,
-                    timestamp: p.timestamp,
-                    manifest,
-                }))
-            } else {
-                let mut clock = p.clock.clone();
-                clock.increment(peer_id_hex);
-                sync_plaintext_to_shadow(root, key, &manifest)?;
-                let (info_hash, torrent_id) =
-                    create_and_add_shadow_torrent(config, session, root).await?;
-                let state = ShareState {
-                    version_hash: disk_vh,
-                    info_hash,
-                    torrent_id,
-                    clock,
-                    timestamp: Utc::now(),
-                    manifest,
-                };
-                persist(data_dir, &config.id, &state)?;
-                tracing::info!(
-                    share_id = %config.id,
-                    clock = ?state.clock.0,
-                    "out-of-band edit detected; bumped clock"
-                );
-                Ok(Some(state))
+            let mut clock = p.clock.clone();
+            clock.increment(peer_id_hex);
+            tracing::info!(share_id = %config.id, clock = ?clock.0, "out-of-band edit detected; bumped clock");
+            ShareState {
+                version_hash: disk_vh,
+                manifest_hash,
+                clock,
+                timestamp: Utc::now(),
+                manifest,
             }
         }
-    }
+        None => {
+            let mut clock = VectorClock::new();
+            clock.increment(peer_id_hex);
+            tracing::info!(share_id = %config.id, version_hash = %disk_vh, "first run: adopted local content");
+            ShareState {
+                version_hash: disk_vh,
+                manifest_hash,
+                clock,
+                timestamp: Utc::now(),
+                manifest,
+            }
+        }
+    };
+    persist(data_dir, &config.id, &state)?;
+    Ok(Some(state))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_local_change(
     config: &ShareConfig,
-    session: &Arc<Session>,
+    transfer: &Transfer,
     root: &Path,
     data_dir: &Path,
     peer_id_hex: &str,
     key: &KeyRing,
     current: Option<&ShareState>,
+    cache: &mut BlobCache,
 ) -> Result<Option<ShareState>> {
     if !has_content(root)? {
         return Ok(None);
     }
-    let (new_vhash, new_manifest) = snapshot_content(root)?;
+    let (new_vhash, new_manifest, files) = snapshot_content(root)?;
     if current
         .map(|s| s.version_hash == new_vhash)
         .unwrap_or(false)
     {
         return Ok(None);
     }
-    if let Some(s) = current {
-        let _ = session
-            .delete(TorrentIdOrHash::Id(s.torrent_id), false)
-            .await;
-    }
-    sync_plaintext_to_shadow(root, key, &new_manifest)?;
-    let (info_hash, torrent_id) = create_and_add_shadow_torrent(config, session, root).await?;
+    let manifest_hash = transfer.publish(root, &files, key, cache).await?;
+    cache.save(data_dir, &config.id)?;
     let mut clock = current.map(|s| s.clock.clone()).unwrap_or_default();
     clock.increment(peer_id_hex);
     let new_state = ShareState {
         version_hash: new_vhash,
-        info_hash,
-        torrent_id,
+        manifest_hash,
         clock,
         timestamp: Utc::now(),
         manifest: new_manifest,
@@ -1328,38 +1006,38 @@ async fn handle_local_change(
     Ok(Some(new_state))
 }
 
-/// Snapshot a share's content. Returns a deterministic version hash and a
-/// manifest (set of relative paths). Both peers compute the same values for
-/// the same content. The hash is blake3 over sorted (rel_path, blake3(content))
-/// triples; the manifest is the same sorted path set.
-fn snapshot_content(root: &Path) -> Result<(String, BTreeSet<PathBuf>)> {
+/// Snapshot a share's content: the version hash, the set of relative
+/// paths, and each file's plaintext blake3. Every peer computes the same
+/// values for the same content.
+fn snapshot_content(root: &Path) -> Result<(String, BTreeSet<PathBuf>, Vec<FileHash>)> {
     let mut paths = Vec::new();
     collect_files(root, root, &mut paths)?;
     paths.sort();
 
-    let mut top = blake3::Hasher::new();
-    let mut manifest = BTreeSet::new();
+    let mut files = Vec::with_capacity(paths.len());
     for rel in &paths {
         let abs = root.join(rel);
         let mut file = std::fs::File::open(&abs).with_context(|| format!("opening {abs:?}"))?;
         let mut content_hasher = blake3::Hasher::new();
         std::io::copy(&mut file, &mut content_hasher)
             .with_context(|| format!("hashing {abs:?}"))?;
-        let path_bytes = rel.to_string_lossy();
-        top.update(&(path_bytes.len() as u64).to_le_bytes());
-        top.update(path_bytes.as_bytes());
-        top.update(content_hasher.finalize().as_bytes());
-        manifest.insert(rel.clone());
+        files.push((rel.clone(), *content_hasher.finalize().as_bytes()));
     }
-    Ok((top.finalize().to_hex().to_string(), manifest))
+    let manifest = paths.into_iter().collect();
+    Ok((transfer::version_hash_of(&files), manifest, files))
 }
 
 fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {dir:?}"))? {
         let entry = entry?;
-        if entry.file_name() == PEERDUP_DIR_NAME {
-            // Don't recurse into peerdup's hidden state dir; that's the
-            // ciphertext shadow, not user content.
+        let name = entry.file_name();
+        if name == PEERDUP_DIR_NAME {
+            // peerdup's own state, never user content (the watcher ignores
+            // it at any depth too).
+            continue;
+        }
+        if name.to_string_lossy().ends_with(".peerdup-tmp") {
+            // A fetched file still being staged.
             continue;
         }
         let ft = entry.file_type()?;
@@ -1373,229 +1051,35 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> 
     Ok(())
 }
 
-const PEERDUP_DIR_NAME: &str = ".peerdup";
-
-fn shadow_root(root: &Path) -> PathBuf {
-    root.join(PEERDUP_DIR_NAME).join("encrypted")
-}
-
-/// Map a plaintext relative path to its ciphertext path inside the shadow.
-/// Adds a `.bin` suffix to the leaf filename so plaintext and shadow can
-/// coexist if anything ever pulls the shadow into the plaintext tree.
-fn shadow_file_for(root: &Path, plaintext_rel: &Path) -> PathBuf {
-    let mut p = shadow_root(root).join(plaintext_rel);
-    if let Some(name) = p.file_name() {
-        let mut n = name.to_os_string();
-        n.push(".bin");
-        p.set_file_name(n);
-    }
-    p
-}
-
-/// Inverse of `shadow_file_for`: given a path relative to the shadow root,
-/// recover the plaintext relative path. Returns None if the path doesn't
-/// have the `.bin` suffix.
-fn plaintext_rel_from_shadow_rel(shadow_rel: &Path) -> Option<PathBuf> {
-    let name = shadow_rel.file_name()?.to_str()?;
-    let stripped = name.strip_suffix(".bin")?;
-    let mut out = shadow_rel.to_path_buf();
-    out.set_file_name(stripped);
-    Some(out)
-}
-
 fn has_content(root: &Path) -> Result<bool> {
-    let mut entries = std::fs::read_dir(root).with_context(|| format!("read_dir {root:?}"))?;
-    Ok(entries.next().is_some())
+    let mut paths = Vec::new();
+    collect_files(root, root, &mut paths)?;
+    Ok(!paths.is_empty())
 }
 
-/// Encrypt the plaintext working copy into the ciphertext shadow.
-/// Walks `manifest`, encrypts each file with `key`, writes to the matching
-/// shadow path. Then walks the shadow and removes any ciphertext file
-/// without a corresponding plaintext entry (handles user file deletions).
-fn sync_plaintext_to_shadow(
-    root: &Path,
-    key: &KeyRing,
-    plaintext_manifest: &BTreeSet<PathBuf>,
-) -> Result<()> {
-    let shadow = shadow_root(root);
-    std::fs::create_dir_all(&shadow).with_context(|| format!("create_dir_all {shadow:?}"))?;
-
-    for rel in plaintext_manifest {
-        let pt_path = root.join(rel);
-        let shadow_path = shadow_file_for(root, rel);
-        if let Some(parent) = shadow_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create_dir_all {parent:?}"))?;
-        }
-        let pt_bytes =
-            std::fs::read(&pt_path).with_context(|| format!("reading plaintext {pt_path:?}"))?;
-        let ct_bytes =
-            crypto::encrypt(key, &pt_bytes).with_context(|| format!("encrypting {rel:?}"))?;
-        std::fs::write(&shadow_path, ct_bytes)
-            .with_context(|| format!("writing ciphertext {shadow_path:?}"))?;
-    }
-
-    // Shadow-side orphan deletion.
-    let mut shadow_files = Vec::new();
-    if shadow.exists() {
-        collect_files(&shadow, &shadow, &mut shadow_files)?;
-    }
-    for shadow_rel in &shadow_files {
-        let Some(pt_rel) = plaintext_rel_from_shadow_rel(shadow_rel) else {
-            continue;
-        };
-        if !plaintext_manifest.contains(&pt_rel) {
-            let abs = shadow.join(shadow_rel);
-            let _ = std::fs::remove_file(&abs);
-        }
-    }
-    Ok(())
-}
-
-/// Decrypt every ciphertext file in the shadow and write plaintext to the
-/// share root. Returns the resulting plaintext manifest. Plaintext writes
-/// use a temp-file + rename for atomicity.
-fn sync_shadow_to_plaintext(root: &Path, key: &KeyRing) -> Result<BTreeSet<PathBuf>> {
-    let shadow = shadow_root(root);
-    if !shadow.exists() {
-        return Ok(BTreeSet::new());
-    }
-    let mut shadow_files = Vec::new();
-    collect_files(&shadow, &shadow, &mut shadow_files)?;
-    let mut manifest = BTreeSet::new();
-    for shadow_rel in &shadow_files {
-        let Some(pt_rel) = plaintext_rel_from_shadow_rel(shadow_rel) else {
-            tracing::warn!(
-                path = %shadow_rel.display(),
-                "shadow file without .bin suffix; skipping"
-            );
-            continue;
-        };
-        let shadow_path = shadow.join(shadow_rel);
-        let pt_path = root.join(&pt_rel);
-        let ct_bytes = std::fs::read(&shadow_path)
-            .with_context(|| format!("reading ciphertext {shadow_path:?}"))?;
-        let pt_bytes = crypto::decrypt(key, &ct_bytes)
-            .with_context(|| format!("decrypting {shadow_rel:?}"))?;
-        if let Some(parent) = pt_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create_dir_all {parent:?}"))?;
-        }
-        let mut tmp_name = pt_path
-            .file_name()
-            .ok_or_else(|| anyhow!("plaintext path has no filename: {pt_path:?}"))?
-            .to_os_string();
-        tmp_name.push(".peerdup-tmp");
-        let tmp = pt_path.with_file_name(tmp_name);
-        std::fs::write(&tmp, &pt_bytes).with_context(|| format!("writing plaintext {tmp:?}"))?;
-        std::fs::rename(&tmp, &pt_path)
-            .with_context(|| format!("renaming {tmp:?} -> {pt_path:?}"))?;
-        manifest.insert(pt_rel);
-    }
-    Ok(manifest)
-}
-
-/// Run create_torrent over the shadow directory and add to librqbit, with
-/// the share id as the torrent name (so the same plaintext + same key on
-/// two peers — even though their ciphertext nonces differ — produces the
-/// same torrent name; the info-hash will still differ per peer because
-/// ciphertext bytes differ, but that's fine since `version_hash` is what
-/// peerdup compares).
-async fn create_and_add_shadow_torrent(
-    config: &ShareConfig,
-    session: &Arc<Session>,
-    root: &Path,
-) -> Result<(String, usize)> {
-    let shadow = shadow_root(root);
-    let result = create_torrent(
-        &shadow,
-        CreateTorrentOptions {
-            name: Some(&config.id),
-            piece_length: None,
-        },
-    )
-    .await
-    .context("create_torrent")?;
-    let info_hash = result.info_hash().as_string();
-    let opts = AddTorrentOptions {
-        output_folder: Some(shadow.to_string_lossy().into_owned()),
-        overwrite: true,
-        paused: false,
-        ..Default::default()
-    };
-    let resp = session
-        .add_torrent(AddTorrent::from_bytes(result.as_bytes()?), Some(opts))
-        .await?;
-    let handle = resp.into_handle().ok_or_else(|| anyhow!("no handle"))?;
-    Ok((info_hash, handle.id()))
-}
-
+/// Fetch a remote version, verify it, and apply it to the share root.
+/// Nothing in the root changes until every file has been fetched,
+/// decrypted and checked against the manifest, and the manifest against
+/// the announced version hash.
 #[allow(clippy::too_many_arguments)]
 async fn apply_remote_sync(
-    session: &Arc<Session>,
+    transfer: &Transfer,
     root: &Path,
-    info_hash: &str,
+    provider: &str,
+    manifest_hash: &str,
     remote_vhash: &str,
     remote_clock: &VectorClock,
     remote_timestamp: DateTime<Utc>,
-    bt_endpoints: &[(String, u16)],
     key: &KeyRing,
     current: Option<&ShareState>,
+    cache: &mut BlobCache,
 ) -> Result<ShareState> {
-    let initial_peers: Vec<SocketAddr> = bt_endpoints
-        .iter()
-        .filter_map(|(host, port)| format!("{}:{}", host, port).parse().ok())
-        .collect();
-    if initial_peers.is_empty() {
-        return Err(anyhow!("announce had no usable peers"));
-    }
-
-    if let Some(s) = current {
-        let _ = session
-            .delete(TorrentIdOrHash::Id(s.torrent_id), false)
-            .await;
-    }
-
-    // librqbit fetches ciphertext into the shadow.
-    let shadow = shadow_root(root);
-    std::fs::create_dir_all(&shadow).with_context(|| format!("create_dir_all {shadow:?}"))?;
-    let magnet = format!("magnet:?xt=urn:btih:{}", info_hash);
-    let opts = AddTorrentOptions {
-        output_folder: Some(shadow.to_string_lossy().into_owned()),
-        initial_peers: Some(initial_peers),
-        overwrite: true,
-        ..Default::default()
-    };
-    let resp = session
-        .add_torrent(AddTorrent::from_url(magnet), Some(opts))
+    let staged = transfer
+        .fetch(provider, manifest_hash, remote_vhash, root, key, cache)
         .await?;
-    let handle = resp.into_handle().ok_or_else(|| anyhow!("no handle"))?;
-    let torrent_id = handle.id();
-    handle
-        .wait_until_completed()
-        .await
-        .context("wait_until_completed")?;
+    let new_manifest: BTreeSet<PathBuf> = staged.files.iter().map(|(p, _)| p.clone()).collect();
+    staged.commit(root)?;
 
-    // Decrypt every shadow file into plaintext. If decryption fails (wrong
-    // key, tampered blob), bail out — this is the "fetched ciphertext but
-    // can't read it" failure mode that's expected for unauthorized peers.
-    let new_manifest = sync_shadow_to_plaintext(root, key)
-        .context("decrypting shadow to plaintext after fetch")?;
-
-    // Verify the decrypted plaintext matches the announced version_hash.
-    // If not, peers disagree about content — likely a key mismatch silently
-    // producing junk that AEAD would have caught (defense in depth) or a
-    // peerdup bug.
-    let (computed_vhash, _) = snapshot_content(root)?;
-    if computed_vhash != remote_vhash {
-        return Err(anyhow!(
-            "decrypted plaintext version_hash {} != announced {}",
-            computed_vhash,
-            remote_vhash
-        ));
-    }
-
-    // Orphan deletion in the plaintext root, using the plaintext manifest.
     if let Some(s) = current {
         delete_orphans(root, &s.manifest, &new_manifest);
     }
@@ -1605,8 +1089,7 @@ async fn apply_remote_sync(
 
     Ok(ShareState {
         version_hash: remote_vhash.to_string(),
-        info_hash: info_hash.to_string(),
-        torrent_id,
+        manifest_hash: manifest_hash.to_string(),
         clock,
         timestamp: remote_timestamp,
         manifest: new_manifest,
@@ -1687,11 +1170,10 @@ async fn debounce(rx: &mut UnboundedReceiver<()>, settle: Duration) -> Option<()
     }
 }
 
-async fn publish_sync_announce(handle: &GossipHandle, state: &ShareState, bt_port: u16) {
-    let bt_endpoints = vec![("127.0.0.1".to_string(), bt_port)];
+async fn publish_sync_announce(handle: &GossipHandle, state: &ShareState, provider: &str) {
     let announce = ShareMsg::Announce {
-        info_hash: state.info_hash.clone(),
-        bt_endpoints,
+        manifest: state.manifest_hash.clone(),
+        provider: provider.to_string(),
         version_hash: Some(state.version_hash.clone()),
         clock: Some(state.clock.clone()),
         timestamp: Some(state.timestamp),
