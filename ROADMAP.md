@@ -18,11 +18,11 @@ guesses, not commitments. Add 50% if part-time, double for "with surprises."
 | 2. Persistent state & daemon | ✅ Done | — |
 | 3. Multi-master sync | ⚠️ Partial: works on one host; concurrent edits resolve by LWW and silently lose the other side (no conflict copies) | in 7.5 |
 | 4. Encryption at rest | ⚠️ Partial: file contents and names encrypted (iroh-blobs manifests); sizes of individual blobs visible to members; `p2panda-encryption` deferred | in 7.5 |
-| 5. ACL via p2panda-auth | ⚠️ Partial: membership, invites, revocation and key rotation done; write permission is not enforced on sync announces, so revoked members and readers can still push | in 7.5 |
+| 5. ACL via p2panda-auth | ✅ Done: membership, invites, revocation, key rotation, members-only connections, signed announces applied only from Writers and Owners | — |
 | 6a. Transport decision | ✅ Decided: iroh-blobs over iroh (see `INTEGRATION_NOTES.md`, "Transport: iroh-blobs"); spike checks open | — |
 | 6. Swarm admission gate | ✅ Replaced: members-only connection gate on the iroh endpoint (`access.rs`); no librqbit hook needed | — |
 | 7. D-Bus IPC surface | ⚠️ Partial: methods and activation done; no signals, bus name not final | 1 week |
-| 7.5. Make it real across machines | 👉 In progress: cross-network sync works in CI (relays, invite bootstrap); signed announces, conflict copies, random topics still to do | 3–4 weeks left |
+| 7.5. Make it real across machines | 👉 In progress: cross-network sync, members-only connections and signed announces done (all in CI); conflict copies, random topics, size limits still to do | 2–3 weeks left |
 | 7.6. Formats and release engineering | Planned | 1–2 weeks |
 | 8. Linux UI (GTK4/libadwaita app) | Planned | 6–10 weeks |
 | 9. Other platforms (Linux Flatpak GUI; Windows, macOS) | Planned | 8–12 weeks |

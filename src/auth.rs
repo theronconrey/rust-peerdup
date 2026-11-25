@@ -451,6 +451,14 @@ impl AuthState {
             .map(|op| op.payload.group_id)
     }
 
+    /// `member`'s current role in `group_id`, if it is a member.
+    pub fn role_of(&self, group_id: MemberId, member: MemberId) -> Option<AuthRole> {
+        self.members(group_id)
+            .into_iter()
+            .find(|(m, _)| *m == member)
+            .map(|(_, r)| r)
+    }
+
     /// Only Owners may invite or revoke. Checked before authoring, so a
     /// non-Owner gets a clear error rather than a CRDT rejection.
     pub fn require_owner(&self, group_id: MemberId, identity: &SigningKey) -> Result<()> {

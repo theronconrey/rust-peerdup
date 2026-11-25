@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 use crate::access::Access;
+use crate::announce::{self, Announce};
 use crate::auth::{self, AuthRole, AuthState, MemberId, SignedOp};
 use crate::clock::{ClockOrdering, VectorClock};
 use crate::crypto::{self, InstallOutcome, KeyRing};
@@ -34,31 +35,13 @@ const ROTATION_BUFFER_CAP: usize = 64;
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "kind")]
 enum ShareMsg {
-    /// A version of the share. v2 (iroh-blobs): `manifest` is the hash of
-    /// the encrypted manifest blob and `provider` the node id (= identity
-    /// public key, hex) to fetch it from. v1 announces (librqbit info-hash
-    /// plus BitTorrent endpoints) carried a different tag and are ignored.
-    #[serde(rename = "share_announce_v2")]
-    Announce {
-        manifest: String,
-        provider: String,
-        /// Deterministic hash over the share's file contents, sorted by
-        /// path. Same content gives the same hash on every peer; sync
-        /// compares versions with it, and receivers check the fetched
-        /// manifest against it before applying anything.
-        #[serde(default)]
-        version_hash: Option<String>,
-        /// Vector clock identifying the version. Required by Sync receivers
-        /// to compare versions; absent means a Phase 2 announce, which Sync
-        /// peers ignore.
-        #[serde(default)]
-        clock: Option<VectorClock>,
-        /// Wall-clock time when this version was created. Used as the
-        /// tiebreaker for LWW resolution when clocks are concurrent.
-        /// Optional for back-compat with pre-3.4 announces.
-        #[serde(default)]
-        timestamp: Option<DateTime<Utc>>,
-    },
+    /// A version of the share: its manifest hash, where to fetch it and
+    /// the version's hash, clock and timestamp, signed by the sender
+    /// (`announce.rs`). Receivers apply it only if the signer is a current
+    /// Writer or Owner. Earlier unsigned announces had other tags and are
+    /// ignored.
+    #[serde(rename = "share_announce_v3")]
+    Announce(Announce),
     /// Phase 5c: full snapshot of this peer's known auth ops for the share.
     /// Receivers verify each, dedupe by op id, and apply via
     /// `AuthState::apply_remote`. Periodic re-broadcasts ensure late joiners
@@ -635,7 +618,7 @@ async fn sync_loop(
         .await?
     };
     if let Some(s) = &state {
-        publish_sync_announce(&topic_handle, s, &peer_id_hex).await;
+        publish_sync_announce(&topic_handle, s, &identity, group_id, &auth_state).await;
     }
 
     let (_watcher, mut watch_rx) =
@@ -659,7 +642,13 @@ async fn sync_loop(
                             clock = ?new_state.clock.0,
                             "local change detected"
                         );
-                        publish_sync_announce(&topic_handle, &new_state, &peer_id_hex).await;
+                        if !announce::may_publish(&auth_state, group_id, &identity) {
+                            tracing::warn!(
+                                share_id = %config.id,
+                                "you are a Reader of this share; local changes are not shared"
+                            );
+                        }
+                        publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
                         state = Some(new_state);
                     }
                     Ok(None) => {}
@@ -668,7 +657,7 @@ async fn sync_loop(
             }
             _ = announce_tick.tick() => {
                 if let Some(s) = &state {
-                    publish_sync_announce(&topic_handle, s, &peer_id_hex).await;
+                    publish_sync_announce(&topic_handle, s, &identity, group_id, &auth_state).await;
                 }
                 publish_auth_ops(&topic_handle, &auth_state, &config.id).await;
                 publish_pending_rotations(&topic_handle, &pending_rotations, &config.id).await;
@@ -700,9 +689,8 @@ async fn sync_loop(
                     Ok(m) => m,
                     Err(_) => continue,
                 };
-                let (manifest, provider, version_hash, clock, timestamp) = match msg {
-                    ShareMsg::Announce { manifest, provider, version_hash, clock, timestamp } =>
-                        (manifest, provider, version_hash, clock, timestamp),
+                let ann = match msg {
+                    ShareMsg::Announce(ann) => ann,
                     ShareMsg::AuthOps { ops } => {
                         match apply_auth_ops(&mut auth_state, ops, &data_dir, &config.id) {
                             Ok(0) => {}
@@ -728,10 +716,21 @@ async fn sync_loop(
                     }
                 };
 
-                let (Some(remote_vhash), Some(remote_clock), Some(remote_ts)) = (version_hash, clock, timestamp) else {
-                    tracing::debug!(share_id = %config.id, "ignoring legacy announce missing required fields");
+                if ann.provider == peer_id_hex {
+                    continue; // our own, echoed back
+                }
+                if let Err(e) = ann.verify(&auth_state, group_id) {
+                    tracing::warn!(error = %e, share_id = %config.id, provider = %ann.provider, "ignoring announce");
                     continue;
-                };
+                }
+                let Announce {
+                    manifest,
+                    provider,
+                    version_hash: remote_vhash,
+                    clock: remote_clock,
+                    timestamp: remote_ts,
+                    ..
+                } = ann;
 
                 let cmp = state.as_ref().map(|s| s.clock.compare(&remote_clock));
                 match cmp {
@@ -758,7 +757,7 @@ async fn sync_loop(
                             if let Err(e) = persist(&data_dir, &config.id, &new_state) {
                                 tracing::warn!(error = ?e, "could not persist state");
                             }
-                            publish_sync_announce(&topic_handle, &new_state, &peer_id_hex).await;
+                            publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
                             state = Some(new_state);
                             continue;
                         }
@@ -793,7 +792,7 @@ async fn sync_loop(
                         if let Err(e) = cache.save(&data_dir, &config.id) {
                             tracing::warn!(error = ?e, "could not save blob cache");
                         }
-                        publish_sync_announce(&topic_handle, &new_state, &peer_id_hex).await;
+                        publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
                         state = Some(new_state);
                     }
                     Err(e) => tracing::warn!(error = ?e, share_id = %config.id, "apply_remote failed"),
@@ -1288,15 +1287,27 @@ async fn debounce(rx: &mut UnboundedReceiver<()>, settle: Duration) -> Option<()
     }
 }
 
-async fn publish_sync_announce(handle: &GossipHandle, state: &ShareState, provider: &str) {
-    let announce = ShareMsg::Announce {
-        manifest: state.manifest_hash.clone(),
-        provider: provider.to_string(),
-        version_hash: Some(state.version_hash.clone()),
-        clock: Some(state.clock.clone()),
-        timestamp: Some(state.timestamp),
-    };
-    if let Ok(bytes) = serde_json::to_vec(&announce) {
+/// Announce `state`, signed, if we may: Readers' changes stay local.
+async fn publish_sync_announce(
+    handle: &GossipHandle,
+    state: &ShareState,
+    identity: &SigningKey,
+    group_id: MemberId,
+    auth_state: &AuthState,
+) {
+    if !announce::may_publish(auth_state, group_id, identity) {
+        tracing::debug!("not a Writer or Owner of this share; not announcing");
+        return;
+    }
+    let ann = Announce::sign(
+        identity,
+        group_id,
+        state.manifest_hash.clone(),
+        state.version_hash.clone(),
+        state.clock.clone(),
+        state.timestamp,
+    );
+    if let Ok(bytes) = serde_json::to_vec(&ShareMsg::Announce(ann)) {
         if let Err(e) = handle.publish(bytes).await {
             tracing::warn!(error = %e, "gossip publish failed");
         }

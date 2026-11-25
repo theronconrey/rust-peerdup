@@ -81,9 +81,10 @@ network id into every ALPN, so blobs must go through p2panda's
    when possible; relay fallback with UDP blocked. *Two containers on
    isolated networks sync through a relay in CI (`tests/e2e-xnet.sh`);
    real NATs, 1 GiB and the UDP-blocked case are still to measure.*
-2. Revocation: a removed node's fetch is refused. *Gate in place
-   (`access.rs`, unit-tested); an e2e revoke over iroh is still to add
-   (`tests/e2e-revoke.sh` predates iroh-blobs).*
+2. Revocation: a removed node's fetch is refused. *Done:
+   `tests/e2e-revoke.sh` (in CI) checks a revoked Writer gets no new
+   files and its edits don't reach the Owner, and that a Reader's edits
+   never leave its machine.*
 3. Crash/resume: `kill -9` a receiver mid-fetch of a 2 GiB file and
    restart; measure how much is re-fetched (iroh-blobs #254).
 4. Store durability: 500 change cycles, kill, restart; no panic or
@@ -103,6 +104,18 @@ network id into every ALPN, so blobs must go through p2panda's
 - Done: two daemons on one network sync initial content, an edit back, a
   new nested file and a deletion (`tests/e2e-sync.sh`, in CI against the
   installed RPM).
+
+## Signed announces (`src/announce.rs`)
+
+A version announce (`share_announce_v3`) is signed with the sender's
+identity key over a domain tag, the share's group id, the manifest hash,
+the provider, the version hash, the clock and the timestamp. Receivers
+apply it only if the signature verifies and the signer is a current Writer
+or Owner in their own auth state; Readers' and non-members' announces are
+dropped with a warning, as are clocks with more than 1,024 entries. A
+Reader's daemon still records its local edits but doesn't announce them
+(it logs that), and the next newer version from a Writer replaces them.
+Unsigned announces (`share_announce_v2`, `share_announce`) are ignored.
 
 ## p2panda 0.8 (core, net) with p2panda-auth 0.5
 
