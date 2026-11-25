@@ -67,3 +67,25 @@ jobs:
         run: |
           cargo build --locked
           tests/e2e-sync.sh target/debug/rust-peerdup
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-peerdup-fedora
+          path: target/debug/rust-peerdup
+          retention-days: 3
+
+  # Two containers on two isolated Docker networks: they can only meet
+  # through a relay or a hole-punched path, as two homes on the internet do.
+  cross-network:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-peerdup-fedora
+          path: bin
+      - name: Two networks, one share (e2e)
+        run: |
+          chmod +x bin/rust-peerdup
+          tests/e2e-xnet.sh bin/rust-peerdup

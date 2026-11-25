@@ -182,6 +182,10 @@ impl Daemon1Iface {
             created_at: chrono::Utc::now(),
         };
         cfg.save(&self.rt.data_dir).map_err(fdo_err)?;
+        if let Some(addr) = &t.inviter_addr {
+            crate::bootstrap::save_share_bootstrap(&self.rt.data_dir, &t.share_id, addr)
+                .map_err(fdo_err)?;
+        }
         crypto::install_keyring(&self.rt.data_dir, &t.share_id, &t.keys).map_err(fdo_err)?;
 
         // Replay the auth log. Each op is signature-verified via apply_remote.

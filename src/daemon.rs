@@ -11,7 +11,9 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use p2panda_core::{SigningKey, Topic};
+use p2panda_net::addrs::NodeInfo;
 use p2panda_net::gossip::GossipHandle;
+use p2panda_net::iroh_endpoint::RelayUrl;
 use p2panda_net::iroh_mdns::MdnsDiscoveryMode;
 use p2panda_net::{AddressBook, Discovery, Endpoint, Gossip, MdnsDiscovery};
 use serde::{Deserialize, Serialize};
@@ -151,6 +153,9 @@ pub struct DaemonRuntime {
     /// Blob store and fetcher (iroh-blobs on the p2panda endpoint).
     pub transfer: Arc<Transfer>,
     pub gossip: Gossip,
+    /// Where p2panda-net looks up peers' addresses; seeded per share from
+    /// its bootstrap and member list (`seed_address_book`).
+    pub address_book: AddressBook,
     /// `share_id -> mpsc tx for ShareCommand`. Populated when a share task is
     /// spawned, removed on shutdown / `share-remove`.
     pub shares: Arc<Mutex<HashMap<String, mpsc::Sender<ShareCommand>>>>,
@@ -163,12 +168,21 @@ pub struct DaemonRuntime {
 /// Bring up the panda layer, the blob store, and an empty runtime.
 /// No share tasks have been spawned yet — the caller (typically `serve()`)
 /// loads the on-disk share configs and calls `spawn_share_task` for each.
-pub async fn start_runtime(data_dir: PathBuf, identity: SigningKey) -> Result<DaemonRuntime> {
+pub async fn start_runtime(
+    data_dir: PathBuf,
+    identity: SigningKey,
+    relays: Vec<RelayUrl>,
+) -> Result<DaemonRuntime> {
     let address_book = AddressBook::builder().spawn().await?;
-    let endpoint = Endpoint::builder(address_book.clone())
-        .signing_key(identity.clone())
-        .spawn()
-        .await?;
+    let mut builder = Endpoint::builder(address_book.clone()).signing_key(identity.clone());
+    if relays.is_empty() {
+        tracing::info!("no relay configured; peers on other networks need a routable address");
+    }
+    for url in relays {
+        builder = builder.relay_url(url);
+    }
+    let endpoint = builder.spawn().await?;
+    spawn_own_addr_writer(endpoint.clone(), data_dir.clone());
     // _mdns and _discovery are kept alive for the daemon's lifetime by being
     // borrowed inside long-lived tasks they spawn. We currently don't need to
     // address them explicitly; on a future shutdown path we'd hold them on
@@ -203,9 +217,67 @@ pub async fn start_runtime(data_dir: PathBuf, identity: SigningKey) -> Result<Da
         identity,
         transfer,
         gossip,
+        address_book,
         shares: Arc::new(Mutex::new(HashMap::new())),
         tasks: Arc::new(Mutex::new(JoinSet::new())),
     })
+}
+
+/// Once the endpoint is online (or after 30 s), write its address to
+/// `<data_dir>/endpoint.json` for invites to carry, and refresh it every
+/// minute as direct addresses and the home relay change.
+fn spawn_own_addr_writer(endpoint: Endpoint, data_dir: PathBuf) {
+    tokio::spawn(async move {
+        let iroh_ep = match endpoint.endpoint().await {
+            Ok(ep) => ep,
+            Err(e) => {
+                tracing::warn!(error = ?e, "no iroh endpoint; invites won't carry our address");
+                return;
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(30), iroh_ep.online()).await;
+        loop {
+            let addr = iroh_ep.addr();
+            if let Err(e) = crate::bootstrap::save_own_addr(&data_dir, &addr) {
+                tracing::warn!(error = ?e, "could not save our address");
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    });
+}
+
+/// Tell p2panda-net where this share's peers are: the inviter's address
+/// from the ticket (as a bootstrap node) and every member's interest in
+/// the share's topic. Failures are logged; same-LAN peers still find each
+/// other over mDNS.
+async fn seed_address_book(
+    address_book: &AddressBook,
+    data_dir: &Path,
+    share_id: &str,
+    topic: Topic,
+    auth_state: &AuthState,
+    group_id: MemberId,
+    me_hex: &str,
+) {
+    if let Some(addr) = crate::bootstrap::load_share_bootstrap(data_dir, share_id) {
+        if let Err(e) = address_book
+            .insert_node_info(NodeInfo::from(addr).bootstrap())
+            .await
+        {
+            tracing::warn!(error = ?e, share_id, "could not add the bootstrap peer");
+        }
+    }
+    for (member, _) in auth_state.members(group_id) {
+        if member.to_hex() == me_hex {
+            continue;
+        }
+        let Ok(node_id) = p2panda_core::VerifyingKey::from_bytes(&member.0) else {
+            continue;
+        };
+        if let Err(e) = address_book.add_topic(node_id, topic).await {
+            tracing::warn!(error = ?e, share_id, "could not register a member's topic");
+        }
+    }
 }
 
 /// Spawn a share task for `config` and return the `mpsc::Sender<ShareCommand>`
@@ -236,6 +308,7 @@ pub async fn spawn_share_task(
     };
     let transfer = rt.transfer.clone();
     let gossip = rt.gossip.clone();
+    let address_book = rt.address_book.clone();
     let identity = rt.identity.clone();
     let data_dir = rt.data_dir.clone();
     let peer_id_hex = identity.verifying_key().to_hex();
@@ -246,6 +319,7 @@ pub async fn spawn_share_task(
             config,
             transfer,
             gossip,
+            address_book,
             data_dir,
             peer_id_hex,
             identity,
@@ -268,11 +342,12 @@ pub async fn serve(
     identity: SigningKey,
     configs: Vec<ShareConfig>,
     register_dbus: bool,
+    relays: Vec<RelayUrl>,
 ) -> Result<()> {
     let peer_id_hex = identity.verifying_key().to_hex();
     tracing::info!(peer_id = %peer_id_hex, share_count = configs.len(), "daemon starting");
 
-    let rt = Arc::new(start_runtime(data_dir, identity).await?);
+    let rt = Arc::new(start_runtime(data_dir, identity, relays).await?);
     let no_shares_at_start = configs.is_empty();
     if no_shares_at_start {
         tracing::warn!("no shares configured; daemon will idle. Add some with `peerdup share-add` (or via D-Bus).");
@@ -432,6 +507,7 @@ async fn run_share(
     config: ShareConfig,
     transfer: Arc<Transfer>,
     gossip: Gossip,
+    address_book: AddressBook,
     data_dir: PathBuf,
     peer_id_hex: String,
     identity: SigningKey,
@@ -460,6 +536,7 @@ async fn run_share(
                 config,
                 transfer,
                 gossip,
+                address_book,
                 topic,
                 data_dir,
                 peer_id_hex,
@@ -485,6 +562,7 @@ async fn sync_loop(
     config: ShareConfig,
     transfer: Arc<Transfer>,
     gossip: Gossip,
+    address_book: AddressBook,
     topic: Topic,
     data_dir: PathBuf,
     peer_id_hex: String,
@@ -505,6 +583,16 @@ async fn sync_loop(
     let group_id = auth::group_id_for(&config.id);
     let mut rotation_buffer: Vec<SignedRotation> = Vec::new();
 
+    seed_address_book(
+        &address_book,
+        &data_dir,
+        &config.id,
+        topic,
+        &auth_state,
+        group_id,
+        &peer_id_hex,
+    )
+    .await;
     let topic_handle = gossip.stream(topic).await?;
     let mut sub = topic_handle.subscribe();
     tracing::info!(share_id = %config.id, root = %root.display(), "sync started");
@@ -793,6 +881,7 @@ async fn handle_invite(
         auth_log: auth_state.ops().to_vec(),
         invitee_pubkey: invitee.0,
         role: suggested_role,
+        inviter_addr: crate::bootstrap::load_own_addr(data_dir),
     };
     let _ = ticket::TICKET_VERSION; // touch to keep the import live
     ticket.encode()

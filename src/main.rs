@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 mod auth;
+mod bootstrap;
 mod client;
 mod clock;
 mod crypto;
@@ -61,6 +62,15 @@ enum Cmd {
         /// auto-skips IPC when no session bus is detected.
         #[arg(long, default_value_t = false)]
         no_dbus: bool,
+        /// Relay server for reaching peers behind NAT; repeat for more.
+        /// Replaces the default, n0's public relays (rate-limited, meant
+        /// for development). Relayed traffic is end-to-end encrypted.
+        #[arg(long = "relay-url", value_name = "URL")]
+        relay_urls: Vec<String>,
+        /// Use no relay at all. Peers on other networks are then reachable
+        /// only at a directly routable address.
+        #[arg(long, default_value_t = false, conflicts_with = "relay_urls")]
+        no_relay: bool,
     },
     /// Add a new share. With `--data-dir` set, writes to disk directly
     /// (Phase 2 semantics; daemon restart required to pick up). Without
@@ -141,12 +151,27 @@ async fn main() -> Result<()> {
     let direct_dir = cli.data_dir.clone();
 
     match cli.cmd {
-        Cmd::Serve { bt_port, no_dbus } => {
+        Cmd::Serve {
+            bt_port,
+            no_dbus,
+            relay_urls,
+            no_relay,
+        } => {
             if bt_port.is_some() {
                 tracing::warn!("--bt-port is ignored: file transfer now runs over iroh");
             }
             let data_dir = data_dir::resolve(direct_dir)?;
-            cmd_serve(data_dir, !no_dbus).await
+            let relays = if no_relay {
+                Vec::new()
+            } else if relay_urls.is_empty() {
+                bootstrap::default_relay_urls()
+            } else {
+                relay_urls
+                    .iter()
+                    .map(|u| bootstrap::parse_relay_url(u))
+                    .collect::<Result<Vec<_>>>()?
+            };
+            cmd_serve(data_dir, !no_dbus, relays).await
         }
         Cmd::ShareAdd { topic, path, role } => match direct_dir {
             Some(dd) => cmd_share_add_direct(dd, topic, path, role),
@@ -233,12 +258,16 @@ fn resolve_ticket_arg(arg: String) -> Result<String> {
     }
 }
 
-async fn cmd_serve(data_dir: PathBuf, register_dbus: bool) -> Result<()> {
+async fn cmd_serve(
+    data_dir: PathBuf,
+    register_dbus: bool,
+    relays: Vec<p2panda_net::iroh_endpoint::RelayUrl>,
+) -> Result<()> {
     std::fs::create_dir_all(&data_dir)?;
     let lock_file = lock::acquire(&data_dir::lock_path(&data_dir))?;
     let identity = identity::load_or_create(&data_dir::identity_path(&data_dir))?;
     let configs = share::load_all(&data_dir)?;
-    let result = daemon::serve(data_dir, identity, configs, register_dbus).await;
+    let result = daemon::serve(data_dir, identity, configs, register_dbus, relays).await;
     drop(lock_file);
     result
 }
@@ -621,6 +650,7 @@ fn cmd_share_invite_direct(
         auth_log: auth_state.ops().to_vec(),
         invitee_pubkey: invitee.0,
         role,
+        inviter_addr: bootstrap::load_own_addr(&data_dir),
     };
     let encoded = ticket.encode()?;
     eprintln!("# Send this string to the joining peer over a secure channel");
@@ -668,6 +698,9 @@ fn cmd_share_join_direct(data_dir: PathBuf, ticket_str: String, path: PathBuf) -
         created_at: chrono::Utc::now(),
     };
     cfg.save(&data_dir)?;
+    if let Some(addr) = &ticket.inviter_addr {
+        bootstrap::save_share_bootstrap(&data_dir, &ticket.share_id, addr)?;
+    }
 
     crypto::install_keyring(&data_dir, &ticket.share_id, &ticket.keys)?;
 
