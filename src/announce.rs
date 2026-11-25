@@ -37,6 +37,13 @@ pub struct Announce {
     pub timestamp: DateTime<Utc>,
     /// Ed25519 signature (hex) by `provider` over `signed_bytes`.
     pub signature: String,
+    /// Random per send, outside the signature. Ed25519 signatures are
+    /// deterministic, so without it every 10-second re-announce of the same
+    /// version is byte-identical and gossip, which drops repeats, delivers
+    /// only the first. A receiver whose fetch failed (say, before a rotated
+    /// key arrived) would then never get another chance.
+    #[serde(default)]
+    pub nonce: u64,
 }
 
 fn signed_bytes(
@@ -88,6 +95,7 @@ impl Announce {
             clock,
             timestamp,
             signature,
+            nonce: rand::random(),
         }
     }
 
@@ -209,5 +217,34 @@ mod tests {
         }
         let a = Announce::sign(&owner, group, "aa".into(), "bb".into(), clock, Utc::now());
         assert!(a.verify(&state, group).is_err());
+    }
+
+    #[test]
+    fn each_send_differs_but_still_verifies() {
+        let (group, state, owner, _, _) = setup();
+        let ts = Utc::now();
+        let a = Announce::sign(
+            &owner,
+            group,
+            "aa".into(),
+            "bb".into(),
+            VectorClock::new(),
+            ts,
+        );
+        let b = Announce::sign(
+            &owner,
+            group,
+            "aa".into(),
+            "bb".into(),
+            VectorClock::new(),
+            ts,
+        );
+        assert_eq!(a.signature, b.signature);
+        assert_ne!(
+            serde_json::to_vec(&a).unwrap(),
+            serde_json::to_vec(&b).unwrap(),
+            "re-announces must not be byte-identical"
+        );
+        b.verify(&state, group).unwrap();
     }
 }

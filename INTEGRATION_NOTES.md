@@ -117,6 +117,14 @@ Reader's daemon still records its local edits but doesn't announce them
 (it logs that), and the next newer version from a Writer replaces them.
 Unsigned announces (`share_announce_v2`, `share_announce`) are ignored.
 
+Each send also carries a random `nonce` outside the signature. Gossip drops
+repeated messages, and Ed25519 signatures are deterministic, so without it
+the 10-second re-announces of one version are byte-identical and only the
+first is delivered; a receiver whose fetch failed then never retries.
+`tests/e2e-revoke.sh` caught exactly that: a Reader got the post-revocation
+announce a second before the rotated key, failed to decrypt, and never saw
+the version again.
+
 ## p2panda 0.8 (core, net) with p2panda-auth 0.5
 
 p2panda-net 0.8 runs on iroh 1.x, which iroh-blobs needs. Our code moved to
