@@ -8,6 +8,7 @@ mod clock;
 mod crypto;
 mod daemon;
 mod data_dir;
+mod epochs;
 mod identity;
 mod ipc;
 mod lock;
@@ -317,10 +318,7 @@ async fn cmd_share_rotate_key(id: String) -> Result<()> {
     let client = client::DaemonClient::connect().await?;
     let new_epoch = client.share_rotate_key(&id).await?;
     println!("Rotated share {id}: new epoch is {new_epoch}");
-    println!(
-        "Distribute the updated keys.bin to other peers; without it they cannot read content \
-         encrypted under epoch {new_epoch}."
-    );
+    println!("The daemon sends the new key to the other members on the next announce tick.");
     Ok(())
 }
 
@@ -495,12 +493,33 @@ fn cmd_share_rotate_key_direct(data_dir: PathBuf, id: String) -> Result<()> {
     if !configs.iter().any(|c| c.id == id) {
         return Err(anyhow!("share {id} not found"));
     }
-    let new_epoch = crypto::rotate_keyring(&data_dir, &id)?;
+    let identity = identity::load_or_create(&data_dir::identity_path(&data_dir))?;
+    let group_id = auth::group_id_for(&id);
+    let auth_state = auth::load(&data_dir, &id)?;
+    auth_state.require_owner(group_id, &identity)?;
+    let ring = crypto::load_or_create_keyring(&data_dir, &id)?;
+    epochs::check_mint(
+        ring.current_epoch(),
+        epochs::required(
+            auth_state.required_epoch(),
+            crypto::load_epoch_floor(&data_dir, &id),
+        ),
+    )?;
+    let me = auth::MemberId(*identity.verifying_key().as_bytes());
+    let mut others: Vec<auth::MemberId> = auth_state
+        .members(group_id)
+        .into_iter()
+        .map(|(m, _role)| m)
+        .filter(|m| *m != me)
+        .collect();
+    others.sort_by_key(|m| m.0);
+    let (new_epoch, _chunks) =
+        rotation::mint_and_queue(&data_dir, &id, &identity, group_id, &others)?;
     println!("Rotated share {id}: new epoch is {new_epoch}");
-    println!("(running daemon will not see this change until restart)");
     println!(
-        "Distribute the updated keys.bin to other peers; without it they cannot read content \
-         encrypted under epoch {new_epoch}."
+        "The new key is queued for {} other member{}; the daemon sends it when it starts.",
+        others.len(),
+        if others.len() == 1 { "" } else { "s" },
     );
     Ok(())
 }
@@ -576,6 +595,15 @@ fn cmd_share_revoke_direct(data_dir: PathBuf, id: String, peer_pubkey_hex: Strin
             peer_pubkey_hex
         ));
     }
+    // The key minted below must satisfy the required epoch after this
+    // removal (see the daemon's handle_revoke).
+    epochs::check_mint(
+        crypto::load_or_create_keyring(&data_dir, &id)?.current_epoch(),
+        epochs::required(
+            auth_state.required_epoch() + 1,
+            crypto::load_epoch_floor(&data_dir, &id),
+        ),
+    )?;
     auth_state.remove_member(&identity, group_id, target)?;
     auth::save(&data_dir, &id, &auth_state)?;
 
@@ -587,17 +615,8 @@ fn cmd_share_revoke_direct(data_dir: PathBuf, id: String, peer_pubkey_hex: Strin
         .collect();
     remaining.sort_by_key(|m| m.0);
 
-    let new_epoch = crypto::rotate_keyring(&data_dir, &id)?;
-    let new_key = {
-        let ring = crypto::load_or_create_keyring(&data_dir, &id)?;
-        *ring
-            .key_for_epoch(new_epoch)
-            .ok_or_else(|| anyhow!("rotated keyring missing epoch {new_epoch}"))?
-    };
-
-    let chunks =
-        rotation::build_signed_rotation(&identity, group_id, new_epoch, &new_key, &remaining)?;
-    rotation::save_pending(&data_dir, &id, &chunks)?;
+    let (new_epoch, _chunks) =
+        rotation::mint_and_queue(&data_dir, &id, &identity, group_id, &remaining)?;
 
     println!("Revoked {} from share {id}", peer_pubkey_hex);
     println!("Rotated keyring to epoch {new_epoch}.");
@@ -643,6 +662,14 @@ fn cmd_share_invite_direct(
         ));
     }
     auth_state.require_owner(group_id, &identity)?;
+    let ring = crypto::load_or_create_keyring(&data_dir, &id)?;
+    epochs::check_invite(
+        ring.current_epoch(),
+        epochs::required(
+            auth_state.required_epoch(),
+            crypto::load_epoch_floor(&data_dir, &id),
+        ),
+    )?;
     if auth_state.is_member(group_id, invitee) {
         return Err(anyhow!(
             "{} is already a member of share {id}",
@@ -652,7 +679,6 @@ fn cmd_share_invite_direct(
     auth_state.add_member(&identity, group_id, invitee, auth_role)?;
     auth::save(&data_dir, &id, &auth_state)?;
 
-    let ring = crypto::load_or_create_keyring(&data_dir, &id)?;
     let ticket = ticket::Ticket {
         version: ticket::TICKET_VERSION,
         share_id: cfg.id.clone(),

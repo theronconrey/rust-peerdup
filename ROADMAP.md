@@ -22,7 +22,7 @@ guesses, not commitments. Add 50% if part-time, double for "with surprises."
 | 6a. Transport decision | ✅ Decided: iroh-blobs over iroh (see `INTEGRATION_NOTES.md`, "Transport: iroh-blobs"); spike checks open | — |
 | 6. Swarm admission gate | ✅ Replaced: members-only connection gate on the iroh endpoint (`access.rs`); no librqbit hook needed | — |
 | 7. D-Bus IPC surface | ⚠️ Partial: methods and activation done; no signals, bus name not final | 1 week |
-| 7.5. Make it real across machines | 👉 In progress: cross-network sync, members-only connections and signed announces, fetches off the loop, size limits and conflict copies done (all in CI); random topics still to do | 2–3 weeks left |
+| 7.5. Make it real across machines | 👉 In progress: cross-network sync, members-only connections and signed announces, old key epochs refused after a revocation, fetches off the loop, size limits and conflict copies done (all in CI); random topics still to do | 2–3 weeks left |
 | 7.6. Formats and release engineering | Planned | 1–2 weeks |
 | 8. Linux UI (GTK4/libadwaita app) | Planned | 6–10 weeks |
 | 9. Other platforms (Linux Flatpak GUI; Windows, macOS) | Planned | 8–12 weeks |
@@ -341,8 +341,13 @@ would put these gaps in front of users.
 - Signed announces: each announce signed with `identity.key` over the share,
   info-hash, version hash, clock and timestamp; only current Writers and
   Owners are applied. New versions under old key epochs are refused.
-  *Signing, the Writer/Owner check and bounds on clocks and timestamps
-  done; refusing new versions under old epochs is not done yet.*
+  *Done: signing, the Writer/Owner check, bounds on clocks and
+  timestamps, and the key-epoch rule (`src/epochs.rs`): nothing new is
+  encrypted, announced or applied under a key older than the share's
+  required epoch, and the current version is re-encrypted when the key
+  rotates (`tests/e2e-revoke.sh`). Members offline during a revocation
+  still trust the revoked peer until they hear of it (INTEGRATION_NOTES,
+  "Old keys after revocation").*
 - Decrypt into a staging directory and check the version hash before
   anything is renamed into the share root.
 - Conflict copies (`name (conflict from <peer> <date>).ext`) instead of

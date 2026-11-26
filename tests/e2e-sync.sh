@@ -141,7 +141,10 @@ within 10 "B notices a local edit while its fetch is stalled" \
     more_than "local change detected" "$LOG_B" "$changes_before"
 [ ! -e "$ROOT_B/big.bin" ] || fail "big.bin applied while its provider was stopped"
 kill -CONT "$PID_A"
-wait_for "trees agree after the stalled fetch" same_tree
+# B fetches, decrypts and hashes big.bin, finds its own edit wins, then
+# does it all again for A's merged version: two 256 MiB passes, which take
+# most of a minute each in a debug build (85 s of the old 90 on main).
+TIMEOUT=$((TIMEOUT * 2)) wait_for "trees agree after the stalled fetch" same_tree
 for r in "$ROOT_A" "$ROOT_B"; do
     [ -f "$r/big.bin" ] && [ -f "$r/during-fetch.txt" ] || fail "$r lost a side's file"
 done

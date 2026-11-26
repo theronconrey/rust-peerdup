@@ -351,6 +351,32 @@ pub fn load_pending(data_dir: &Path, share_id: &str) -> Result<Vec<SignedRotatio
     Ok(out)
 }
 
+/// Mint the share's next key epoch, persist it to `keys.bin`, sign its
+/// rotation for `recipients` and queue the chunks in `pending_rotations/`.
+/// Shared by `share-revoke` and `share-rotate-key`, in the daemon and in
+/// direct mode; the caller checks `epochs::check_mint` and that it is an
+/// Owner first. Returns the new epoch and the chunks (empty when there is
+/// nobody to send the key to).
+pub fn mint_and_queue(
+    data_dir: &Path,
+    share_id: &str,
+    identity: &SigningKey,
+    group_id: MemberId,
+    recipients: &[MemberId],
+) -> Result<(u64, Vec<SignedRotation>)> {
+    let new_epoch = crate::crypto::rotate_keyring(data_dir, share_id)?;
+    let ring = crate::crypto::load_or_create_keyring(data_dir, share_id)?;
+    let new_key = *ring
+        .key_for_epoch(new_epoch)
+        .ok_or_else(|| anyhow!("rotated keyring missing epoch {new_epoch}"))?;
+    if recipients.is_empty() {
+        return Ok((new_epoch, Vec::new()));
+    }
+    let chunks = build_signed_rotation(identity, group_id, new_epoch, &new_key, recipients)?;
+    save_pending(data_dir, share_id, &chunks)?;
+    Ok((new_epoch, chunks))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

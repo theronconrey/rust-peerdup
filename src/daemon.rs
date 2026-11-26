@@ -4,6 +4,7 @@ use crate::announce::{self, Announce};
 use crate::auth::{self, AuthRole, AuthState, MemberId, SignedOp};
 use crate::clock::{ClockOrdering, VectorClock};
 use crate::crypto::{self, InstallOutcome, KeyRing};
+use crate::epochs;
 use crate::rotation::{self, SignedRotation, VerifyOutcome};
 use crate::share::{ShareConfig, ShareRole};
 use crate::share_state::{self, PersistedState};
@@ -20,7 +21,7 @@ use p2panda_net::iroh_endpoint::RelayUrl;
 use p2panda_net::iroh_mdns::MdnsDiscoveryMode;
 use p2panda_net::{AddressBook, Discovery, Endpoint, Gossip, MdnsDiscovery};
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +37,11 @@ const VERSION_FETCH_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// Cap the in-memory buffer of out-of-order key rotations per share. 64 epochs
 /// is far more than expected; we evict the oldest if we somehow run past it.
 const ROTATION_BUFFER_CAP: usize = 64;
+
+/// Manifests refused for their key epochs (`transfer::EpochRefused`) are
+/// remembered so their re-announces (every 10 s) aren't fetched again. The
+/// memo is cleared when the required epoch changes and when it fills.
+const REFUSED_MEMO_CAP: usize = 256;
 
 /// Command sent from an IPC handler into the running share task. Each variant
 /// pairs a request with a `oneshot::Sender` for the reply, so per-share state
@@ -590,6 +596,11 @@ async fn sync_loop(
     tracing::info!(share_id = %config.id, root = %root.display(), "sync started");
 
     let mut cache = BlobCache::load(&data_dir, &config.id);
+    // The required epoch (`epochs`) is recomputed from the auth state and
+    // the floor wherever it's used; both only change on this loop.
+    let mut epoch_floor = crypto::load_epoch_floor(&data_dir, &config.id);
+    let required_now =
+        |auth: &AuthState, floor: u64| epochs::required(auth.required_epoch(), floor);
     let mut state = {
         let k = key.read().await;
         reconcile_on_start(
@@ -599,12 +610,21 @@ async fn sync_loop(
             &data_dir,
             &peer_id_hex,
             &k,
+            required_now(&auth_state, epoch_floor),
             &mut cache,
         )
         .await?
     };
     if let Some(s) = &state {
-        publish_sync_announce(&topic_handle, s, &identity, group_id, &auth_state).await;
+        publish_sync_announce(
+            &topic_handle,
+            s,
+            &identity,
+            group_id,
+            &auth_state,
+            required_now(&auth_state, epoch_floor),
+        )
+        .await;
     }
 
     let (_watcher, watch_tx, mut watch_rx) =
@@ -624,8 +644,67 @@ async fn sync_loop(
     let mut fetch: Option<FetchTask> = None;
     let mut next: Option<RemoteVersion> = None;
     let mut generation: u64 = 0;
+    // A local change (or the first run's content) waits for the rotated
+    // key: set when `publish_current` held something back.
+    let mut held_back = state.is_none();
+    // The keyring epoch we last re-encrypted under (or tried to), so a
+    // republish is attempted once per epoch, not on every message.
+    let mut republished_at: u64 = state.as_ref().map_or(0, |s| s.epoch);
+    // Manifests refused for their key epochs, and the required epoch the
+    // memo was built under.
+    let mut refused: HashSet<String> = HashSet::new();
+    let mut refused_under = required_now(&auth_state, epoch_floor);
 
     loop {
+        // Whenever the keyring has advanced past the version we publish
+        // (a revocation or rotation here, or a rotated key installed from
+        // gossip), or a change waited for the key, publish now: the same
+        // version re-encrypted with the same clock, or a new one. Readers
+        // record their own changes but have nothing to re-announce.
+        let required = required_now(&auth_state, epoch_floor);
+        if required != refused_under {
+            refused.clear();
+            refused_under = required;
+        }
+        let have = key.read().await.current_epoch();
+        let stale = state.as_ref().is_some_and(|s| {
+            epochs::needs_republish(s.epoch, have, required)
+                && announce::may_publish(&auth_state, group_id, &identity)
+        });
+        if epochs::may_encrypt(have, required) && (held_back || (stale && have > republished_at)) {
+            held_back = false;
+            republished_at = have;
+            let outcome = {
+                let k = key.read().await;
+                publish_current(
+                    &config,
+                    &transfer,
+                    &root,
+                    &data_dir,
+                    &peer_id_hex,
+                    &k,
+                    required,
+                    state.as_ref(),
+                    &mut cache,
+                )
+                .await
+            };
+            if let Some(s) = handle_published(
+                outcome,
+                &config.id,
+                &topic_handle,
+                &identity,
+                group_id,
+                &auth_state,
+                required,
+                &mut held_back,
+            )
+            .await
+            {
+                state = Some(s);
+            }
+        }
+
         tokio::select! {
             // Debounce: every event pushes the deadline back; the check runs
             // once things have been quiet for SETTLE. Both arms are
@@ -640,32 +719,15 @@ async fn sync_loop(
                 tracing::debug!(share_id = %config.id, "filesystem changed; checking for a new version");
                 let outcome = {
                     let k = key.read().await;
-                    handle_local_change(&config, &transfer, &root, &data_dir, &peer_id_hex, &k, state.as_ref(), &mut cache).await
+                    publish_current(&config, &transfer, &root, &data_dir, &peer_id_hex, &k, required, state.as_ref(), &mut cache).await
                 };
-                match outcome {
-                    Ok(Some(new_state)) => {
-                        tracing::info!(
-                            share_id = %config.id,
-                            version_hash = %new_state.version_hash,
-                            clock = ?new_state.clock.0,
-                            "local change detected"
-                        );
-                        if !announce::may_publish(&auth_state, group_id, &identity) {
-                            tracing::warn!(
-                                share_id = %config.id,
-                                "you are a Reader of this share; local changes are not shared"
-                            );
-                        }
-                        publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
-                        state = Some(new_state);
-                    }
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!(error = ?e, share_id = %config.id, "local change check failed"),
+                if let Some(s) = handle_published(outcome, &config.id, &topic_handle, &identity, group_id, &auth_state, required, &mut held_back).await {
+                    state = Some(s);
                 }
             }
             _ = announce_tick.tick() => {
                 if let Some(s) = &state {
-                    publish_sync_announce(&topic_handle, s, &identity, group_id, &auth_state).await;
+                    publish_sync_announce(&topic_handle, s, &identity, group_id, &auth_state, required).await;
                 }
                 publish_auth_ops(&topic_handle, &auth_state, &config.id).await;
                 publish_pending_rotations(&topic_handle, &pending_rotations, &config.id).await;
@@ -679,6 +741,7 @@ async fn sync_loop(
                     &key,
                     &mut auth_state,
                     &mut pending_rotations,
+                    epoch_floor,
                 ).await;
                 if exit {
                     access.remove_share(&config.id).await;
@@ -717,6 +780,7 @@ async fn sync_loop(
                             &mut rotation_buffer,
                             &data_dir,
                             &config.id,
+                            &mut epoch_floor,
                         ).await {
                             tracing::warn!(error = ?e, share_id = %config.id, "key rotation handler failed");
                         }
@@ -729,6 +793,11 @@ async fn sync_loop(
                 }
                 if let Err(e) = ann.verify(&auth_state, group_id) {
                     tracing::warn!(error = %e, share_id = %config.id, provider = %ann.provider, "ignoring announce");
+                    continue;
+                }
+                if refused.contains(&ann.manifest) {
+                    tracing::debug!(share_id = %config.id, manifest = %ann.manifest,
+                        "ignoring a re-announce of a version refused for its key epoch");
                     continue;
                 }
                 let Announce {
@@ -771,7 +840,7 @@ async fn sync_loop(
                         }
                     }
                     Verdict::Fetch { .. } => {
-                        fetch = Some(start_fetch(&mut generation, remote, &config.id, &transfer, &root, &key, &fetch_tx).await);
+                        fetch = Some(start_fetch(&mut generation, remote, &config.id, &transfer, &root, &key, required, &fetch_tx).await);
                     }
                 }
             }
@@ -782,8 +851,25 @@ async fn sync_loop(
                 }
                 fetch = None;
                 let FetchDone { remote, result, .. } = done;
+                // Check the key epoch again against the required epoch as
+                // it is *now*: a revocation may have arrived mid-fetch.
+                let result = result.and_then(|staged| {
+                    transfer::check_version_epochs(staged.epoch, std::iter::empty::<u64>(), required)?;
+                    Ok(staged)
+                });
                 match result {
-                    Err(e) => tracing::warn!(error = ?e, share_id = %config.id, "apply_remote failed"),
+                    Err(e) => match e.downcast_ref::<transfer::EpochRefused>() {
+                        Some(refusal) => {
+                            tracing::warn!(share_id = %config.id, provider = %remote.provider,
+                                manifest = %remote.manifest, version_hash = %remote.version_hash,
+                                "refused a remote version: {refusal}");
+                            if refused.len() >= REFUSED_MEMO_CAP {
+                                refused.clear();
+                            }
+                            refused.insert(remote.manifest.clone());
+                        }
+                        None => tracing::warn!(error = ?e, share_id = %config.id, "apply_remote failed"),
+                    },
                     // The share may have moved on while the fetch ran (a
                     // local edit, or a version applied in between), so
                     // decide again before touching the root.
@@ -801,14 +887,14 @@ async fn sync_loop(
                                     let _ = watch_tx.send(());
                                 }
                                 tracing::info!(share_id = %config.id, version_hash = %new_state.version_hash,
-                                    "applied remote version");
+                                    epoch = new_state.epoch, "applied remote version");
                                 if let Err(e) = persist(&data_dir, &config.id, &new_state) {
                                     tracing::warn!(error = ?e, "could not persist state");
                                 }
                                 if let Err(e) = cache.save(&data_dir, &config.id) {
                                     tracing::warn!(error = ?e, "could not save blob cache");
                                 }
-                                publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
+                                publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state, required).await;
                                 state = Some(new_state);
                             }
                             Err(e) => tracing::warn!(error = ?e, share_id = %config.id, "apply_remote failed"),
@@ -817,8 +903,9 @@ async fn sync_loop(
                 }
                 if let Some(queued) = next.take() {
                     match judge(&config.id, state.as_ref(), &queued) {
+                        Verdict::Fetch { .. } if refused.contains(&queued.manifest) => {}
                         Verdict::Fetch { .. } => {
-                            fetch = Some(start_fetch(&mut generation, queued, &config.id, &transfer, &root, &key, &fetch_tx).await);
+                            fetch = Some(start_fetch(&mut generation, queued, &config.id, &transfer, &root, &key, required, &fetch_tx).await);
                         }
                         Verdict::Ignore | Verdict::LocalWins => {}
                     }
@@ -828,8 +915,79 @@ async fn sync_loop(
     }
 }
 
+/// Log and announce what `publish_current` did, and return the new state
+/// if there is one. A held-back change sets `held_back`, so the loop
+/// publishes it once the rotated key arrives.
+#[allow(clippy::too_many_arguments)]
+async fn handle_published(
+    outcome: Result<Published>,
+    share_id: &str,
+    topic_handle: &GossipHandle,
+    identity: &SigningKey,
+    group_id: MemberId,
+    auth_state: &AuthState,
+    required: u64,
+    held_back: &mut bool,
+) -> Option<ShareState> {
+    let new_state = match outcome {
+        Ok(Published::Unchanged) => return None,
+        Ok(Published::Held { have, required }) => {
+            *held_back = true;
+            tracing::info!(
+                share_id,
+                have,
+                required,
+                "local change waits for the rotated key from a revocation; \
+                 it is published once the key arrives"
+            );
+            return None;
+        }
+        Ok(Published::New(s)) => {
+            tracing::info!(
+                share_id,
+                version_hash = %s.version_hash,
+                clock = ?s.clock.0,
+                epoch = s.epoch,
+                "local change detected"
+            );
+            if !announce::may_publish(auth_state, group_id, identity) {
+                tracing::warn!(
+                    share_id,
+                    "you are a Reader of this share; local changes are not shared"
+                );
+            }
+            s
+        }
+        Ok(Published::Republished(s)) => {
+            tracing::info!(
+                share_id,
+                version_hash = %s.version_hash,
+                manifest = %s.manifest_hash,
+                "republished under epoch {}",
+                s.epoch
+            );
+            s
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, share_id, "publishing the current version failed");
+            return None;
+        }
+    };
+    publish_sync_announce(
+        topic_handle,
+        &new_state,
+        identity,
+        group_id,
+        auth_state,
+        required,
+    )
+    .await;
+    Some(new_state)
+}
+
 /// Dispatch a `ShareCommand` against the share-loop's owned state. Returns
 /// `true` iff the loop should exit (Shutdown).
+#[allow(clippy::too_many_arguments)]
 async fn handle_share_command(
     cmd: ShareCommand,
     config: &ShareConfig,
@@ -838,6 +996,7 @@ async fn handle_share_command(
     key: &Arc<RwLock<KeyRing>>,
     auth_state: &mut AuthState,
     pending_rotations: &mut Vec<SignedRotation>,
+    epoch_floor: u64,
 ) -> bool {
     match cmd {
         ShareCommand::Invite {
@@ -855,6 +1014,7 @@ async fn handle_share_command(
                 invitee,
                 auth_role,
                 suggested_role,
+                epoch_floor,
             )
             .await;
             let _ = reply.send(result);
@@ -869,13 +1029,23 @@ async fn handle_share_command(
                 auth_state,
                 pending_rotations,
                 target,
+                epoch_floor,
             )
             .await;
             let _ = reply.send(result);
             false
         }
         ShareCommand::RotateKey { reply } => {
-            let result = handle_rotate_key(config, data_dir, key).await;
+            let result = handle_rotate_key(
+                config,
+                data_dir,
+                identity,
+                key,
+                auth_state,
+                pending_rotations,
+                epoch_floor,
+            )
+            .await;
             let _ = reply.send(result);
             false
         }
@@ -903,6 +1073,7 @@ async fn handle_invite(
     invitee: MemberId,
     auth_role: AuthRole,
     suggested_role: ShareRole,
+    epoch_floor: u64,
 ) -> Result<String> {
     suggested_role.ensure_encrypted()?;
     let group_id = auth::group_id_for(&config.id);
@@ -913,6 +1084,10 @@ async fn handle_invite(
         ));
     }
     auth_state.require_owner(group_id, identity)?;
+    epochs::check_invite(
+        key.read().await.current_epoch(),
+        epochs::required(auth_state.required_epoch(), epoch_floor),
+    )?;
     if auth_state.is_member(group_id, invitee) {
         return Err(anyhow!(
             "{} is already a member of share {}",
@@ -941,6 +1116,7 @@ async fn handle_invite(
     ticket.encode()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_revoke(
     config: &ShareConfig,
     data_dir: &Path,
@@ -949,6 +1125,7 @@ async fn handle_revoke(
     auth_state: &mut AuthState,
     pending_rotations: &mut Vec<SignedRotation>,
     target: MemberId,
+    epoch_floor: u64,
 ) -> Result<u64> {
     let group_id = auth::group_id_for(&config.id);
     if auth_state.is_empty() {
@@ -962,6 +1139,13 @@ async fn handle_revoke(
             config.id
         ));
     }
+    // The key minted below must satisfy the required epoch after this
+    // removal; checked before the Remove is authored, so a refusal leaves
+    // no removal without its rotation.
+    epochs::check_mint(
+        key.read().await.current_epoch(),
+        epochs::required(auth_state.required_epoch() + 1, epoch_floor),
+    )?;
     auth_state.remove_member(identity, group_id, target)?;
     auth::save(data_dir, &config.id, auth_state)?;
 
@@ -973,22 +1157,13 @@ async fn handle_revoke(
         .collect();
     remaining.sort_by_key(|m| m.0);
 
-    let new_epoch = crypto::rotate_keyring(data_dir, &config.id)?;
-    let new_key_bytes = {
-        let ring = crypto::load_or_create_keyring(data_dir, &config.id)?;
-        *ring
-            .key_for_epoch(new_epoch)
-            .ok_or_else(|| anyhow!("rotated keyring missing epoch {new_epoch}"))?
-    };
+    let (new_epoch, chunks) =
+        rotation::mint_and_queue(data_dir, &config.id, identity, group_id, &remaining)?;
     // Reload the in-memory keyring so encrypt/decrypt sees the new epoch.
     {
         let fresh = crypto::load_or_create_keyring(data_dir, &config.id)?;
         *key.write().await = fresh;
     }
-
-    let chunks =
-        rotation::build_signed_rotation(identity, group_id, new_epoch, &new_key_bytes, &remaining)?;
-    rotation::save_pending(data_dir, &config.id, &chunks)?;
     // Live broadcasting: append to the in-memory queue so the next announce
     // tick picks it up (no daemon restart needed).
     pending_rotations.extend(chunks);
@@ -996,14 +1171,35 @@ async fn handle_revoke(
     Ok(new_epoch)
 }
 
+/// Rotate the share key without revoking anyone. Owners only, and the new
+/// key is sent to every other member, like a revocation's: before, the
+/// key stayed on this machine, so after the share loop re-encrypted its
+/// current version under it (it does that whenever the keyring advances)
+/// no other member could read the share.
 async fn handle_rotate_key(
     config: &ShareConfig,
     data_dir: &Path,
+    identity: &SigningKey,
     key: &Arc<RwLock<KeyRing>>,
+    auth_state: &AuthState,
+    pending_rotations: &mut Vec<SignedRotation>,
+    epoch_floor: u64,
 ) -> Result<u64> {
-    let new_epoch = crypto::rotate_keyring(data_dir, &config.id)?;
+    let group_id = auth::group_id_for(&config.id);
+    auth_state.require_owner(group_id, identity)?;
+    epochs::check_mint(
+        key.read().await.current_epoch(),
+        epochs::required(auth_state.required_epoch(), epoch_floor),
+    )?;
+    let me = MemberId(*identity.verifying_key().as_bytes());
+    let mut others = member_ids(auth_state, group_id);
+    others.retain(|m| *m != me);
+    others.sort_by_key(|m| m.0);
+    let (new_epoch, chunks) =
+        rotation::mint_and_queue(data_dir, &config.id, identity, group_id, &others)?;
     let fresh = crypto::load_or_create_keyring(data_dir, &config.id)?;
     *key.write().await = fresh;
+    pending_rotations.extend(chunks);
     Ok(new_epoch)
 }
 
@@ -1013,7 +1209,13 @@ struct ShareState {
     version_hash: String,
     /// Hash of this version's encrypted manifest blob in our store; what we
     /// announce. Peers that fetched the version announce the same one.
+    /// Empty while nothing is published (`epoch` 0).
     manifest_hash: String,
+    /// Key epoch the manifest (and every file blob) is encrypted under; 0
+    /// if not published, which happens when the daemon starts while it
+    /// waits for a revocation's rotated key. Only a version at or above
+    /// the required epoch is announced (`epochs::announceable`).
+    epoch: u64,
     /// Per-peer counters. Identifies the logical version across peers.
     clock: VectorClock,
     /// When this version was created. Tiebreaker for LWW conflict resolution.
@@ -1066,7 +1268,13 @@ fn persist(data_dir: &Path, share_id: &str, s: &ShareState) -> Result<()> {
 /// - content differs from persisted vhash → out-of-band edit; bump our counter
 ///
 /// Every case with content (re)publishes it to the blob store, which is a
-/// cache and may have been wiped.
+/// cache and may have been wiped, under the current key epoch.
+///
+/// While the keyring is below the required epoch (a revocation's rotated
+/// key hasn't arrived), nothing is encrypted: the persisted version comes
+/// back unpublished (`epoch` 0) and the share loop publishes it, and any
+/// out-of-band edit, once the key is here (`epochs::needs_republish`).
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_on_start(
     config: &ShareConfig,
     transfer: &Transfer,
@@ -1074,6 +1282,7 @@ async fn reconcile_on_start(
     data_dir: &Path,
     peer_id_hex: &str,
     key: &KeyRing,
+    required: u64,
     cache: &mut BlobCache,
 ) -> Result<Option<ShareState>> {
     let persisted = share_state::load(data_dir, &config.id)?;
@@ -1087,6 +1296,26 @@ async fn reconcile_on_start(
         return Ok(None);
     }
 
+    let epoch = key.current_epoch();
+    if !epochs::may_encrypt(epoch, required) {
+        tracing::info!(
+            share_id = %config.id,
+            have = epoch,
+            required,
+            "this share had a revocation and its rotated key hasn't arrived; \
+             nothing is published until it does"
+        );
+        return Ok(persisted.map(|p| ShareState {
+            version_hash: p.version_hash,
+            manifest_hash: String::new(),
+            epoch: 0,
+            clock: p.clock,
+            timestamp: p.timestamp,
+            manifest: from_hex_map(&p.files),
+            base: from_hex_map(&p.base),
+        }));
+    }
+
     let (disk_vh, manifest, files) = snapshot_content(root)?;
     let manifest_hash = transfer.publish(root, &files, key, cache).await?;
     cache.save(data_dir, &config.id)?;
@@ -1097,11 +1326,13 @@ async fn reconcile_on_start(
                 share_id = %config.id,
                 clock = ?p.clock.0,
                 version_hash = %disk_vh,
+                epoch,
                 "resumed at persisted clock"
             );
             return Ok(Some(ShareState {
                 version_hash: disk_vh,
                 manifest_hash,
+                epoch,
                 clock: p.clock,
                 timestamp: p.timestamp,
                 manifest,
@@ -1111,10 +1342,12 @@ async fn reconcile_on_start(
         Some(p) => {
             let mut clock = p.clock.clone();
             clock.increment(peer_id_hex);
-            tracing::info!(share_id = %config.id, clock = ?clock.0, "out-of-band edit detected; bumped clock");
+            tracing::info!(share_id = %config.id, clock = ?clock.0, epoch,
+                "out-of-band edit detected; bumped clock");
             ShareState {
                 version_hash: disk_vh,
                 manifest_hash,
+                epoch,
                 clock,
                 timestamp: Utc::now(),
                 manifest,
@@ -1124,10 +1357,12 @@ async fn reconcile_on_start(
         None => {
             let mut clock = VectorClock::new();
             clock.increment(peer_id_hex);
-            tracing::info!(share_id = %config.id, version_hash = %disk_vh, "first run: adopted local content");
+            tracing::info!(share_id = %config.id, version_hash = %disk_vh, epoch,
+                "first run: adopted local content");
             ShareState {
                 version_hash: disk_vh,
                 manifest_hash,
+                epoch,
                 clock,
                 timestamp: Utc::now(),
                 manifest,
@@ -1139,43 +1374,110 @@ async fn reconcile_on_start(
     Ok(Some(state))
 }
 
+/// What `publish_current` did.
+#[derive(Debug)]
+enum Published {
+    /// Nothing to do: no content, or the current version is on disk and
+    /// already published under the current key.
+    Unchanged,
+    /// There is something to publish, but the keyring is below the
+    /// required epoch: nothing was encrypted. The share loop tries again
+    /// once the key arrives.
+    Held { have: u64, required: u64 },
+    /// A new version (local change): the clock was bumped.
+    New(ShareState),
+    /// The same version (same version hash, clock and timestamp)
+    /// re-encrypted under the current key: a new manifest hash only.
+    Republished(ShareState),
+}
+
+/// Publish what is on disk: a new version if the content changed, or the
+/// current version again if it is encrypted under an older key epoch than
+/// the keyring's (after a rotation). Nothing is encrypted while the
+/// keyring is below `required`.
 #[allow(clippy::too_many_arguments)]
-async fn handle_local_change(
+async fn publish_current(
     config: &ShareConfig,
     transfer: &Transfer,
     root: &Path,
     data_dir: &Path,
     peer_id_hex: &str,
     key: &KeyRing,
+    required: u64,
     current: Option<&ShareState>,
     cache: &mut BlobCache,
-) -> Result<Option<ShareState>> {
+) -> Result<Published> {
     if !has_content(root)? {
-        return Ok(None);
+        return Ok(Published::Unchanged);
     }
     let (new_vhash, new_manifest, files) = snapshot_content(root)?;
     tracing::debug!(share_id = %config.id, files = files.len(), "snapshot taken");
-    if current
-        .map(|s| s.version_hash == new_vhash)
-        .unwrap_or(false)
-    {
-        return Ok(None);
+    let epoch = key.current_epoch();
+    let changed = current.is_none_or(|s| s.version_hash != new_vhash);
+    let stale = current.is_some_and(|s| s.epoch < epoch);
+    if !changed && !stale {
+        return Ok(Published::Unchanged);
+    }
+    if !epochs::may_encrypt(epoch, required) {
+        return Ok(Published::Held {
+            have: epoch,
+            required,
+        });
     }
     let manifest_hash = transfer.publish(root, &files, key, cache).await?;
-    tracing::debug!(share_id = %config.id, "published to the blob store");
+    tracing::debug!(share_id = %config.id, epoch, "published to the blob store");
     cache.save(data_dir, &config.id)?;
-    let mut clock = current.map(|s| s.clock.clone()).unwrap_or_default();
-    clock.increment(peer_id_hex);
-    let new_state = ShareState {
-        version_hash: new_vhash,
+    let next = next_state(
+        current,
+        new_vhash,
+        new_manifest,
         manifest_hash,
-        clock,
-        timestamp: Utc::now(),
-        manifest: new_manifest,
-        base: current.map(|s| s.base.clone()).unwrap_or_default(),
-    };
-    persist(data_dir, &config.id, &new_state)?;
-    Ok(Some(new_state))
+        epoch,
+        peer_id_hex,
+        Utc::now(),
+    );
+    persist(data_dir, &config.id, &next)?;
+    Ok(if changed {
+        Published::New(next)
+    } else {
+        Published::Republished(next)
+    })
+}
+
+/// The state after publishing `version_hash` as `manifest_hash` under
+/// `epoch`. Only a content change is a new version and bumps our clock
+/// counter; re-encrypting the same content keeps the clock and the
+/// timestamp, so peers that have it compare `Equal` and fetch nothing.
+fn next_state(
+    current: Option<&ShareState>,
+    version_hash: String,
+    manifest: FileMap,
+    manifest_hash: String,
+    epoch: u64,
+    peer_id_hex: &str,
+    now: DateTime<Utc>,
+) -> ShareState {
+    match current {
+        Some(s) if s.version_hash == version_hash => ShareState {
+            manifest_hash,
+            epoch,
+            manifest,
+            ..s.clone()
+        },
+        _ => {
+            let mut clock = current.map(|s| s.clock.clone()).unwrap_or_default();
+            clock.increment(peer_id_hex);
+            ShareState {
+                version_hash,
+                manifest_hash,
+                epoch,
+                clock,
+                timestamp: now,
+                manifest,
+                base: current.map(|s| s.base.clone()).unwrap_or_default(),
+            }
+        }
+    }
 }
 
 /// Snapshot a share's content: the version hash, the set of relative
@@ -1316,6 +1618,10 @@ struct FetchDone {
 /// the keyring (a read lock held across the fetch would block a rotation
 /// from installing). The result comes back on `tx`, tagged with a fresh
 /// generation.
+/// `min_epoch` is the required epoch when the fetch starts; the loop
+/// checks the staged version again at commit time against the required
+/// epoch then.
+#[allow(clippy::too_many_arguments)]
 async fn start_fetch(
     generation: &mut u64,
     remote: RemoteVersion,
@@ -1323,6 +1629,7 @@ async fn start_fetch(
     transfer: &Arc<Transfer>,
     root: &Path,
     key: &Arc<RwLock<KeyRing>>,
+    min_epoch: u64,
     tx: &mpsc::Sender<FetchDone>,
 ) -> FetchTask {
     *generation += 1;
@@ -1348,6 +1655,7 @@ async fn start_fetch(
                 &remote.version_hash,
                 &root,
                 &key,
+                min_epoch,
             ),
         )
         .await
@@ -1400,6 +1708,7 @@ fn commit_remote(
     me_short: &str,
 ) -> Result<(ShareState, bool)> {
     let incoming: FileMap = staged.files.iter().cloned().collect();
+    let epoch = staged.epoch;
     let empty = FileMap::new();
     let (recorded, base) = current
         .map(|s| (&s.manifest, &s.base))
@@ -1461,6 +1770,7 @@ fn commit_remote(
         ShareState {
             version_hash: remote.version_hash.clone(),
             manifest_hash: remote.manifest.clone(),
+            epoch,
             clock,
             timestamp: remote.timestamp,
             base: incoming.clone(),
@@ -1605,16 +1915,27 @@ async fn sleep_until_due(due: Option<tokio::time::Instant>) {
     }
 }
 
-/// Announce `state`, signed, if we may: Readers' changes stay local.
+/// Announce `state`, signed, if we may: Readers' changes stay local, and
+/// so does a version under a key epoch below `required` (it waits to be
+/// re-encrypted once the rotated key arrives).
 async fn publish_sync_announce(
     handle: &GossipHandle,
     state: &ShareState,
     identity: &SigningKey,
     group_id: MemberId,
     auth_state: &AuthState,
+    required: u64,
 ) {
     if !announce::may_publish(auth_state, group_id, identity) {
         tracing::debug!("not a Writer or Owner of this share; not announcing");
+        return;
+    }
+    if !epochs::announceable(state.epoch, required) {
+        tracing::debug!(
+            epoch = state.epoch,
+            required,
+            "current version is under an old key epoch; not announcing"
+        );
         return;
     }
     let ann = Announce::sign(
@@ -1691,9 +2012,17 @@ async fn apply_key_rotation(
     rotation_buffer: &mut Vec<SignedRotation>,
     data_dir: &Path,
     share_id: &str,
+    epoch_floor: &mut u64,
 ) -> Result<()> {
     match try_install_rotation(
-        &rotation, auth_state, group_id, identity, key, data_dir, share_id,
+        &rotation,
+        auth_state,
+        group_id,
+        identity,
+        key,
+        data_dir,
+        share_id,
+        epoch_floor,
     )
     .await?
     {
@@ -1707,6 +2036,7 @@ async fn apply_key_rotation(
                 rotation_buffer,
                 data_dir,
                 share_id,
+                epoch_floor,
             )
             .await;
         }
@@ -1725,6 +2055,7 @@ enum AppliedOrBuffered {
     Buffered,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_install_rotation(
     rotation: &SignedRotation,
     auth_state: &AuthState,
@@ -1733,6 +2064,7 @@ async fn try_install_rotation(
     key: &Arc<RwLock<KeyRing>>,
     data_dir: &Path,
     share_id: &str,
+    epoch_floor: &mut u64,
 ) -> Result<AppliedOrBuffered> {
     match rotation::verify_and_decrypt(rotation, auth_state, group_id, identity) {
         VerifyOutcome::OkForUs(new_key) => {
@@ -1774,6 +2106,24 @@ async fn try_install_rotation(
                         "rotation epoch ahead of local keyring; buffering");
                     Ok(AppliedOrBuffered::Buffered)
                 }
+                InstallOutcome::Conflict { epoch } => {
+                    // Two Owners minted different keys for one epoch (a
+                    // concurrent revocation or rotation). One of them may
+                    // have gone to a member the other was revoking, so
+                    // neither is trusted for new content: the next epoch
+                    // is required. Fail closed until an Owner rotates.
+                    *epoch_floor = crypto::raise_epoch_floor(data_dir, share_id, epoch + 1)
+                        .with_context(|| format!("raising the epoch floor of share {share_id}"))?;
+                    tracing::error!(
+                        share_id = %share_id,
+                        epoch,
+                        rotator = %rotation.rotator_pubkey.to_hex(),
+                        floor = *epoch_floor,
+                        "two different keys for one epoch (concurrent rotations by Owners); \
+                         new content waits for a newer key: an Owner should run share-rotate-key"
+                    );
+                    Ok(AppliedOrBuffered::Idempotent)
+                }
             }
         }
         VerifyOutcome::NotForUs => {
@@ -1800,6 +2150,7 @@ async fn try_install_rotation(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drain_rotation_buffer(
     auth_state: &AuthState,
     group_id: MemberId,
@@ -1808,6 +2159,7 @@ async fn drain_rotation_buffer(
     rotation_buffer: &mut Vec<SignedRotation>,
     data_dir: &Path,
     share_id: &str,
+    epoch_floor: &mut u64,
 ) {
     loop {
         if rotation_buffer.is_empty() {
@@ -1818,7 +2170,14 @@ async fn drain_rotation_buffer(
         rotation_buffer.sort_by_key(|r| r.epoch);
         let candidate = rotation_buffer.remove(0);
         match try_install_rotation(
-            &candidate, auth_state, group_id, identity, key, data_dir, share_id,
+            &candidate,
+            auth_state,
+            group_id,
+            identity,
+            key,
+            data_dir,
+            share_id,
+            epoch_floor,
         )
         .await
         {
@@ -1929,6 +2288,7 @@ mod tests {
             me_of(&bob),
             AuthRole::Writer,
             ShareRole::Sync,
+            0,
         )
         .await
         .unwrap();
@@ -1955,6 +2315,7 @@ mod tests {
             me_of(&bob),
             AuthRole::Writer,
             ShareRole::Sync,
+            0,
         )
         .await
         .unwrap();
@@ -1968,6 +2329,7 @@ mod tests {
             &mut auth_state,
             &mut pending,
             me_of(&bob),
+            0,
         )
         .await
         .unwrap();
@@ -2091,6 +2453,7 @@ mod tests {
         ShareState {
             version_hash: "cc".repeat(32),
             manifest_hash: "dd".repeat(32),
+            epoch: 1,
             clock: VectorClock::new(),
             timestamp: at(),
             manifest,
@@ -2230,11 +2593,244 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rotate_key_handler_appends_epoch() {
-        let (td, config, _identity, _auth_state, key) = bootstrap("rotate-1");
+    async fn rotate_key_handler_appends_epoch_and_sends_it_to_the_members() {
+        let (td, config, identity, mut auth_state, key) = bootstrap("rotate-1");
+        let bob = SigningKey::generate();
+        handle_invite(
+            &config,
+            td.path(),
+            &identity,
+            &key,
+            &mut auth_state,
+            me_of(&bob),
+            AuthRole::Reader,
+            ShareRole::Sync,
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(key.read().await.current_epoch(), 1);
-        let new_epoch = handle_rotate_key(&config, td.path(), &key).await.unwrap();
+        let mut pending = Vec::new();
+        let new_epoch = handle_rotate_key(
+            &config,
+            td.path(),
+            &identity,
+            &key,
+            &auth_state,
+            &mut pending,
+            0,
+        )
+        .await
+        .unwrap();
         assert_eq!(new_epoch, 2);
         assert_eq!(key.read().await.current_epoch(), 2);
+        // Bob gets the new key; it is queued on disk and in memory.
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].epoch, 2);
+        let group = group_id_for(&config.id);
+        match rotation::verify_and_decrypt(&pending[0], &auth_state, group, &bob) {
+            VerifyOutcome::OkForUs(k) => {
+                assert_eq!(&k, key.read().await.key_for_epoch(2).unwrap())
+            }
+            other => panic!("expected OkForUs, got {other:?}"),
+        }
+        assert_eq!(
+            rotation::load_pending(td.path(), &config.id).unwrap().len(),
+            1
+        );
+        // A rotation is not a removal.
+        assert_eq!(auth_state.required_epoch(), 1);
+    }
+
+    #[tokio::test]
+    async fn only_owners_rotate() {
+        let (td, config, identity, mut auth_state, key) = bootstrap("rotate-owner");
+        let bob = SigningKey::generate();
+        let group = group_id_for(&config.id);
+        auth_state
+            .add_member(&identity, group, me_of(&bob), AuthRole::Writer)
+            .unwrap();
+        let err = handle_rotate_key(
+            &config,
+            td.path(),
+            &bob,
+            &key,
+            &auth_state,
+            &mut Vec::new(),
+            0,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Owner"), "{err}");
+        assert_eq!(key.read().await.current_epoch(), 1);
+    }
+
+    /// An Owner that knows of a removal but hasn't got its rotated key
+    /// must not revoke, rotate or invite: a revocation would mint a second
+    /// epoch-2 key, and nothing may be authored without its rotation.
+    #[tokio::test]
+    async fn an_owner_behind_on_keys_refuses_to_mint_or_invite() {
+        let (td, config, identity, mut auth_state, key) = bootstrap("behind");
+        let group = group_id_for(&config.id);
+        let (bob, carol, dave) = (
+            SigningKey::generate(),
+            SigningKey::generate(),
+            SigningKey::generate(),
+        );
+        for m in [&bob, &carol] {
+            auth_state
+                .add_member(&identity, group, me_of(m), AuthRole::Writer)
+                .unwrap();
+        }
+        // Another Owner's removal arrived; its key (epoch 2) didn't.
+        auth_state
+            .remove_member(&identity, group, me_of(&bob))
+            .unwrap();
+        assert_eq!(auth_state.required_epoch(), 2);
+        let ops_before = auth_state.ops().len();
+
+        let err = handle_revoke(
+            &config,
+            td.path(),
+            &identity,
+            &key,
+            &mut auth_state,
+            &mut Vec::new(),
+            me_of(&carol),
+            0,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("fork"), "{err}");
+        assert_eq!(
+            auth_state.ops().len(),
+            ops_before,
+            "no Remove without a rotation"
+        );
+        assert!(auth_state.is_member(group, me_of(&carol)));
+        assert_eq!(key.read().await.current_epoch(), 1);
+
+        let err = handle_invite(
+            &config,
+            td.path(),
+            &identity,
+            &key,
+            &mut auth_state,
+            me_of(&dave),
+            AuthRole::Writer,
+            ShareRole::Sync,
+            0,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("epoch 2"), "{err}");
+        assert!(!auth_state.is_member(group, me_of(&dave)));
+
+        // A rotation to epoch 2 is allowed: it is what heals a fork, and
+        // here it gives this node the epoch the removal requires.
+        let epoch = handle_rotate_key(
+            &config,
+            td.path(),
+            &identity,
+            &key,
+            &auth_state,
+            &mut Vec::new(),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(epoch, 2);
+        // A fork floor of 4 still refuses a revocation from epoch 2.
+        assert!(handle_revoke(
+            &config,
+            td.path(),
+            &identity,
+            &key,
+            &mut auth_state,
+            &mut Vec::new(),
+            me_of(&carol),
+            4,
+        )
+        .await
+        .is_err());
+    }
+
+    fn shared_state(epoch: u64) -> ShareState {
+        let mut s = state(files(&[("a.txt", b"v1")]), FileMap::new());
+        s.clock.increment(&"aa".repeat(32));
+        s.epoch = epoch;
+        s
+    }
+
+    #[test]
+    fn republishing_unchanged_content_keeps_the_clock() {
+        let current = shared_state(1);
+        let later = at() + chrono::TimeDelta::hours(1);
+        let next = next_state(
+            Some(&current),
+            current.version_hash.clone(),
+            current.manifest.clone(),
+            "ee".repeat(32),
+            2,
+            &"bb".repeat(32),
+            later,
+        );
+        assert_eq!(next.clock, current.clock, "no clock bump");
+        assert_eq!(
+            next.timestamp, current.timestamp,
+            "same version, same timestamp"
+        );
+        assert_eq!(next.version_hash, current.version_hash);
+        assert_eq!(next.base, current.base);
+        assert_eq!(next.epoch, 2);
+        assert_eq!(next.manifest_hash, "ee".repeat(32));
+        // Peers that have the version compare it Equal: nothing to fetch.
+        let as_remote = RemoteVersion {
+            manifest: next.manifest_hash.clone(),
+            provider: "bb".repeat(32),
+            version_hash: next.version_hash.clone(),
+            clock: next.clock.clone(),
+            timestamp: next.timestamp,
+        };
+        assert!(matches!(
+            judge("s", Some(&current), &as_remote),
+            Verdict::Ignore
+        ));
+    }
+
+    #[test]
+    fn a_content_change_is_a_new_version() {
+        let current = shared_state(1);
+        let me = "bb".repeat(32);
+        let later = at() + chrono::TimeDelta::hours(1);
+        let next = next_state(
+            Some(&current),
+            "ff".repeat(32),
+            files(&[("a.txt", b"v2")]),
+            "ee".repeat(32),
+            2,
+            &me,
+            later,
+        );
+        assert_eq!(next.clock.0.get(&me), Some(&1));
+        assert_eq!(
+            current.clock.compare(&next.clock),
+            ClockOrdering::OtherDominates
+        );
+        assert_eq!(next.timestamp, later);
+        // First publish ever.
+        let first = next_state(
+            None,
+            "ff".repeat(32),
+            FileMap::new(),
+            "ee".repeat(32),
+            1,
+            &me,
+            later,
+        );
+        assert_eq!(first.clock.0.get(&me), Some(&1));
     }
 }

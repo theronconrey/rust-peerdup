@@ -129,11 +129,17 @@ pub enum InstallOutcome {
     Installed,
     /// Epoch already present with the same key bytes; no-op.
     Idempotent,
-    /// Epoch is older than `current_epoch`; silently dropped.
+    /// Epoch is older than `current_epoch`, and our key for it is the same;
+    /// silently dropped.
     Stale,
     /// Epoch is more than one ahead of `current_epoch`; caller should buffer
     /// and retry once the missing epochs have been installed.
     Gap { have: u64, got: u64 },
+    /// We already hold a *different* key for this epoch: two Owners rotated
+    /// concurrently and the epoch forked. Nothing is changed; the caller
+    /// raises the share's epoch floor (`raise_epoch_floor`), since one of
+    /// the two keys may have gone to a member that was being revoked.
+    Conflict { epoch: u64 },
 }
 
 /// Install a key for a specific epoch, received out-of-band (e.g. via a
@@ -148,18 +154,19 @@ pub fn install_epoch_key(
 ) -> Result<InstallOutcome> {
     let mut ring = load_or_create_keyring(data_dir, share_id)?;
     let current = ring.current_epoch();
-    if epoch == current {
+    if epoch == 0 {
+        return Err(anyhow!("epoch 0 does not exist; epochs start at 1"));
+    }
+    if epoch <= current {
         let existing = ring
             .key_for_epoch(epoch)
-            .expect("current_epoch always has a key");
-        if existing == key {
+            .expect("every epoch up to current has a key");
+        if existing != key {
+            return Ok(InstallOutcome::Conflict { epoch });
+        }
+        if epoch == current {
             return Ok(InstallOutcome::Idempotent);
         }
-        return Err(anyhow!(
-            "epoch {epoch} already populated with a different key"
-        ));
-    }
-    if epoch < current {
         return Ok(InstallOutcome::Stale);
     }
     if epoch > current + 1 {
@@ -172,6 +179,55 @@ pub fn install_epoch_key(
     ring.keys.push(*key);
     save_keyring(data_dir, share_id, &ring)?;
     Ok(InstallOutcome::Installed)
+}
+
+fn floor_path(data_dir: &Path, share_id: &str) -> PathBuf {
+    data_dir::shares_dir(data_dir)
+        .join(share_id)
+        .join("epoch_floor")
+}
+
+/// The share's epoch floor: the lowest key epoch new content may use
+/// because a fork was seen below it (`InstallOutcome::Conflict`). 0 when no
+/// fork was ever seen. See `epochs::required`.
+pub fn load_epoch_floor(data_dir: &Path, share_id: &str) -> u64 {
+    let path = floor_path(data_dir, share_id);
+    match fs::read_to_string(&path) {
+        Ok(s) => s.trim().parse().unwrap_or_else(|_| {
+            // Fail closed: an unreadable floor freezes new content until
+            // an Owner rotates, rather than silently forgetting a fork.
+            tracing::warn!(?path, "unreadable epoch floor; treating it as very high");
+            u64::MAX
+        }),
+        Err(_) => 0,
+    }
+}
+
+/// Raise the share's epoch floor to `floor` (never lowers it) and return
+/// the floor now in force.
+pub fn raise_epoch_floor(data_dir: &Path, share_id: &str, floor: u64) -> Result<u64> {
+    let current = load_epoch_floor(data_dir, share_id);
+    if floor <= current {
+        return Ok(current);
+    }
+    let path = floor_path(data_dir, share_id);
+    crate::data_dir::write_private_atomic(&path, format!("{floor}\n").as_bytes())
+        .with_context(|| format!("writing {path:?}"))?;
+    Ok(floor)
+}
+
+/// The key epoch a ciphertext blob claims, from its 8-byte header. The
+/// claim is only trustworthy after the blob decrypts: the epoch selects the
+/// key, so a relabelled blob fails authentication. Callers that refuse a
+/// blob on its epoch alone (`transfer::check_version_epochs`) refuse
+/// before decrypting, which is safe: refusing never needs the claim to be
+/// true.
+pub fn epoch_of(blob: &[u8]) -> Result<u64> {
+    let header: [u8; EPOCH_LEN] = blob
+        .get(..EPOCH_LEN)
+        .and_then(|h| h.try_into().ok())
+        .ok_or_else(|| anyhow!("blob too short ({} bytes) for an epoch header", blob.len()))?;
+    Ok(u64::from_le_bytes(header))
 }
 
 /// Encrypt with the keyring's current key. Output: `epoch(8 LE) ‖ nonce(24) ‖ ct ‖ tag(16)`.
@@ -203,9 +259,7 @@ pub fn decrypt(ring: &KeyRing, blob: &[u8]) -> Result<Vec<u8>> {
             HEADER_LEN + TAG_LEN
         ));
     }
-    let mut epoch_bytes = [0u8; EPOCH_LEN];
-    epoch_bytes.copy_from_slice(&blob[..EPOCH_LEN]);
-    let epoch = u64::from_le_bytes(epoch_bytes);
+    let epoch = epoch_of(blob)?;
     let key = ring.key_for_epoch(epoch).ok_or_else(|| {
         anyhow!(
             "no key for epoch {} (keyring has {} epoch{})",
@@ -345,16 +399,17 @@ mod tests {
     }
 
     #[test]
-    fn install_epoch_key_rejects_overwrite() {
+    fn install_epoch_key_reports_a_fork_and_keeps_our_key() {
         let td = fresh_ring_on_disk("share-install-3");
+        let ours = *load_or_create_keyring(td.path(), "share-install-3")
+            .unwrap()
+            .key_for_epoch(1)
+            .unwrap();
         let mismatched = [0xABu8; KEY_LEN];
-        let err = install_epoch_key(td.path(), "share-install-3", 1, &mismatched)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("epoch 1 already populated"),
-            "unexpected error: {err}"
-        );
+        let outcome = install_epoch_key(td.path(), "share-install-3", 1, &mismatched).unwrap();
+        assert_eq!(outcome, InstallOutcome::Conflict { epoch: 1 });
+        let ring = load_or_create_keyring(td.path(), "share-install-3").unwrap();
+        assert_eq!(ring.key_for_epoch(1).unwrap(), &ours);
     }
 
     #[test]
@@ -376,13 +431,43 @@ mod tests {
         let new_epoch = rotate_keyring(td.path(), "share-install-5").unwrap();
         assert_eq!(new_epoch, 2);
 
-        let stale = [0x55u8; KEY_LEN];
-        let outcome = install_epoch_key(td.path(), "share-install-5", 1, &stale).unwrap();
+        let ring = load_or_create_keyring(td.path(), "share-install-5").unwrap();
+        let epoch1 = *ring.key_for_epoch(1).unwrap();
+        let outcome = install_epoch_key(td.path(), "share-install-5", 1, &epoch1).unwrap();
         assert_eq!(outcome, InstallOutcome::Stale);
+
+        // A different key for an older epoch is a fork, not stale.
+        let other = [0x55u8; KEY_LEN];
+        let outcome = install_epoch_key(td.path(), "share-install-5", 1, &other).unwrap();
+        assert_eq!(outcome, InstallOutcome::Conflict { epoch: 1 });
 
         // Disk still has the original epoch-1 key (overwrite didn't happen).
         let ring = load_or_create_keyring(td.path(), "share-install-5").unwrap();
         assert_eq!(ring.current_epoch(), 2);
-        assert_ne!(ring.key_for_epoch(1).unwrap(), &stale);
+        assert_eq!(ring.key_for_epoch(1).unwrap(), &epoch1);
+    }
+
+    #[test]
+    fn epoch_of_reads_the_header_only() {
+        let r = ring_with(3);
+        let ct = encrypt(&r, b"x").unwrap();
+        assert_eq!(epoch_of(&ct).unwrap(), 3);
+        // Only the header is parsed: a truncated blob still has an epoch,
+        // a blob shorter than the header has none.
+        assert_eq!(epoch_of(&ct[..EPOCH_LEN]).unwrap(), 3);
+        assert!(epoch_of(&ct[..EPOCH_LEN - 1]).is_err());
+        assert!(epoch_of(&[]).is_err());
+    }
+
+    #[test]
+    fn epoch_floor_only_rises() {
+        let td = TmpDir::new("floor");
+        assert_eq!(load_epoch_floor(td.path(), "s"), 0);
+        std::fs::create_dir_all(crate::data_dir::shares_dir(td.path()).join("s")).unwrap();
+        assert_eq!(raise_epoch_floor(td.path(), "s", 3).unwrap(), 3);
+        assert_eq!(raise_epoch_floor(td.path(), "s", 2).unwrap(), 3);
+        assert_eq!(load_epoch_floor(td.path(), "s"), 3);
+        assert_eq!(raise_epoch_floor(td.path(), "s", 5).unwrap(), 5);
+        assert_eq!(load_epoch_floor(td.path(), "s"), 5);
     }
 }

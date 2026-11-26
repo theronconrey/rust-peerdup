@@ -525,6 +525,34 @@ impl AuthState {
         }
     }
 
+    /// Removals in effect: `Remove` ops in the log that p2panda-auth's
+    /// strong-remove resolver didn't filter out. A filtered op (say, one a
+    /// removed Owner authored concurrently with, or backdated before, its
+    /// own removal) never took effect, so it isn't counted; otherwise a
+    /// revoked Owner could raise the count at will and freeze the share. An
+    /// op in a mutual-remove cycle is in the filter too but does take
+    /// effect (everyone in the cycle is removed), so it counts.
+    pub fn removals(&self) -> u64 {
+        let inner = &self.crdt.inner;
+        self.ops
+            .iter()
+            .filter(|op| matches!(op.payload.action, GroupAction::Remove { .. }))
+            .map(|op| op.id())
+            .filter(|id| !inner.ignore.contains(id) || inner.mutual_removes.contains(id))
+            .count() as u64
+    }
+
+    /// The lowest key epoch new content may be encrypted under, as far as
+    /// this node's view of the membership goes: `1 + removals()`. Every
+    /// revocation rotates the key once (`share-revoke`, daemon and direct
+    /// mode), so after `n` removals keys up to epoch `n` are held by at
+    /// least one removed member. Demotions don't count: a demoted member
+    /// keeps read access. See `epochs::required` for the floor that a key
+    /// fork adds, and INTEGRATION_NOTES.md, "Old keys after revocation".
+    pub fn required_epoch(&self) -> u64 {
+        1 + self.removals()
+    }
+
     pub fn members(&self, group_id: MemberId) -> Vec<(MemberId, AuthRole)> {
         self.crdt
             .members(group_id)
@@ -895,6 +923,75 @@ mod tests {
         state.remove_member(&alice, group, me_of(&bob)).unwrap();
         assert!(!state.is_member(group, me_of(&bob)));
         assert!(state.is_member(group, me_of(&alice)));
+    }
+
+    #[test]
+    fn required_epoch_counts_removals() {
+        let alice = fresh_key();
+        let (bob, carol) = (fresh_key(), fresh_key());
+        let group = group_id_for("share-required");
+        let mut state = AuthState::empty_for(group);
+        state.create_group(&alice, group).unwrap();
+        assert_eq!(state.required_epoch(), 1, "create");
+        state
+            .add_member(&alice, group, me_of(&bob), AuthRole::Writer)
+            .unwrap();
+        state
+            .add_member(&alice, group, me_of(&carol), AuthRole::Reader)
+            .unwrap();
+        assert_eq!(state.required_epoch(), 1, "add, add");
+        state.remove_member(&alice, group, me_of(&bob)).unwrap();
+        assert_eq!(state.required_epoch(), 2, "remove");
+        state
+            .add_member(&alice, group, me_of(&bob), AuthRole::Writer)
+            .unwrap();
+        assert!(state.is_member(group, me_of(&bob)));
+        assert_eq!(state.required_epoch(), 2, "remove, re-add");
+        state.remove_member(&alice, group, me_of(&carol)).unwrap();
+        assert_eq!(state.required_epoch(), 3, "second remove");
+
+        // A peer replaying the log reaches the same number.
+        let mut replica = AuthState::empty_for(group);
+        for op in state.ops() {
+            replica.apply_remote(op.clone()).unwrap();
+        }
+        assert_eq!(replica.required_epoch(), 3);
+    }
+
+    /// A removed Owner can still sign ops whose deps predate its removal;
+    /// they validate at those deps. The resolver filters them, and they
+    /// must not count, or a revoked Owner could freeze the share by
+    /// raising the required epoch past every key.
+    #[test]
+    fn a_removed_owners_backdated_removal_does_not_count() {
+        let alice = fresh_key();
+        let (mallory, carol) = (fresh_key(), fresh_key());
+        let group = group_id_for("share-backdated");
+        let mut state = AuthState::empty_for(group);
+        state.create_group(&alice, group).unwrap();
+        state
+            .add_member(&alice, group, me_of(&mallory), AuthRole::Owner)
+            .unwrap();
+        state
+            .add_member(&alice, group, me_of(&carol), AuthRole::Writer)
+            .unwrap();
+        let before: Vec<OpId> = state.crdt.inner.heads().into_iter().collect();
+        state.remove_member(&alice, group, me_of(&mallory)).unwrap();
+        assert_eq!(state.required_epoch(), 2);
+
+        let backdated = forge(
+            &mallory,
+            before,
+            GroupAction::Remove {
+                member: GroupMember::Individual(me_of(&carol)),
+            },
+            group,
+        );
+        // Applied and filtered, or refused: either way it changes nothing.
+        let _ = state.apply_remote(backdated);
+        assert_eq!(state.required_epoch(), 2);
+        assert!(state.is_member(group, me_of(&carol)));
+        assert!(!state.is_member(group, me_of(&mallory)));
     }
 
     #[test]

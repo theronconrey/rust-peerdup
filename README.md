@@ -42,7 +42,7 @@ writing:
 | 5a. Invite/join via copy-paste tickets | ✅ Done |
 | 5b. Peer activity listing (`share peers`) | ✅ Done |
 | 5c. `p2panda-auth` group CRDT integration | ✅ Done |
-| 5d. Auto key rotation on revocation | ✅ Done |
+| 5d. Auto key rotation on revocation | ✅ Done; new versions under pre-revocation keys are refused and the current version is re-encrypted |
 | 5e. 4-peer revocation e2e test | ✅ Done |
 | Write permission enforced on sync announces (readers, revoked members) | ✅ Done (signed announces) |
 | 7. D-Bus IPC surface | ⚠️ Partial: CLI talks to the daemon over `org.peerdup.Daemon1`; no signals yet |
@@ -147,6 +147,12 @@ rust-peerdup share-members <share-id>
 rust-peerdup share-revoke  <share-id> <peer-pubkey-hex>
 ```
 
+A revocation rotates the share key and sends the new key to the remaining
+members. Until a member has it, that member publishes nothing new, and no
+member accepts new content encrypted under an older key. Members that are
+offline during a revocation still trust the revoked peer until they hear of
+it (see `SECURITY.md`).
+
 ## D-Bus IPC
 
 Since Phase 7, the daemon exposes its API on the user session bus as
@@ -194,6 +200,7 @@ src/
 ├── crypto.rs         KeyRing + XChaCha20-Poly1305 encryption
 ├── auth.rs           Membership CRDT (p2panda-auth) + signed op log
 ├── rotation.rs       Phase 5d signed sealed-box key rotation envelopes
+├── epochs.rs         Which key epochs new content may use after a revocation
 ├── ticket.rs         Invite ticket encode/decode
 ├── identity.rs       Ed25519 identity load/persist
 ├── data_dir.rs       Path resolution
@@ -215,7 +222,7 @@ three against the binary from the RPM):
 
 ```bash
 tests/e2e-sync.sh   target/debug/rust-peerdup   # two peers, one network
-tests/e2e-revoke.sh target/debug/rust-peerdup   # owner, writer, reader; revoke
+tests/e2e-revoke.sh target/debug/rust-peerdup   # owner, writers, reader; revoke; old keys
 tests/e2e-xnet.sh   target/debug/rust-peerdup   # two isolated networks (docker)
 ```
 
