@@ -2006,13 +2006,13 @@ mod tests {
         let mut local = state(FileMap::new(), FileMap::new());
         local.clock = ours.clone();
         local.timestamp = at() + chrono::TimeDelta::seconds(1);
-        let remote = RemoteVersion {
+        let theirs_remote = RemoteVersion {
             clock: theirs.clone(),
             ..remote()
         };
         // We are later: we win and change nothing.
         assert!(matches!(
-            judge("s", Some(&local), &remote),
+            judge("s", Some(&local), &theirs_remote),
             Verdict::LocalWins
         ));
         // The other side, earlier, sees our version as concurrent (not
