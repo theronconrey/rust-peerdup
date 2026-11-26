@@ -144,10 +144,14 @@ wait_for "C learns over gossip that B was revoked" c_dropped_b
 wait_for "C installs the rotated key" c_rotated
 # C ran throughout; B was only a member of this share, so C blocks it and
 # closes the connections B has open to it, not just new ones.
-c_cut_b() { grep "no longer a member of any share" "$SCRATCH/c.log" | grep -q "node=$pub_b"; }
+# (Field names are coloured in the log, hence the sed.)
+cut_b_lines() {
+    sed -e 's/\x1b\[[0-9;]*m//g' "$SCRATCH/c.log" \
+        | grep "no longer a member of any share" | grep "node=$pub_b"
+}
+c_cut_b() { cut_b_lines | grep -q .; }
 wait_for "C cuts B off once it learns of the revocation" c_cut_b
-grep "no longer a member of any share" "$SCRATCH/c.log" | grep "node=$pub_b" | head -1 \
-    | cut -c1-220 | sed 's/^/    /'
+cut_b_lines | head -1 | cut -c1-220 | sed 's/^/    /'
 
 info "A adds a file after the revocation"
 echo "after revoking B" > "$(root a)/secret.txt"

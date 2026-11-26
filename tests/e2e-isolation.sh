@@ -95,8 +95,10 @@ has() { grep -q "$2" "$(root "$1")/$3" 2>/dev/null; }
 exists() { test -e "$(root "$1")/$2"; }
 # The id of the share of daemon $1 whose folder is $2 (share-list: ID ROLE NAME PATH).
 id_of() { pd "$1" share-list | awk -v p="$2" 'NR > 1 && $4 == p {print $1}'; }
+# Daemon $1's log without colour codes (tracing colours field names).
+plain() { sed -e 's/\x1b\[[0-9;]*m//g' "$SCRATCH/$1.log" 2>/dev/null; }
 # Log lines of daemon $1 that contain both $2 and $3.
-lines() { grep -F -- "$2" "$SCRATCH/$1.log" 2>/dev/null | grep -F -- "$3" || true; }
+lines() { plain "$1" | grep -F -- "$2" | grep -F -- "$3" || true; }
 count() { lines "$@" | grep -c . || true; }
 
 export RUST_LOG="${RUST_LOG:-rust_peerdup=info}"
