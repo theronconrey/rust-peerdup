@@ -296,6 +296,16 @@ pub async fn spawn_share_task(
         Ok(s) => s,
         Err(e) => return Err(e.context("loading auth log")),
     };
+    if auth_state.is_empty() {
+        // Without its Create op nobody is a member, and the first op that
+        // arrived over gossip would define the group. A share gets its log
+        // from share-add or from a ticket; anything else is damage.
+        return Err(anyhow!(
+            "share {} has no auth log ({}); remove it and join again from a fresh ticket",
+            config.id,
+            auth::auth_log_path(&rt.data_dir, &config.id).display()
+        ));
+    }
     let pending_rotations = match rotation::load_pending(&rt.data_dir, &config.id) {
         Ok(p) => p,
         Err(e) => {
@@ -1579,7 +1589,7 @@ mod tests {
         let config = ShareConfig::new(topic, td.path().join("share-root"), ShareRole::Sync);
         config.save(td.path()).unwrap();
         let group = group_id_for(&config.id);
-        let mut auth_state = AuthState::empty();
+        let mut auth_state = AuthState::empty_for(group);
         auth_state.create_group(&identity, group).unwrap();
         auth::save(td.path(), &config.id, &auth_state).unwrap();
         let ring = crypto::load_or_create_keyring(td.path(), &config.id).unwrap();

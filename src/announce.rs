@@ -153,7 +153,7 @@ mod tests {
         let writer = SigningKey::generate();
         let reader = SigningKey::generate();
         let group = group_id_for("announce-test");
-        let mut state = AuthState::empty();
+        let mut state = AuthState::empty_for(group);
         state.create_group(&owner, group).unwrap();
         state
             .add_member(&owner, group, me(&writer), AuthRole::Writer)
