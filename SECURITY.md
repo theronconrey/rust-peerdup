@@ -34,12 +34,11 @@ fixes.
 These are known and tracked, so they don't need a report (new angles on
 them do):
 
-- Daemons on different machines don't sync yet (each announces a loopback
-  address).
-- Sync announces are not signed and write permission is not enforced on
-  them, so a revoked member or a reader can still push changes.
-- File names and sizes are visible to anyone in the BitTorrent swarm; file
-  contents are encrypted.
+- By default peers that can't connect directly meet through n0's public
+  relays, which see who talks to whom (not what). `--relay-url` changes
+  this.
+- Concurrent edits to the same file resolve by last-writer-wins; the
+  other side's change is lost, not kept as a conflict copy.
 - Some vendored crates bring their own crypto and CA list instead of
   following Fedora's crypto-policies (CONTRIBUTING.md, section 3).
 

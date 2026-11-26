@@ -7,9 +7,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-/// Current ticket schema version. Bumped to 2 in Phase 5c when the auth-log
-/// snapshot was added; v1 tickets are no longer accepted.
-pub const TICKET_VERSION: u8 = 2;
+/// Current ticket schema version. 2 added the auth-log snapshot (Phase 5c);
+/// 3 added the inviter's network address. Older tickets are refused.
+pub const TICKET_VERSION: u8 = 3;
 
 /// A share invitation. Contains everything a receiving peer needs to join
 /// the share locally: the topic (so gossip lines up), the per-share keyring
@@ -46,6 +46,10 @@ pub struct Ticket {
     /// Transport role the inviter suggests for this peer (Seed/Leech/Sync).
     /// Distinct from the auth-level role inside `auth_log`.
     pub role: ShareRole,
+    /// The inviter's iroh address (node id, home relay, direct addresses)
+    /// when its daemon has run, so the joiner can reach it on another
+    /// network. Kept as the share's bootstrap peer (`bootstrap.rs`).
+    pub inviter_addr: Option<p2panda_net::iroh_endpoint::EndpointAddr>,
 }
 
 impl Ticket {
@@ -91,11 +95,11 @@ impl Ticket {
 mod tests {
     use super::*;
     use crate::auth::{group_id_for, AuthRole, AuthState, MemberId};
-    use p2panda_core::PrivateKey;
+    use p2panda_core::SigningKey;
 
-    fn make_log() -> (PrivateKey, PrivateKey, Vec<SignedOp>) {
-        let alice = PrivateKey::new();
-        let bob = PrivateKey::new();
+    fn make_log() -> (SigningKey, SigningKey, Vec<SignedOp>) {
+        let alice = SigningKey::generate();
+        let bob = SigningKey::generate();
         let group = group_id_for("ticket-test");
         let mut state = AuthState::empty();
         state.create_group(&alice, group).unwrap();
@@ -103,7 +107,7 @@ mod tests {
             .add_member(
                 &alice,
                 group,
-                MemberId(*bob.public_key().as_bytes()),
+                MemberId(*bob.verifying_key().as_bytes()),
                 AuthRole::Writer,
             )
             .unwrap();
@@ -119,8 +123,9 @@ mod tests {
             topic: "demo".into(),
             keys: vec![[1u8; KEY_LEN], [2u8; KEY_LEN]],
             auth_log: log.clone(),
-            invitee_pubkey: *bob.public_key().as_bytes(),
+            invitee_pubkey: *bob.verifying_key().as_bytes(),
             role: ShareRole::Sync,
+            inviter_addr: None,
         };
         let s = t.encode().unwrap();
         let back = Ticket::decode(&s).unwrap();
@@ -151,8 +156,9 @@ mod tests {
             topic: "demo".into(),
             keys: vec![[1u8; KEY_LEN]],
             auth_log: log,
-            invitee_pubkey: *bob.public_key().as_bytes(),
+            invitee_pubkey: *bob.verifying_key().as_bytes(),
             role: ShareRole::Sync,
+            inviter_addr: None,
         };
         let s = t.encode().unwrap();
         let err = Ticket::decode(&s).unwrap_err().to_string();
@@ -171,12 +177,33 @@ mod tests {
             topic: "demo".into(),
             keys: vec![[7u8; KEY_LEN]],
             auth_log: log,
-            invitee_pubkey: *bob.public_key().as_bytes(),
+            invitee_pubkey: *bob.verifying_key().as_bytes(),
             role: ShareRole::Sync,
+            inviter_addr: None,
         };
         let err = Ticket::decode(&t.encode().unwrap())
             .unwrap_err()
             .to_string();
         assert!(err.contains("does not match its topic"), "{err}");
+    }
+
+    #[test]
+    fn inviter_address_survives_the_round_trip() {
+        let (_alice, bob, log) = make_log();
+        let id = iroh::PublicKey::from_bytes(bob.verifying_key().as_bytes()).unwrap();
+        let addr = p2panda_net::iroh_endpoint::EndpointAddr::new(id)
+            .with_relay_url(crate::bootstrap::default_relay_urls()[0].clone());
+        let t = Ticket {
+            version: TICKET_VERSION,
+            share_id: crate::share::id_from_topic("demo"),
+            topic: "demo".into(),
+            keys: vec![[3u8; KEY_LEN]],
+            auth_log: log,
+            invitee_pubkey: *bob.verifying_key().as_bytes(),
+            role: ShareRole::Sync,
+            inviter_addr: Some(addr.clone()),
+        };
+        let back = Ticket::decode(&t.encode().unwrap()).unwrap();
+        assert_eq!(back.inviter_addr, Some(addr));
     }
 }

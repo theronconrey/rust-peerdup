@@ -4,7 +4,7 @@
 # https://docs.fedoraproject.org/en-US/packaging-guidelines/Rust/
 #
 # Vendored dependencies: an exception, on purpose. rust-peerdup is built on
-# p2panda, iroh and librqbit, and none of them (nor many of the crates
+# p2panda and iroh, and none of them (nor many of the crates
 # they pull in) are packaged in Fedora, so the crates come from a vendor
 # tarball made by packaging/vendor.sh. This is the guidelines' own vendoring
 # path: %%cargo_prep -v, no %%cargo_generate_buildrequires, no -devel
@@ -20,7 +20,7 @@ Summary:        Encrypted peer-to-peer folder sync daemon
 # statically linked with (cargo-vendor.txt), as %%cargo_license_summary
 # prints them in the build log (CI shows it too), with each AND-ed term
 # listed once. Update this when Cargo.lock changes.
-License:        MIT AND Apache-2.0 AND BSD-2-Clause AND BSD-3-Clause AND CC0-1.0 AND CDLA-Permissive-2.0 AND ISC AND MPL-2.0 AND Unicode-3.0 AND Unlicense AND Zlib AND (0BSD OR MIT OR Apache-2.0) AND (Apache-2.0 OR BSL-1.0) AND (Apache-2.0 OR GPL-2.0-only) AND (Apache-2.0 OR ISC) AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0) AND (Apache-2.0 OR MIT) AND (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT) AND (BSD-2-Clause OR Apache-2.0 OR MIT) AND (BSD-3-Clause OR MIT OR Apache-2.0) AND (CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception) AND (CC0-1.0 OR MIT-0 OR Apache-2.0) AND (MIT OR Apache-2.0) AND (MIT OR Apache-2.0 OR BSD-1-Clause) AND (MIT OR Apache-2.0 OR LGPL-2.1-or-later) AND (MIT OR Apache-2.0 OR Zlib) AND (MIT OR Zlib OR Apache-2.0) AND (Unlicense OR MIT) AND (Zlib OR Apache-2.0 OR MIT)
+License:        MIT AND Apache-2.0 AND BSD-3-Clause AND CC0-1.0 AND CDLA-Permissive-2.0 AND ISC AND MPL-2.0 AND Unicode-3.0 AND Unlicense AND Zlib AND (Apache-2.0 OR BSL-1.0) AND (Apache-2.0 OR GPL-2.0-only) AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR MIT) AND (Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT) AND (BSD-2-Clause OR Apache-2.0 OR MIT) AND (BSD-3-Clause OR MIT OR Apache-2.0) AND (CC0-1.0 OR Apache-2.0 OR Apache-2.0 WITH LLVM-exception) AND (CC0-1.0 OR MIT-0 OR Apache-2.0) AND (MIT OR Apache-2.0) AND (MIT OR Apache-2.0 OR BSD-1-Clause) AND (MIT OR Apache-2.0 OR LGPL-2.1-or-later) AND (MIT OR Apache-2.0 OR Zlib) AND (Unlicense OR MIT) AND (Zlib OR Apache-2.0 OR MIT)
 URL:            https://github.com/theronconrey/rust-peerdup
 Source0:        %{url}/archive/v%{version}/%{name}-%{version}.tar.gz
 # Made by packaging/vendor.sh and attached to each GitHub release.
@@ -30,30 +30,26 @@ ExclusiveArch:  %{rust_arches}
 
 BuildRequires:  cargo-rpm-macros >= 26
 BuildRequires:  systemd-rpm-macros
-# %%firewalld_reload, so the shipped service is known to a running firewalld.
-BuildRequires:  firewalld-filesystem
 # Generates the man page from --help (kept ASCII; a unit test checks).
 BuildRequires:  help2man
-# native-tls (through reqwest) links the system OpenSSL, so TLS made that
-# way follows the system crypto-policies.
-BuildRequires:  pkgconfig(openssl)
-# aws-lc-sys and ring (TLS for iroh's QUIC and rustls) compile C code.
+# ring (rustls, under iroh's QUIC) and blake3 compile C and assembly.
 BuildRequires:  gcc
-BuildRequires:  gcc-c++
-BuildRequires:  cmake
-BuildRequires:  clang
+# p2panda-net's address book uses SQLite through sqlx. Link the system
+# library instead of the copy libsqlite3-sys would compile
+# (LIBSQLITE3_SYS_USE_PKG_CONFIG below; vendor.sh also drops its sources).
+BuildRequires:  pkgconfig(sqlite3)
 
 # The session bus, which starts the daemon on the first CLI call.
 Requires:       dbus-common
-Requires:       firewalld-filesystem
-Requires(post): firewalld-filesystem
 %{?systemd_requires}
 
 %description
 rust-peerdup keeps folders in sync between your machines without a central
-server. Peers find each other and exchange metadata over p2panda gossip, move
-file contents over BitTorrent with librqbit, and encrypt everything that
-leaves the machine with per-share keys that rotate when a member is removed.
+server. Peers find each other and exchange metadata over p2panda gossip and
+move file contents as content-addressed blobs over iroh, which connects
+peers directly where it can and through a relay where it can't. Everything
+that leaves the machine, file names included, is encrypted with per-share
+keys that rotate when a member is removed.
 
 It runs as a per-user service with a D-Bus API on the session bus, started
 on demand; the rust-peerdup command drives it.
@@ -63,6 +59,7 @@ on demand; the rust-peerdup command drives it.
 %cargo_prep -v vendor
 
 %build
+export LIBSQLITE3_SYS_USE_PKG_CONFIG=1
 %cargo_build
 %{cargo_license_summary}
 %{cargo_license} > LICENSE.dependencies
@@ -78,15 +75,13 @@ install -Dpm 0644 systemd/rust-peerdup.service \
     %{buildroot}%{_userunitdir}/rust-peerdup.service
 install -Dpm 0644 dbus-1/org.peerdup.Daemon1.service \
     %{buildroot}%{_datadir}/dbus-1/services/org.peerdup.Daemon1.service
-install -Dpm 0644 firewalld/rust-peerdup.xml \
-    %{buildroot}%{_prefix}/lib/firewalld/services/rust-peerdup.xml
 
 %check
+export LIBSQLITE3_SYS_USE_PKG_CONFIG=1
 %cargo_test
 
 %post
 %systemd_user_post rust-peerdup.service
-%firewalld_reload
 
 %preun
 %systemd_user_preun rust-peerdup.service
@@ -101,7 +96,6 @@ install -Dpm 0644 firewalld/rust-peerdup.xml \
 %{_mandir}/man1/rust-peerdup.1*
 %{_userunitdir}/rust-peerdup.service
 %{_datadir}/dbus-1/services/org.peerdup.Daemon1.service
-%{_prefix}/lib/firewalld/services/rust-peerdup.xml
 
 %changelog
 * Tue Nov 24 2026 Theron Conrey <theron@conrey.org> - 0.1.0-1

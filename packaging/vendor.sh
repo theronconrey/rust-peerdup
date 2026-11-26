@@ -8,7 +8,10 @@
 #
 # The vendor tarball is filtered to Linux targets with cargo-vendor-filterer,
 # so it carries no Windows or macOS import libraries or other prebuilt
-# binaries. It is reproducible: same Cargo.lock, same tarball.
+# binaries, and the SQLite/SQLCipher C sources libsqlite3-sys bundles are
+# dropped (the spec links the system SQLite; the pre-generated Rust
+# bindings next to them stay, since the build still uses them). It is reproducible: same
+# Cargo.lock, same tarball.
 #
 # Packit runs this to make the sources for every Copr build
 # (.packit.yaml); the release workflow runs it to attach the vendor tarball
@@ -38,6 +41,10 @@ trap 'rm -rf "$work"' EXIT
     --platform=powerpc64le-unknown-linux-gnu \
     --platform=s390x-unknown-linux-gnu \
     --platform=riscv64gc-unknown-linux-gnu \
+    --exclude-crate-path='libsqlite3-sys#sqlite3/sqlite3.c' \
+    --exclude-crate-path='libsqlite3-sys#sqlite3/sqlite3.h' \
+    --exclude-crate-path='libsqlite3-sys#sqlite3/sqlite3ext.h' \
+    --exclude-crate-path='libsqlite3-sys#sqlcipher' \
     "$work/vendor" >&2)
 
 tar --sort=name --mtime="@0" --owner=0 --group=0 --numeric-owner \

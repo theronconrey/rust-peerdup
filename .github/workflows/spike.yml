@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: MIT
+#
+# Fast loop for spike/** branches: let cargo resolve Cargo.lock after a
+# Cargo.toml change (committed back to the branch), then check, lint and
+# test on Fedora's rustc. No RPM build; fedora.yml does that on the pull
+# request. Not meant to land on main.
+
+name: Spike
+
+on:
+  push:
+    branches: ["spike/**"]
+
+env:
+  # Link Fedora's SQLite, as the spec does, not libsqlite3-sys's bundled copy.
+  LIBSQLITE3_SYS_USE_PKG_CONFIG: "1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: spike-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:latest
+    steps:
+      - name: Install Fedora tooling
+        run: >
+          dnf -y install git-core rpm-build cargo rust clippy rustfmt
+          cargo-rpm-macros dnf-plugins-core
+
+      - uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: dnf -y builddep rust-peerdup.spec
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: spike-${{ hashFiles('Cargo.toml') }}
+          restore-keys: spike-
+
+      - name: Resolve Cargo.lock and push it back if it changed
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cargo metadata --format-version 1 >/dev/null
+          if ! git diff --quiet -- Cargo.lock; then
+            git config user.name "spike-lockfile"
+            git config user.email "noreply@github.com"
+            git commit -s -m "Cargo.lock: resolve for $(git log -1 --format=%h)" -- Cargo.lock
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+      - name: Check, lint, test
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets --message-format=short -- -D warnings
+          cargo test --locked
+
+      - name: Two daemons sync a share (e2e)
+        run: |
+          cargo build --locked
+          tests/e2e-sync.sh target/debug/rust-peerdup
+          tests/e2e-revoke.sh target/debug/rust-peerdup
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-peerdup-fedora
+          path: target/debug/rust-peerdup
+          retention-days: 3
+
+  # Two containers on two isolated Docker networks: they can only meet
+  # through a relay or a hole-punched path, as two homes on the internet do.
+  cross-network:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: rust-peerdup-fedora
+          path: bin
+      - name: Two networks, one share (e2e)
+        run: |
+          chmod +x bin/rust-peerdup
+          tests/e2e-xnet.sh bin/rust-peerdup
