@@ -440,7 +440,7 @@ mod tests {
         // A share.json from before v4.
         let old = format!(
             r#"{{"id":"{}","topic":"demo","root_path":"/x","role":"sync","created_at":"2026-01-01T00:00:00Z"}}"#,
-            blake3::hash(b"demo").to_hex().as_str()[..16].to_string()
+            &blake3::hash(b"demo").to_hex().as_str()[..16]
         );
         let legacy: ShareConfig = serde_json::from_str(&old).unwrap();
         assert_eq!(legacy.topic, ShareTopic::Legacy("demo".into()));
