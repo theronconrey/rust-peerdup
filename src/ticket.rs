@@ -255,7 +255,8 @@ mod tests {
         let carol = SigningKey::generate();
         let err = ticket_with(log.clone(), &bob)
             .verified_auth_state(me(&carol))
-            .unwrap_err()
+            .err()
+            .expect("refused")
             .to_string();
         assert!(err.contains("different public key"), "{err}");
 
@@ -268,14 +269,16 @@ mod tests {
         // A log that never adds us.
         let err = ticket_with(log[..1].to_vec(), &bob)
             .verified_auth_state(me(&bob))
-            .unwrap_err()
+            .err()
+            .expect("refused")
             .to_string();
         assert!(err.contains("not list us"), "{err}");
 
         // A log missing its Create: the Add waits forever.
         let err = ticket_with(log[1..].to_vec(), &bob)
             .verified_auth_state(me(&bob))
-            .unwrap_err()
+            .err()
+            .expect("refused")
             .to_string();
         assert!(err.contains("missing dependencies"), "{err}");
     }
