@@ -84,22 +84,8 @@ network id into every ALPN, so blobs must go through p2panda's
 `accept`/`connect`, not iroh-blobs' own downloader.
 
 **Known gaps (next steps):**
-- Members-only connections (done, `src/access.rs`): the endpoint runs
-  p2panda-net's `ConnectionBlockList` in restrictive mode. Allowed = the
-  union of every running share's members; recomputed at share start,
-  after auth ops apply, after invite/revoke, and when a share stops.
-  Blocked nodes are refused after the TLS handshake with code 403 for
-  every ALPN, so a revoked member can't open a new connection for blobs
-  or gossip. **`ConnectionBlockList::block` only affects new
-  connections**: one the revoked node already has open stays up until it
-  closes (idle timeout, restart, network change), and it can keep
-  fetching blobs and receiving gossip over it until then. What it gets
-  is ciphertext; after the rotation it can't decrypt new versions, and
-  its announces are refused because it is no longer a Writer. Closing
-  live connections on revocation is still to do. `allow()` lifts a
-  block, so re-inviting works. Not yet per share: a
-  member of share A could fetch share B's blobs if it learned their
-  hashes (they are ciphertext under B's key).
+- Members-only connections and per-share blob access: done, see
+  "Members-only connections" below.
 - Relays: the default is n0's public relays (rate-limited, meant for
   development); bulk data goes through them when hole-punching fails.
   `--relay-url` is there; consider shipping a self-hosted `iroh-relay`
@@ -138,6 +124,139 @@ network id into every ALPN, so blobs must go through p2panda's
 - Done: two daemons on one network sync initial content, an edit back, a
   new nested file and a deletion (`tests/e2e-sync.sh`, in CI against the
   installed RPM).
+
+## Members-only connections
+
+`src/access.rs`; both layers key on the node id, which is the member's
+identity key and which iroh authenticates in the TLS handshake.
+
+**Connections.** The endpoint's hook is `MembersOnly`, an iroh
+`EndpointHooks` (p2panda-net 0.8.1 `Endpoint::builder(..).hooks(impl
+EndpointHooks + Clone + 'static)`; iroh 1.5 runs every hook in order for
+every connection, incoming and outgoing, every ALPN). It delegates the
+decision to p2panda-net's `ConnectionBlockList` in restrictive mode:
+allowed = the union of every running share's current members,
+recomputed at share start, after auth ops apply, after invite/revoke,
+and when a share stops. A refused node gets code 403 after the
+handshake (`after_handshake`), and we never dial it (`before_connect`).
+
+`ConnectionBlockList::block` only refuses *new* connections, so
+`MembersOnly::after_handshake` also records every accepted connection
+as a `WeakConnectionHandle` (iroh's hook docs: never keep a strong
+`Connection` from a hook; it keeps the connection alive and disables
+close-on-drop). When a node leaves the union, `Access::apply` blocks it
+and then closes every recorded connection to it with application code
+403, reason `membership revoked`, and logs `no longer a member of any
+share: blocked, live connections closed node=<hex> closed=<n>`. The
+hook records a connection *before* it asks the block list, under the
+same lock the close takes, so a connection that races a block is either
+recorded in time to be closed or refused by the block list. Records are
+pruned when a connection closes (`WeakConnectionHandle::closed`) and
+whenever a node's list is touched. `set_members`/`remove_share` are
+serialised so allow/block calls apply in order.
+
+Nothing reconnects around this: p2panda-net's endpoint actor keeps no
+pool (each `connect` makes a new connection, through the hooks);
+iroh-gossip dials through the same iroh endpoint, so a re-dial of the
+revoked node is refused in `before_connect`, and its dials to us in
+`after_handshake`. iroh-gossip holds one connection per peer for all
+topics, so a close only affects the revoked node; HyParView replaces it
+from the passive view, and the healer rejoins from the address book.
+None of our protocols accepts 0-RTT (`on_accepting` is the default, a
+full handshake), which matters: an incoming 0-RTT connection could carry
+data before `after_handshake` runs. Keep it that way.
+
+The cut is per daemon, not per share. A node revoked from share X that
+is still a member of share Y on the same daemon keeps its connection,
+and because iroh-gossip has no per-topic authorisation, it can stay in
+X's gossip topic over it: it keeps hearing X's announces (manifest
+hashes, version hashes, clocks), auth ops and rotation chunks (sealed to
+the remaining members) until it disconnects. What stops it is the key
+rotation (it can't decrypt new versions), the Writer check (its
+announces are refused) and the blob gate below (it can't fetch X's
+blobs). Rotating X's gossip topic on revocation (deriving it from the
+new epoch's key) would close this; not done yet.
+
+**Blobs.** A connection allowed for any share may carry requests for
+any blob, so each request is checked on its own. `BlobsProtocol::new(&store,
+Some(events))` gets an `EventSender` with `transfer::BLOB_EVENTS`:
+`connected: ConnectMode::Intercept` (iroh-blobs 0.105's `ClientConnected`
+carries `connection_id` and `endpoint_id`; requests carry only the
+`connection_id`, so the map comes from here), `get:
+RequestMode::Intercept`, and get-many, push and observe `Disabled` (our
+fetches only send gets). `Access::serve_blob_events` answers: a get for
+hash H from node N is allowed only if some running share has H in one of
+its last `RECENT_VERSIONS` (4) versions and N is a current member of it
+(`access::decide_blob`), otherwise `AbortReason::Permission` and a log
+line `refused a blob request: <why> node=<hex> blob=<hash>`. A dropped
+or unanswered decision is a refusal in iroh-blobs, so an unexpected
+request type fails closed.
+
+- Only single-blob requests (`GetRequest.ranges.is_blob()`, or empty).
+  A request with child ranges treats H as a hash sequence and serves
+  the blobs it names; a member holds the share key and can make a
+  ciphertext blob whose bytes are other blobs' hashes, so children would
+  reach any blob in the store.
+- A version's hashes (manifest and every file blob) are recorded when
+  `Transfer::publish` returns, before the version is announced, and
+  when a fetched version is committed (we announce what we applied).
+  A fetched version that is refused or discarded isn't recorded, so a
+  Writer can't push real versions out of the window with junk.
+- Keeping four versions lets a fetch of a just-superseded version (a
+  quick second edit, a re-encryption after a rotation) finish. A share
+  that publishes faster than a peer fetches can still push a version out
+  mid-fetch; the fetch fails and the next announce is fetched, reusing
+  the blobs it already has.
+- A hash in two shares is allowed to members of either (it is the same
+  bytes).
+- The index is in memory, rebuilt as shares start and republish.
+- Revocation needs no extra step: membership is read per request, so a
+  revoked node's request on a still-open connection is refused.
+
+`tests/e2e-isolation.sh` checks both layers with three daemons (A
+revokes over D-Bus while running); `tests/e2e-revoke.sh` checks a member
+that learns of a revocation over gossip cuts the revoked node off too.
+
+## Share identity and topics (v4 tickets)
+
+Before, a share's id was `hex(blake3(topic))[..16]` and its gossip topic
+`blake3(topic)`, with the topic a string the user chose: guessable, and
+two unrelated "photos" shares collided (review finding 5). With
+iroh-gossip any connected node that knows a topic id can join it, and
+p2panda's confidential (PSI) discovery only hides topics that have
+entropy.
+
+Now (`src/share.rs`):
+- `share-add` makes a `TopicSecret`, 32 bytes from the OS RNG.
+- share id = `hex(blake3::derive_key("rust-peerdup 2026-11-26 share id
+  v1", secret))[..16]`; gossip topic = `blake3::derive_key("rust-peerdup
+  2026-11-26 gossip topic v1", secret)`. blake3's KDF mode with one
+  context string per value: the id (shown, logged, used in the auth
+  group id) says nothing about the topic. The context strings are part
+  of the format.
+- `--name` is a label (`--topic` stays as a hidden alias): shown by
+  `share-list`, returned as the second field of D-Bus `ShareList`,
+  carried in tickets; at most 256 bytes and no control characters,
+  since another machine's ticket supplies it. Never hashed.
+- The secret is never logged, announced or returned over D-Bus
+  (`TopicSecret`'s `Debug` prints `TopicSecret(..)`). The gossip topic
+  id is as good as the secret for joining gossip; it is sent only to
+  peers on the topic and never logged by us.
+- Ticket v4 carries `name` and `topic: ShareTopic` (the secret, or a
+  legacy topic string, below); `Ticket::decode` checks that `share_id`
+  derives from it, which also keeps it a safe directory name. v3 tickets
+  are refused (no releases yet).
+- `share.json` holds the secret, so it is written like the other
+  secrets: 0600 from creation, atomically (`write_private_atomic`). An
+  older one that others can read is chmod'ed 0600 when loaded. On disk:
+  `name`, and `topic_secret` (hex) or `legacy_topic`.
+- Migration: a `share.json` from before (only `topic`) loads as
+  `ShareTopic::Legacy`, named after its topic, with the old id and gossip
+  topic, so it keeps syncing with its members; invites to it carry the
+  legacy topic. The daemon warns at start that its topic can be guessed.
+  Moving it to a random topic means a new share (and new invites): the
+  members would all have to switch at once. A `share.json` whose id
+  doesn't derive from its topic is skipped with an error.
 
 ## Signed announces (`src/announce.rs`)
 
@@ -219,9 +338,9 @@ p2panda-net 0.8 runs on iroh 1.x, which iroh-blobs needs. Our code moved to
 p2panda-core 0.8 (`SigningKey`/`VerifyingKey`, `Topic`); p2panda-auth stays
 at 0.5.2 because 0.8 removed `GroupControlMessage`, which the membership
 code is built on. Nothing passes p2panda-core types into p2panda-auth, so
-the two core versions never meet. Gossip topics are still
-`blake3(topic string)`, the value p2panda-core 0.5's `Hash::new` produced,
-so share topic ids didn't change.
+the two core versions never meet. Gossip topics were `blake3(topic
+string)` across that move; since ticket v4 they derive from a random
+secret (see "Share identity and topics").
 
 p2panda-net 0.8's address book stores data in SQLite through sqlx, and
 `libsqlite3-sys` would compile its bundled copy. The spec sets
@@ -402,6 +521,9 @@ Could be unified later but unification touches `clock.rs` and
 `share_state.rs` everywhere they hold a peer id, so we deferred it.
 
 ### Ticket format is now v2; v1 is rejected
+*(Since then: v3 added the inviter's address, v4 the topic secret and
+name; each older version is refused.)*
+
 `Ticket.version` was bumped from 1 to 2 to add `auth_log` and
 `invitee_pubkey`. There is no migration path — v1 tickets fail to
 decode. Acceptable because no shipped builds had real users yet.
@@ -692,6 +814,21 @@ deterministic comparison, applies the winner's version as a concurrent
 one, keeps its changes as conflict copies, and its merged clock then
 dominates both. Invariant: a version that dominates ours includes our
 content.
+
+### The blob gate refuses hash-sequence requests from members
+Looks over-strict, since the requester is a member. A request with child
+ranges makes the provider read the requested blob as a list of hashes
+and serve those blobs, and a member can write such a list into a blob it
+publishes (it holds the key, so it picks the ciphertext bytes). Allowing
+it would serve other shares' blobs. Our fetches only ask for single
+blobs.
+
+### `MembersOnly` records a connection before it decides
+Looks backwards. Blocking and closing happen in that order in
+`Access::apply`; recording first in the hook means a connection that
+races a revocation is either recorded in time to be closed or refused by
+the block list. Recording after an accept would leave a window where it
+is neither.
 
 ### `AuthState::apply_remote` refuses a well-signed `Create`
 Looks like it breaks replaying a log into a fresh state. It doesn't: the
@@ -1039,8 +1176,9 @@ counts.
 
 ## Secrets on disk are created 0600, not chmod'ed to it
 
-`identity.key`, `keys.bin`, `auth.log` and the pending rotation envelopes
-all go through `data_dir::write_private_atomic`: the temp file is opened
+`identity.key`, `keys.bin`, `auth.log`, the pending rotation envelopes
+and `share.json` (it holds the topic secret since ticket v4) all go
+through `data_dir::write_private_atomic`: the temp file is opened
 with `O_CREAT|O_EXCL` and mode 0600, synced, then renamed into place. The
 earlier pattern (`fs::write` then `set_permissions(0o600)`) left each
 secret readable under the default umask (usually 0644) until the chmod ran.
