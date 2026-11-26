@@ -39,5 +39,18 @@ them do):
   this.
 - Some vendored crates bring their own crypto and CA list instead of
   following Fedora's crypto-policies (CONTRIBUTING.md, section 3).
+- A member that is offline (or cut off) while someone is revoked still
+  trusts the revoked peer until the revocation reaches it. Until then it
+  serves the revoked peer anything it writes, under the old key, and may
+  pass on that peer's changes; once it catches up it re-encrypts them
+  under the new key and other members accept them. Up-to-date members
+  refuse anything new under the old key, so they don't spread it, but
+  only the revocation reaching the lagging member stops the direct path.
+  Details in `INTEGRATION_NOTES.md`, "Old keys after revocation".
+- After a revocation, a peer that already had a connection open keeps it
+  until it closes (`INTEGRATION_NOTES.md`, "Known gaps").
+- Two Owners revoking or rotating at the same moment can leave the share
+  unable to publish until one of them runs `share-rotate-key` (it fails
+  closed; see "Old keys after revocation").
 
 The threat model is in `INTEGRATION_NOTES.md` ("Threat model: wire-only").

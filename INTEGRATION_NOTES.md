@@ -273,12 +273,15 @@ appended. This is what makes "old content remains readable after
 rotation" work — a peer that holds the keyring can decrypt any blob
 encrypted under any past epoch.
 
-### Rotation is opt-in via CLI
-`peerdup share rotate-key <id>` appends a new key to `keys.bin`. Daemon
-restart is required for the new key to become "current" for re-encryption.
-Out-of-band keyring distribution is required so other peers can read
-post-rotation content (Phase 5 will replace this with `share invite`
-tickets driven by `p2panda-auth`).
+### Rotation without a revocation
+`share-rotate-key <id>` appends a new key to `keys.bin` and, since the
+old-keys work, sends it to every other member exactly like a revocation
+does (signed sealed-box envelopes, queued in `pending_rotations/`). Only
+an Owner may run it: receivers accept rotations from Owners only. It used
+to keep the key on the machine that made it, so every version published
+after it was unreadable to everyone else. A running daemon re-encrypts
+its current version under the new key straight away (see "Old keys after
+revocation").
 
 ### Why our `version_hash` is computed over plaintext, not ciphertext
 Two peers with the same plaintext encrypt with their own random nonces,
@@ -469,7 +472,7 @@ alternative (track each rotation's "auth-state-at-author-time") would
 require carrying an extra dependency vector on every rotation.
 
 ### On-disk: `pending_rotations/`
-`share-revoke` writes one file per chunk at
+`share-revoke` and `share-rotate-key` write one file per chunk at
 `<data_dir>/shares/<id>/pending_rotations/<epoch>-<n>.bin` (atomic
 tmp+rename, 0600 on Unix), each a bincode `SignedRotation`; a
 `<epoch>.bin` from before chunking still loads. The daemon loads all such files at start and
@@ -488,6 +491,116 @@ current_epoch + 1` get queued and re-tried in epoch order each time a
 new rotation slots in. Cap-overflow drops the oldest. The buffer is
 ephemeral (in-memory only); a daemon restart re-loads it from disk
 queue + lossy gossip catch-up.
+
+## Old keys after revocation
+
+A revoked member keeps every key it ever held (`KeyRing` never deletes
+keys), so it can read anything encrypted under those keys if it gets the
+ciphertext. Rotation only protects what is encrypted *after* it, and
+until this change nothing made sure new content was: a Writer that
+missed the revocation kept publishing under the old key, peers applied
+and re-announced its versions, and nobody re-encrypted the current
+version. `src/epochs.rs` holds the rule; the pieces:
+
+**Required epoch.** In a node's own view, `max(1 + removals, floor)`:
+- `AuthState::required_epoch` is `1 + removals`, where a removal is a
+  `Remove` op in the log that p2panda-auth's strong-remove resolver did
+  not filter (`inner.ignore`), or that is part of a mutual-remove cycle
+  (`inner.mutual_removes`, filtered but in effect). Every revocation
+  rotates once (daemon and direct mode), so after `n` removals keys up to
+  epoch `n` are each held by some removed member. A filtered `Remove`
+  never took effect and is not counted: a removed Owner can still sign
+  `Remove` ops whose dependencies predate its removal (they validate at
+  those dependencies, then get filtered), and counting them would let it
+  raise the required epoch at will and freeze the share. Demotions don't
+  count (the member keeps read access).
+- The **floor** (`<share>/epoch_floor`, `crypto::raise_epoch_floor`) is
+  set when a rotation brings a *different* key for an epoch we already
+  hold (`InstallOutcome::Conflict`; before, the same epoch errored and an
+  older one was silently `Stale`). Two Owners rotated concurrently, and
+  one of the two keys may have gone to a member the other was revoking,
+  so neither is trusted for new content: the floor becomes the next
+  epoch. It never goes down.
+
+**Publishing.** A node encrypts nothing new while its keyring is below
+the required epoch (`publish_current` returns `Held`; the daemon logs
+"local change waits for the rotated key"), not even into its local
+store, and announces only a version at or above it. At start in that
+state the persisted version comes back unpublished (`epoch` 0). When the
+key arrives the change is published as usual.
+
+**Receiving.** `transfer::fetch` takes the required epoch at the start
+of the fetch and refuses, before decrypting, a manifest under an older
+epoch, and, before staging, any file blob whose epoch differs from the
+manifest's (`check_version_epochs`): otherwise a version could carry a
+current-epoch manifest over old ciphertext. The share loop checks the
+staged version again against the required epoch at commit time, since a
+`Remove` may land mid-fetch. A refusal is an `EpochRefused` error, kept
+apart from "no key for epoch N" (we are behind and retry later): it is
+logged as "refused a remote version: version encrypted under epoch X;
+this share requires >= Y after a revocation", and the manifest is
+remembered so its 10-second re-announces aren't fetched again (cleared
+when the required epoch changes). The epoch in the header isn't covered
+by the AEAD, but it selects the key, so a relabelled blob fails to
+decrypt; refusing on the claimed epoch never needs it to be true.
+
+**Re-encrypting after a rotation.** Whenever a node's keyring advances
+(its own revocation or rotation, or a key installed from gossip), the
+share loop publishes its current version again under the new key:
+same version hash, clock and timestamp, a new manifest hash, then it
+announces, persists the state and saves the blob cache. Without this a
+peer that was behind would refuse the current version forever, since
+every copy was under the old key. There is no loop or storm: peers that
+have the version compare `Equal` and fetch nothing, the clock is not
+bumped (`next_state` bumps only when the content changed), and it runs
+once per keyring epoch. Readers don't (they never announce). The blob
+cache reuses ciphertext only for the same plaintext *and* epoch, so the
+re-encryption really is under the new key. The start path publishes
+under the current key anyway (the store is a cache).
+
+**Minting.** An Owner revokes or rotates only if the key it mints will
+satisfy the required epoch afterwards (`check_mint`): an Owner that knows
+of a removal whose key hasn't arrived would otherwise mint a second key
+for that epoch. The check runs before the `Remove` is authored, so a
+refusal leaves no removal without its rotation. Invites also wait for
+the required key (`check_invite`), or the joiner would get neither the
+key nor an envelope for it.
+
+**Residual risk.** The rule is enforced by each node on its own view.
+A member that hasn't heard of the revocation (offline, partitioned)
+still counts the revoked node as a member: its connection gate lets it
+in and it serves it whatever it writes, under the old key, until the
+revocation reaches it. The rule stops that content from spreading to
+up-to-date members (they refuse it, and they refuse the revoked node's
+connections), but it can't stop the revoked node from reading it
+straight from the lagging member; no rotation can. Only the revocation
+reaching the lagging member closes that. Two related limits:
+- The lagging member may also apply the revoked node's own edits (a
+  revoked Writer's announces still verify there). Once it catches up it
+  re-encrypts its current version, which then carries those edits to
+  everyone. Nothing distinguishes them afterwards.
+- With two revocations by different Owners at about the same time, a
+  node that has heard of only one removal can accept the key the *other*
+  Owner minted, which that Owner also sent to the member whose removal
+  the node has heard of. The same goes for an Owner that installed a
+  rotated key before the `Remove` behind it arrived and then revokes
+  someone else: its envelopes still include the first removed member.
+  Either stops once the node hears of the other removal (the count
+  rises) or sees the second key (a fork). Meanwhile the up-to-date
+  members block that member's connections, so it can only get such
+  content from lagging members, as above. A rotation that named the
+  removals it was made after would close this exactly; that needs a wire
+  change (`SignedRotation` v3) and is left for later.
+Concurrent revocations by two Owners always produce two keys for one
+epoch: the share then fails closed (the count asks for an epoch nobody
+has, and the fork raises the floor) and publishes nothing until an Owner
+runs `share-rotate-key`.
+
+`tests/e2e-revoke.sh` covers the lagging Writer: D is stopped before the
+revocation, edits offline, restarts without knowing; A refuses its
+epoch-1 version, D gets the rotated key, re-encrypts ("republished under
+epoch 2"), and A and C accept it. B is stopped while D lags, because D
+would serve it (the residual risk), and never gets the edit.
 
 ## Phase 7: D-Bus IPC
 
