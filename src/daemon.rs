@@ -509,11 +509,19 @@ async fn run_share(
     pending_rotations: Vec<SignedRotation>,
     cmd_rx: mpsc::Receiver<ShareCommand>,
 ) -> Result<()> {
-    // BLAKE3 of the topic string, the same id p2panda-core 0.5's Hash::new gave.
-    let topic = Topic::from(*blake3::hash(config.topic.as_bytes()).as_bytes());
+    // Derived from the share's topic secret (never logged), or for a
+    // share made before ticket v4 from its topic string.
+    let topic = Topic::from(config.topic.gossip_topic());
+    if config.topic.is_legacy() {
+        tracing::warn!(
+            share_id = %config.id,
+            "this share was made before random topics: its gossip topic derives from its \
+             name, which others can guess; re-create it with share-add to get a random one"
+        );
+    }
     tracing::info!(
         share_id = %config.id,
-        topic = %config.topic,
+        name = %config.name,
         role = ?config.role,
         auth_ops = auth_state.ops().len(),
         pending_rotations = pending_rotations.len(),
@@ -1109,6 +1117,7 @@ async fn handle_invite(
     let ticket = Ticket {
         version: TICKET_VERSION,
         share_id: config.id.clone(),
+        name: config.name.clone(),
         topic: config.topic.clone(),
         keys: exported,
         auth_log: auth_state.ops().to_vec(),
@@ -2268,8 +2277,12 @@ mod tests {
     ) {
         let td = TmpDir::new(label);
         let identity = SigningKey::generate();
-        let topic = format!("topic-{label}");
-        let config = ShareConfig::new(topic, td.path().join("share-root"), ShareRole::Sync);
+        let config = ShareConfig::create(
+            format!("share-{label}"),
+            td.path().join("share-root"),
+            ShareRole::Sync,
+        )
+        .unwrap();
         config.save(td.path()).unwrap();
         let group = group_id_for(&config.id);
         let mut auth_state = AuthState::empty_for(group);

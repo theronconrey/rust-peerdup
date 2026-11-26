@@ -20,7 +20,7 @@ body:
     attributes:
       label: Steps to reproduce
       placeholder: |
-        1. rust-peerdup share-add --topic ... --path ... --role sync
+        1. rust-peerdup share-add --name ... --path ... --role sync
         2. ...
     validations:
       required: true

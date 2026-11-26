@@ -80,10 +80,12 @@ enum Cmd {
     /// (Phase 2 semantics; daemon restart required to pick up). Without
     /// `--data-dir`, calls `ShareAdd` over D-Bus on the running daemon.
     ShareAdd {
-        /// Logical topic string. Hashed into the gossip topic id; both peers
-        /// must use the same topic to find each other.
-        #[arg(long)]
-        topic: String,
+        /// A name for the share, shown by share-list and carried in
+        /// invites. Just a label: the share's id and gossip topic come from
+        /// a random secret made here, so two shares with the same name are
+        /// different shares. (--topic is the old spelling.)
+        #[arg(long, alias = "topic")]
+        name: String,
         /// Path to the folder this share covers.
         #[arg(long)]
         path: PathBuf,
@@ -177,9 +179,9 @@ async fn main() -> Result<()> {
             };
             cmd_serve(data_dir, !no_dbus, relays).await
         }
-        Cmd::ShareAdd { topic, path, role } => match direct_dir {
-            Some(dd) => cmd_share_add_direct(dd, topic, path, role),
-            None => cmd_share_add(topic, path, role).await,
+        Cmd::ShareAdd { name, path, role } => match direct_dir {
+            Some(dd) => cmd_share_add_direct(dd, name, path, role),
+            None => cmd_share_add(name, path, role).await,
         },
         Cmd::ShareList => match direct_dir {
             Some(dd) => cmd_share_list_direct(dd),
@@ -278,7 +280,7 @@ async fn cmd_serve(
 
 // ── D-Bus client paths (default) ─────────────────────────────────────────────
 
-async fn cmd_share_add(topic: String, path: PathBuf, role: ShareRole) -> Result<()> {
+async fn cmd_share_add(name: String, path: PathBuf, role: ShareRole) -> Result<()> {
     let path = if path.is_absolute() {
         path
     } else {
@@ -289,8 +291,8 @@ async fn cmd_share_add(topic: String, path: PathBuf, role: ShareRole) -> Result<
     }
     let client = client::DaemonClient::connect().await?;
     let role_str = role_to_str(role);
-    let share_id = client.share_add(&topic, &path, role_str).await?;
-    println!("Added share {share_id} ({topic})");
+    let share_id = client.share_add(&name, &path, role_str).await?;
+    println!("Added share {share_id} ({name})");
     Ok(())
 }
 
@@ -301,13 +303,13 @@ async fn cmd_share_list() -> Result<()> {
         println!("No shares configured");
         return Ok(());
     }
-    println!("{:<18} {:<8} {:<20} PATH", "ID", "ROLE", "TOPIC");
-    for (id, topic, path, role, _created_at) in shares {
+    println!("{:<18} {:<8} {:<20} PATH", "ID", "ROLE", "NAME");
+    for (id, name, path, role, _created_at) in shares {
         println!(
             "{:<18} {:<8} {:<20} {}",
             id,
             role,
-            truncate(&topic, 20),
+            truncate(&name, 20),
             path
         );
     }
@@ -429,7 +431,7 @@ async fn cmd_share_remove(id: String) -> Result<()> {
 
 fn cmd_share_add_direct(
     data_dir: PathBuf,
-    topic: String,
+    name: String,
     path: PathBuf,
     role: ShareRole,
 ) -> Result<()> {
@@ -442,7 +444,7 @@ fn cmd_share_add_direct(
     if matches!(role, ShareRole::Seed) && !path.exists() {
         return Err(anyhow!("seed path does not exist: {path:?}"));
     }
-    let config = ShareConfig::new(topic, path, role);
+    let config = ShareConfig::create(name, path, role)?;
     if share::load_all(&data_dir)?
         .iter()
         .any(|c| c.id == config.id)
@@ -459,7 +461,7 @@ fn cmd_share_add_direct(
     auth::save(&data_dir, &config.id, &auth_state)?;
     config.save(&data_dir)?;
 
-    println!("Added share {} ({})", config.id, config.topic);
+    println!("Added share {} ({})", config.id, config.name);
     println!(
         "Auth group bootstrapped with {} as owner",
         identity.verifying_key().to_hex()
@@ -473,14 +475,14 @@ fn cmd_share_list_direct(data_dir: PathBuf) -> Result<()> {
         println!("No shares configured at {:?}", data_dir);
         return Ok(());
     }
-    println!("{:<18} {:<8} {:<20} PATH", "ID", "ROLE", "TOPIC");
+    println!("{:<18} {:<8} {:<20} PATH", "ID", "ROLE", "NAME");
     for c in configs {
         let role = format!("{:?}", c.role).to_lowercase();
         println!(
             "{:<18} {:<8} {:<20} {}",
             c.id,
             role,
-            truncate(&c.topic, 20),
+            truncate(&c.name, 20),
             c.root_path.display()
         );
     }
@@ -682,6 +684,7 @@ fn cmd_share_invite_direct(
     let ticket = ticket::Ticket {
         version: ticket::TICKET_VERSION,
         share_id: cfg.id.clone(),
+        name: cfg.name.clone(),
         topic: cfg.topic.clone(),
         keys: ring.export_keys(),
         auth_log: auth_state.ops().to_vec(),
@@ -724,7 +727,7 @@ fn cmd_share_join_direct(data_dir: PathBuf, ticket_str: String, path: PathBuf) -
     println!(
         "Joined share {} ({}) at {}",
         cfg.id,
-        cfg.topic,
+        cfg.name,
         cfg.root_path.display()
     );
     Ok(())
@@ -760,11 +763,13 @@ fn role_to_str(role: ShareRole) -> &'static str {
     }
 }
 
+/// At most `max` characters (not bytes: a name may be any UTF-8).
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
-        format!("{}…", &s[..max.saturating_sub(1)])
+        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
     }
 }
 
@@ -789,6 +794,19 @@ mod cli_tests {
                 panic!("non-ASCII {c:?} in help text:\n{text}");
             }
         }
+    }
+
+    #[test]
+    fn truncate_counts_characters_not_bytes() {
+        assert_eq!(super::truncate("photos", 20), "photos");
+        // Byte 19 is inside a two-byte character; slicing there panicked.
+        let name = "a".repeat(18) + "\u{e9}\u{e9}\u{e9}";
+        assert_eq!(
+            super::truncate(&name, 20),
+            "a".repeat(18) + "\u{e9}\u{2026}"
+        );
+        let long = "\u{e9}".repeat(30);
+        assert_eq!(super::truncate(&long, 20).chars().count(), 20);
     }
 
     #[test]

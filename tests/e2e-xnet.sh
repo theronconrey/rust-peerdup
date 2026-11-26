@@ -78,7 +78,7 @@ ok "A on $RUN-net-a, B on $RUN-net-b"
 
 info "A creates a share and comes online"
 inside a "echo 'hello across networks' > /share/hello.txt && mkdir -p /share/sub && head -c 2000000 /dev/urandom > /share/sub/blob.bin"
-pd a "share-add --topic xnet-$RUN --path /share --role sync" >/dev/null
+pd a "share-add --name xnet-$RUN --path /share --role sync" >/dev/null
 share_id="$(pd a share-list | awk 'NR>1 {print $1; exit}')"
 start_daemon a
 wait_for "A wrote its address with a home relay" inside a "grep -qi relay /data/endpoint.json"

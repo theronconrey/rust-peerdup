@@ -116,7 +116,7 @@ rust-peerdup whoami
 #   prints:  d18c65e7…
 
 # 2. On A: create a share and invite B.
-rust-peerdup share-add --topic mydemo --path ~/Sync/mydemo --role sync
+rust-peerdup share-add --name mydemo --path ~/Sync/mydemo --role sync
 SHARE_ID=$(rust-peerdup share-list | tail -1 | awk '{print $1}')
 rust-peerdup share-invite "$SHARE_ID" <B-pubkey-hex> --auth-role writer
 #   prints the ticket string. Send it to B over a secure channel.

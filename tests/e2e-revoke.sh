@@ -90,7 +90,7 @@ export RUST_LOG="${RUST_LOG:-rust_peerdup=info}"
 info "A creates a share and invites B and D (writers) and C (reader)"
 mkdir -p "$(root a)" "$(root b)" "$(root c)" "$(root d)"
 echo "hello from A" > "$(root a)/hello.txt"
-pd a share-add --topic "e2e-revoke-$$-$RANDOM" --path "$(root a)" --role sync >/dev/null
+pd a share-add --name "e2e-revoke-$$-$RANDOM" --path "$(root a)" --role sync >/dev/null
 share="$(pd a share-list | awk 'NR>1 {print $1; exit}')"
 pub_b="$(pd b whoami)"; pub_c="$(pd c whoami)"; pub_d="$(pd d whoami)"
 pd a share-invite "$share" "$pub_b" --auth-role writer 2>/dev/null | pd b share-join - --path "$(root b)" >/dev/null

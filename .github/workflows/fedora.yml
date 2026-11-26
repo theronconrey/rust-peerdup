@@ -97,10 +97,14 @@ jobs:
           # Works with no daemon and no session bus: direct on-disk mode.
           rust-peerdup --data-dir /tmp/peer whoami
           mkdir -p /tmp/share
-          rust-peerdup --data-dir /tmp/peer share-add --topic ci --path /tmp/share --role sync
+          rust-peerdup --data-dir /tmp/peer share-add --name ci --path /tmp/share --role sync
+          # --topic is still accepted for --name; same name, different share.
+          rust-peerdup --data-dir /tmp/peer share-add --topic ci --path /tmp/share2 --role sync
+          test "$(rust-peerdup --data-dir /tmp/peer share-list | grep -c ' ci ')" = 2
+          test "$(stat -c %a /tmp/peer/shares/*/share.json | sort -u)" = 600
           rust-peerdup --data-dir /tmp/peer share-list
           # The unencrypted roles are refused.
-          if rust-peerdup --data-dir /tmp/peer share-add --topic seed --path /tmp/share --role seed; then
+          if rust-peerdup --data-dir /tmp/peer share-add --name seed --path /tmp/share --role seed; then
             echo "seed role was accepted"; exit 1
           fi
           # --man=no: the container installs without documentation.
