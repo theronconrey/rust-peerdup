@@ -22,9 +22,13 @@
 //! source of truth; a damaged store can be deleted and is rebuilt from the
 //! plaintext on the next publish.
 
+use crate::access::Access;
 use crate::crypto::{self, KeyRing};
 use anyhow::{anyhow, Context, Result};
 use iroh_blobs::api::blobs::BlobStatus;
+use iroh_blobs::provider::events::{
+    ConnectMode, EventMask, EventSender, ObserveMode, RequestMode, ThrottleMode,
+};
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, Hash};
 use p2panda_core::VerifyingKey;
@@ -33,6 +37,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Format version of the decrypted manifest.
@@ -162,6 +167,10 @@ pub struct StagedVersion {
     /// What the fetch learned for the `BlobCache`, applied by the share
     /// loop (which owns the cache) when it commits.
     cache_updates: Vec<(String, String, Hash, u64)>,
+    /// The manifest and every file blob: once the share loop commits the
+    /// version, it makes them fetchable from us by the share's members
+    /// (`Access::record_version`).
+    pub blobs: Vec<Hash>,
 }
 
 impl StagedVersion {
@@ -171,6 +180,7 @@ impl StagedVersion {
             files,
             epoch,
             cache_updates: Vec::new(),
+            blobs: Vec::new(),
         }
     }
 
@@ -275,25 +285,47 @@ impl BlobCache {
     }
 }
 
+/// What the blob protocol asks us about (`Access::serve_blob_events`):
+/// connects, to learn the node id behind each connection, and every get
+/// request, to check it against the share's members. Get-many, push and
+/// observe are refused outright; the daemon's own fetches only send gets.
+pub const BLOB_EVENTS: EventMask = EventMask {
+    connected: ConnectMode::Intercept,
+    get: RequestMode::Intercept,
+    get_many: RequestMode::Disabled,
+    push: RequestMode::Disabled,
+    observe: ObserveMode::Disabled,
+    throttle: ThrottleMode::None,
+};
+
 /// The daemon's blob store, served on its endpoint under iroh-blobs' ALPN.
 pub struct Transfer {
     store: FsStore,
     endpoint: Endpoint,
+    access: Arc<Access>,
 }
 
 impl Transfer {
-    pub async fn start(data_dir: &Path, endpoint: Endpoint) -> Result<Self> {
+    /// Open the store and serve it. Every request goes through the
+    /// per-share blob gate in `access`.
+    pub async fn start(data_dir: &Path, endpoint: Endpoint, access: Arc<Access>) -> Result<Self> {
         let dir = data_dir.join("blobs");
         std::fs::create_dir_all(&dir).with_context(|| format!("create_dir_all {dir:?}"))?;
         let store = FsStore::load(&dir)
             .await
             .map_err(|e| anyhow!("opening blob store {dir:?}: {e:?}"))?;
-        let blobs = BlobsProtocol::new(&store, None);
+        let (events, rx) = EventSender::channel(64, BLOB_EVENTS);
+        tokio::spawn(access.clone().serve_blob_events(rx));
+        let blobs = BlobsProtocol::new(&store, Some(events));
         endpoint
             .accept(iroh_blobs::ALPN, blobs)
             .await
             .map_err(|e| anyhow!("registering the blobs protocol: {e:?}"))?;
-        Ok(Self { store, endpoint })
+        Ok(Self {
+            store,
+            endpoint,
+            access,
+        })
     }
 
     /// Flush and close the store. Without this the last writes can be lost.
@@ -324,9 +356,13 @@ impl Transfer {
     }
 
     /// Publish the share's current plaintext as a version. Returns the
-    /// manifest blob's hash (hex), which is what gets announced.
+    /// manifest blob's hash (hex), which is what gets announced. The
+    /// version's blobs are fetchable by `share_id`'s members from the
+    /// moment this returns (`Access::record_version`), before any
+    /// announce.
     pub async fn publish(
         &self,
+        share_id: &str,
         root: &Path,
         files: &[FileHash],
         key: &KeyRing,
@@ -334,6 +370,7 @@ impl Transfer {
     ) -> Result<String> {
         let epoch = key.current_epoch();
         let mut entries = Vec::with_capacity(files.len());
+        let mut blobs = Vec::with_capacity(files.len() + 1);
         for (rel, plain) in files {
             let path = rel_to_manifest_path(rel)?;
             let plain_hex = hex32(plain);
@@ -354,6 +391,7 @@ impl Transfer {
                 plain: plain_hex,
                 blob: blob.to_hex().to_string(),
             });
+            blobs.push(blob);
         }
         let keep: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
         cache.retain_paths(&keep);
@@ -364,7 +402,10 @@ impl Transfer {
         };
         let ct =
             crypto::encrypt(key, &serde_json::to_vec(&manifest)?).context("encrypting manifest")?;
-        Ok(self.add(&ct).await?.to_hex().to_string())
+        let manifest_hash = self.add(&ct).await?;
+        blobs.push(manifest_hash);
+        self.access.record_version(share_id, blobs);
+        Ok(manifest_hash.to_hex().to_string())
     }
 
     /// Fetch the version `manifest_hex` from `provider_hex`, check it
@@ -423,6 +464,7 @@ impl Transfer {
         }
 
         let mut staged = StagedVersion::new(files, manifest_epoch);
+        staged.blobs.push(manifest_hash);
         for e in &manifest.entries {
             let rel = manifest_path_to_rel(&e.path)?;
             let blob = Hash::from_str(&e.blob).map_err(|err| anyhow!("bad blob hash: {err:?}"))?;
@@ -445,6 +487,7 @@ impl Transfer {
             staged
                 .cache_updates
                 .push((e.path.clone(), e.plain.clone(), blob, blob_epoch));
+            staged.blobs.push(blob);
         }
         Ok(staged)
     }

@@ -178,7 +178,7 @@ pub async fn start_runtime(
     });
 
     let transfer = Arc::new(
-        Transfer::start(&data_dir, endpoint.clone())
+        Transfer::start(&data_dir, endpoint.clone(), access.clone())
             .await
             .context("starting the blob store")?,
     );
@@ -880,7 +880,11 @@ async fn sync_loop(
                         }
                         Verdict::LocalWins => drop(staged),
                         Verdict::Fetch { concurrent } => match commit_remote(&root, staged, &remote, state.as_ref(), &mut cache, concurrent, &peer_id_hex[..8]) {
-                            Ok((new_state, rescan)) => {
+                            Ok((new_state, blobs, rescan)) => {
+                                // We serve it from now on (we announce it
+                                // below): its blobs become fetchable by
+                                // this share's members.
+                                access.record_version(&config.id, blobs);
                                 if rescan {
                                     // Conflict copies or files kept from our
                                     // side: publish them as a newer version.
@@ -1317,7 +1321,9 @@ async fn reconcile_on_start(
     }
 
     let (disk_vh, manifest, files) = snapshot_content(root)?;
-    let manifest_hash = transfer.publish(root, &files, key, cache).await?;
+    let manifest_hash = transfer
+        .publish(&config.id, root, &files, key, cache)
+        .await?;
     cache.save(data_dir, &config.id)?;
 
     let state = match persisted {
@@ -1424,7 +1430,9 @@ async fn publish_current(
             required,
         });
     }
-    let manifest_hash = transfer.publish(root, &files, key, cache).await?;
+    let manifest_hash = transfer
+        .publish(&config.id, root, &files, key, cache)
+        .await?;
     tracing::debug!(share_id = %config.id, epoch, "published to the blob store");
     cache.save(data_dir, &config.id)?;
     let next = next_state(
@@ -1678,8 +1686,8 @@ async fn start_fetch(
 }
 
 /// Apply a fetched, verified version to the share root and return the new
-/// state, plus whether files of ours were kept (so the caller publishes
-/// them as a newer version). Runs on the share loop, after `judge` said
+/// state, the version's blobs (manifest and files), and whether files of
+/// ours were kept (so the caller publishes them as a newer version). Runs on the share loop, after `judge` said
 /// the version still wins.
 ///
 /// Local content is never silently lost. A file the new version would
@@ -1706,9 +1714,10 @@ fn commit_remote(
     cache: &mut BlobCache,
     concurrent: bool,
     me_short: &str,
-) -> Result<(ShareState, bool)> {
+) -> Result<(ShareState, Vec<iroh_blobs::Hash>, bool)> {
     let incoming: FileMap = staged.files.iter().cloned().collect();
     let epoch = staged.epoch;
+    let blobs = staged.blobs.clone();
     let empty = FileMap::new();
     let (recorded, base) = current
         .map(|s| (&s.manifest, &s.base))
@@ -1776,6 +1785,7 @@ fn commit_remote(
             base: incoming.clone(),
             manifest: incoming,
         },
+        blobs,
         kept,
     ))
 }
@@ -2499,7 +2509,7 @@ mod tests {
         // Their newer version changes a and drops b and c.
         let staged = transfer::staged_for_test(root, &[("a.txt", b"theirs")]);
         let mut cache = BlobCache::default();
-        let (next, kept) = commit_remote(
+        let (next, _, kept) = commit_remote(
             root,
             staged,
             &remote(),
@@ -2532,7 +2542,7 @@ mod tests {
         write(root, "a.txt", b"v1");
         let current = state(files(&[("a.txt", b"v1")]), FileMap::new());
         let staged = transfer::staged_for_test(root, &[("a.txt", b"v2")]);
-        let (_, kept) = commit_remote(
+        let (_, _, kept) = commit_remote(
             root,
             staged,
             &remote(),
@@ -2568,7 +2578,7 @@ mod tests {
             base,
         );
         let staged = transfer::staged_for_test(root, &[("a.txt", b"v0"), ("b.txt", b"theirs")]);
-        let (_, kept) = commit_remote(
+        let (_, _, kept) = commit_remote(
             root,
             staged,
             &remote(),
