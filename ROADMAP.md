@@ -335,10 +335,14 @@ would put these gaps in front of users.
 **Key deliverables:**
 - Announce reachable addresses, or move transfer onto iroh (Phase 6a).
 - Timeouts on every fetch, run off the share's select loop, so one bad
-  announce can't stall a share.
+  announce can't stall a share. *Timeouts done (30 s connect, 300 s per
+  blob); fetches still run on the select loop, so a slow provider stalls
+  the share for that long.*
 - Signed announces: each announce signed with `identity.key` over the share,
   info-hash, version hash, clock and timestamp; only current Writers and
   Owners are applied. New versions under old key epochs are refused.
+  *Signing, the Writer/Owner check and bounds on clocks and timestamps
+  done; refusing new versions under old epochs is not done yet.*
 - Decrypt into a staging directory and check the version hash before
   anything is renamed into the share root.
 - Conflict copies (`name (conflict from <peer> <date>).ext`) instead of

@@ -47,7 +47,7 @@ writing:
 | Write permission enforced on sync announces (readers, revoked members) | ✅ Done (signed announces) |
 | 7. D-Bus IPC surface | ⚠️ Partial: CLI talks to the daemon over `org.peerdup.Daemon1`; no signals yet |
 | 6a. Transport: iroh-blobs over iroh | ✅ Done (spike checks open) |
-| 6. Only members can connect (replaces the BitTorrent admission gate) | ✅ Done |
+| 6. Only members can connect (replaces the BitTorrent admission gate) | ✅ Done for new connections; a revoked member's open connection isn't closed yet |
 | 7.5. Sync across networks | ⚠️ In progress: works via relays; conflict copies and random topics next |
 
 Detailed design notes, including non-obvious gotchas about iroh and

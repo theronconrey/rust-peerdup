@@ -21,7 +21,8 @@ almost none of BitTorrent: DHT off, no trackers, no UPnP, one known peer.
   local yet.
 - A version = one ciphertext blob per file (`crypto::encrypt`, epoch header
   included) plus one encrypted JSON manifest of `(path, plaintext blake3,
-  blob hash)`. Gossip (`share_announce_v2`) carries the manifest hash, the
+  blob hash)`. Gossip (`share_announce_v3`, signed; see "Signed
+  announces") carries the manifest hash, the
   provider's node id (= identity key hex; p2panda's `NodeId` is
   `VerifyingKey`), the version hash, clock and timestamp.
 - Receive: connect (30 s timeout), fetch the manifest, decrypt, refuse
@@ -62,8 +63,15 @@ network id into every ALPN, so blobs must go through p2panda's
   union of every running share's members; recomputed at share start,
   after auth ops apply, after invite/revoke, and when a share stops.
   Blocked nodes are refused after the TLS handshake with code 403 for
-  every ALPN, so a revoked member gets neither blobs nor gossip.
-  `allow()` lifts a block, so re-inviting works. Not yet per share: a
+  every ALPN, so a revoked member can't open a new connection for blobs
+  or gossip. **`ConnectionBlockList::block` only affects new
+  connections**: one the revoked node already has open stays up until it
+  closes (idle timeout, restart, network change), and it can keep
+  fetching blobs and receiving gossip over it until then. What it gets
+  is ciphertext; after the rotation it can't decrypt new versions, and
+  its announces are refused because it is no longer a Writer. Closing
+  live connections on revocation is still to do. `allow()` lifts a
+  block, so re-inviting works. Not yet per share: a
   member of share A could fetch share B's blobs if it learned their
   hashes (they are ciphertext under B's key).
 - Relays: the default is n0's public relays (rate-limited, meant for
@@ -116,6 +124,19 @@ dropped with a warning, as are clocks with more than 1,024 entries. A
 Reader's daemon still records its local edits but doesn't announce them
 (it logs that), and the next newer version from a Writer replaces them.
 Unsigned announces (`share_announce_v2`, `share_announce`) are ignored.
+
+Bounds checked before the signature (`Announce::verify`):
+- at most 1,024 clock entries;
+- every clock key is a peer id, 64 lowercase hex characters;
+- every clock value is at most 2^40 (`MAX_CLOCK_VALUE`).
+  `VectorClock::increment` saturates, so before this bound a Writer
+  could send `u64::MAX` and every later version, ours included, would
+  compare `Equal` with it: the share froze for good;
+- the timestamp is at most 10 minutes ahead of our clock
+  (`MAX_CLOCK_SKEW_MINUTES`). A later timestamp always wins
+  last-writer-wins, so an unbounded one would win every conflict.
+  Peers whose clocks are more than 10 minutes apart see the faster one's
+  announces refused until the slower clock catches up; keep NTP on.
 
 Each send also carries a random `nonce` outside the signature. Gossip drops
 repeated messages, and Ed25519 signatures are deterministic, so without it
@@ -445,9 +466,16 @@ the broadcast tick doesn't lose the rotation.
 
 ## Things that look wrong but aren't
 
-*History:* the three items below were about the librqbit session, which no
-longer exists. For the current equivalents see "Transport: iroh-blobs"
+*History:* the three librqbit items below were about the librqbit
+session, which no longer exists. For the current equivalents see "Transport: iroh-blobs"
 (the blob cache, the staging step, and the `.peerdup` path filters).
+
+### `AuthState::apply_remote` refuses a well-signed `Create`
+Looks like it breaks replaying a log into a fresh state. It doesn't: the
+state is bound to its group (`AuthState::empty_for`), and a `Create` is
+accepted exactly once, as the first op with no dependencies. A second
+one would reset the group (see "p2panda-auth: a second Create resets
+group state"); don't relax `check_shape`.
 
 ### `disable_dht: true` in `SessionOptions`
 Looks like we crippled BitTorrent's peer discovery. We didn't — for this demo
@@ -813,6 +841,46 @@ empty group, after which every rotation was rejected as `NotAManager`. An
 `AuthState` also only accepts ops for the group of its first op, buffers
 at most 256 ops with missing dependencies, and invite/revoke check that
 the local identity is an Owner before authoring anything.
+
+## p2panda-auth: a second Create resets group state
+
+p2panda-auth 0.5.2's `GroupCrdt::process` handles a `Create` for a group
+that already exists as a fresh definition of the group: it does not check
+that the group is new, or that the author has any role in it. Review
+finding 1, confirmed by `stranger_create_for_existing_group_is_refused`
+failing in CI (spike run 45737164708): after an Owner created the group
+and added a Writer and a Reader, a Reader-signed `Create` with no
+dependencies, applied through `apply_remote`, left the group as
+`[(reader, Owner)]`. Anyone who could reach the gossip topic could have
+done the same.
+
+So `AuthState` enforces the shape of the log itself (`check_shape`):
+- an `AuthState` is bound to its share's group from the start
+  (`AuthState::empty_for(group_id_for(share_id))`);
+- a `Create` is accepted only as the first op, and only with no
+  dependencies;
+- every other op must have dependencies.
+
+The first `Create` therefore always comes from the share's creator: from
+`share-add` on their machine, or from the ticket on a joiner's, whose log
+is replayed and checked (`Ticket::verified_auth_state`) before anything
+is written. A share whose `auth.log` is empty is refused at start, since
+its first gossiped op would otherwise define the group. If you add
+another way to build an `AuthState`, start it with `empty_for` and feed
+it a log that begins with the real `Create`.
+
+## Joining writes share.json last
+
+`share-join` (direct and D-Bus) decodes the ticket, checks it was issued
+for our key, and replays and verifies its auth log, requiring that no op
+waits for a missing dependency and that we are a member, before it writes
+anything. Then `ticket::install_join` writes `keys.bin`, `auth.log` and
+`bootstrap.json`, and `share.json` last; `share::load_all` skips a share
+directory without `share.json`, so the daemon never starts a share with
+missing keys or membership. If a write fails the directory is removed,
+and a directory without `share.json` (an interrupted join) is replaced on
+the next join. `share-add` likewise writes `auth.log` before `share.json`
+and refuses a share that already exists.
 
 ## Direct mode takes the daemon lock
 
