@@ -188,17 +188,15 @@ impl StagedVersion {
     }
 
     /// Record what this version's files are encrypted as, so re-announces
-    /// and our own next publish reuse the blobs.
+    /// and our own next publish reuse the blobs. Entries for other paths
+    /// stay: a concurrent apply keeps files of ours the other side doesn't
+    /// have (and conflict copies), and dropping their entries made the
+    /// next publish re-encrypt them, a whole large file for nothing. The
+    /// next `publish` prunes entries for files that are really gone.
     pub fn apply_to_cache(&self, cache: &mut BlobCache) {
         for (path, plain, blob, epoch) in &self.cache_updates {
             cache.remember(path.clone(), plain.clone(), *blob, *epoch);
         }
-        let keep: Vec<String> = self
-            .files
-            .iter()
-            .filter_map(|(rel, _)| rel_to_manifest_path(rel).ok())
-            .collect();
-        cache.retain_paths(&keep);
     }
 }
 
@@ -825,6 +823,25 @@ mod tests {
         assert!(!tmp.exists());
         assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"hello");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn applying_a_version_keeps_cache_entries_for_files_we_kept() {
+        let mut cache = BlobCache::default();
+        let ours = Hash::new(b"big");
+        cache.remember("big.bin".into(), "p-big".into(), ours, 1);
+        let mut staged = StagedVersion::new(vec![(PathBuf::from("a.txt"), [1u8; 32])], 1);
+        let theirs = Hash::new(b"a");
+        staged
+            .cache_updates
+            .push(("a.txt".into(), "p-a".into(), theirs, 1));
+        staged.apply_to_cache(&mut cache);
+        assert_eq!(cache.reuse("a.txt", "p-a", 1), Some(theirs));
+        assert_eq!(
+            cache.reuse("big.bin", "p-big", 1),
+            Some(ours),
+            "a file kept from our side must not be re-encrypted"
+        );
     }
 
     #[test]
