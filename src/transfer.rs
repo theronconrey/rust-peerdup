@@ -22,7 +22,7 @@
 //! source of truth; a damaged store can be deleted and is rebuilt from the
 //! plaintext on the next publish.
 
-use crate::crypto::{self, KeyRing, EPOCH_LEN};
+use crate::crypto::{self, KeyRing};
 use anyhow::{anyhow, Context, Result};
 use iroh_blobs::api::blobs::BlobStatus;
 use iroh_blobs::store::fs::FsStore;
@@ -84,6 +84,70 @@ struct Manifest {
 /// One file of a version: relative path plus blake3 of its plaintext.
 pub type FileHash = (PathBuf, [u8; 32]);
 
+/// A version refused for the key epochs it is encrypted under (see
+/// `epochs`). Distinct from "no key for epoch N" (we are behind; a retry
+/// after the rotated key arrives succeeds): a refusal is permanent for
+/// that manifest, since the required epoch only grows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpochRefused {
+    /// The manifest is under a key epoch older than the required one.
+    Old { epoch: u64, required: u64 },
+    /// A file blob's epoch differs from the manifest's: a version is
+    /// encrypted under one key, so old ciphertext can't be slipped into a
+    /// version whose manifest is under a current key.
+    Mixed {
+        manifest_epoch: u64,
+        blob_epoch: u64,
+    },
+}
+
+impl std::fmt::Display for EpochRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EpochRefused::Old { epoch, required } => write!(
+                f,
+                "version encrypted under epoch {epoch}; this share requires >= {required} \
+                 after a revocation"
+            ),
+            EpochRefused::Mixed {
+                manifest_epoch,
+                blob_epoch,
+            } => write!(
+                f,
+                "version mixes key epochs: manifest under epoch {manifest_epoch}, a file \
+                 under epoch {blob_epoch}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EpochRefused {}
+
+/// Decide whether a version may be applied on its key epochs: the
+/// manifest's epoch must be at least `min_epoch` (the receiver's required
+/// epoch), and every file blob must have the manifest's epoch.
+pub fn check_version_epochs(
+    manifest_epoch: u64,
+    blob_epochs: impl IntoIterator<Item = u64>,
+    min_epoch: u64,
+) -> std::result::Result<(), EpochRefused> {
+    if manifest_epoch < min_epoch {
+        return Err(EpochRefused::Old {
+            epoch: manifest_epoch,
+            required: min_epoch,
+        });
+    }
+    for blob_epoch in blob_epochs {
+        if blob_epoch != manifest_epoch {
+            return Err(EpochRefused::Mixed {
+                manifest_epoch,
+                blob_epoch,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// A fetched, verified version, staged next to its final paths. Dropping
 /// it removes every staged file not yet committed, so an error, a timeout
 /// or an aborted fetch task leaves no `*.peerdup-tmp` behind.
@@ -91,16 +155,21 @@ pub struct StagedVersion {
     /// `(final path relative to the root, temp file holding the plaintext)`.
     staged: Vec<(PathBuf, PathBuf)>,
     pub files: Vec<FileHash>,
+    /// Key epoch of the manifest and of every file blob. The share loop
+    /// checks it again against the required epoch before committing,
+    /// since a revocation may have arrived while the fetch ran.
+    pub epoch: u64,
     /// What the fetch learned for the `BlobCache`, applied by the share
     /// loop (which owns the cache) when it commits.
     cache_updates: Vec<(String, String, Hash, u64)>,
 }
 
 impl StagedVersion {
-    fn new(files: Vec<FileHash>) -> Self {
+    fn new(files: Vec<FileHash>, epoch: u64) -> Self {
         Self {
             staged: Vec::new(),
             files,
+            epoch,
             cache_updates: Vec::new(),
         }
     }
@@ -305,6 +374,11 @@ impl Transfer {
     /// plaintext next to its destination under `root`. Nothing in the share
     /// root changes until the caller commits the result; if this fails or
     /// is cancelled, the staged files are removed.
+    ///
+    /// A version whose manifest is under a key epoch below `min_epoch`, or
+    /// that has a file blob under any other epoch than its manifest's, is
+    /// refused with an [`EpochRefused`] error (`check_version_epochs`),
+    /// before the manifest is decrypted or a blob is staged.
     pub async fn fetch(
         &self,
         provider_hex: &str,
@@ -312,6 +386,7 @@ impl Transfer {
         version_hash: &str,
         root: &Path,
         key: &KeyRing,
+        min_epoch: u64,
     ) -> Result<StagedVersion> {
         let provider = VerifyingKey::from_str(provider_hex)
             .map_err(|e| anyhow!("bad provider id {provider_hex:?}: {e:?}"))?;
@@ -329,6 +404,8 @@ impl Transfer {
         self.fetch_blob(&conn, manifest_hash, MAX_MANIFEST_BYTES)
             .await?;
         let manifest_ct = self.read(manifest_hash).await?;
+        let manifest_epoch = crypto::epoch_of(&manifest_ct).context("reading the manifest")?;
+        check_version_epochs(manifest_epoch, std::iter::empty::<u64>(), min_epoch)?;
         let manifest_pt = crypto::decrypt(key, &manifest_ct).context("decrypting manifest")?;
         let manifest: Manifest =
             serde_json::from_slice(&manifest_pt).context("parsing manifest")?;
@@ -347,12 +424,15 @@ impl Transfer {
             ));
         }
 
-        let mut staged = StagedVersion::new(files);
+        let mut staged = StagedVersion::new(files, manifest_epoch);
         for e in &manifest.entries {
             let rel = manifest_path_to_rel(&e.path)?;
             let blob = Hash::from_str(&e.blob).map_err(|err| anyhow!("bad blob hash: {err:?}"))?;
             self.fetch_blob(&conn, blob, MAX_BLOB_BYTES).await?;
             let ct = self.read(blob).await?;
+            let blob_epoch =
+                crypto::epoch_of(&ct).with_context(|| format!("reading {}", e.path))?;
+            check_version_epochs(manifest_epoch, [blob_epoch], min_epoch)?;
             let pt = crypto::decrypt(key, &ct).with_context(|| format!("decrypting {}", e.path))?;
             if blake3::hash(&pt).to_hex().as_str() != e.plain {
                 return Err(anyhow!("{} does not match its manifest hash", e.path));
@@ -364,16 +444,9 @@ impl Transfer {
             // up too.
             staged.staged.push((rel, tmp.clone()));
             write_new(&tmp, &pt)?;
-            if ct.len() >= EPOCH_LEN {
-                let mut ep = [0u8; EPOCH_LEN];
-                ep.copy_from_slice(&ct[..EPOCH_LEN]);
-                staged.cache_updates.push((
-                    e.path.clone(),
-                    e.plain.clone(),
-                    blob,
-                    u64::from_le_bytes(ep),
-                ));
-            }
+            staged
+                .cache_updates
+                .push((e.path.clone(), e.plain.clone(), blob, blob_epoch));
         }
         Ok(staged)
     }
@@ -430,6 +503,7 @@ pub(crate) fn staged_for_test(root: &Path, files: &[(&str, &[u8])]) -> StagedVer
             .iter()
             .map(|(p, b)| (PathBuf::from(p), *blake3::hash(b).as_bytes()))
             .collect(),
+        1,
     );
     for (p, b) in files {
         let rel = PathBuf::from(p);
@@ -739,18 +813,83 @@ mod tests {
         let root = scratch("staged");
         let tmp = root.join("a.txt.peerdup-tmp");
         write_new(&tmp, b"hello").unwrap();
-        let mut staged = StagedVersion::new(Vec::new());
+        let mut staged = StagedVersion::new(Vec::new(), 1);
         staged.staged.push((PathBuf::from("a.txt"), tmp.clone()));
         drop(staged);
         assert!(!tmp.exists(), "dropping a staged version must clean up");
 
         write_new(&tmp, b"hello").unwrap();
-        let mut staged = StagedVersion::new(Vec::new());
+        let mut staged = StagedVersion::new(Vec::new(), 1);
         staged.staged.push((PathBuf::from("a.txt"), tmp.clone()));
         staged.commit(&root).unwrap();
         assert!(!tmp.exists());
         assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"hello");
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn version_epochs_equal_and_current_are_accepted() {
+        assert_eq!(check_version_epochs(2, [2, 2, 2], 2), Ok(()));
+        assert_eq!(
+            check_version_epochs(1, std::iter::empty::<u64>(), 1),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn version_epochs_above_the_minimum_are_accepted() {
+        // A manual rotation can put a version ahead of the required epoch.
+        assert_eq!(check_version_epochs(3, [3, 3], 2), Ok(()));
+    }
+
+    #[test]
+    fn a_manifest_below_the_minimum_is_refused() {
+        let err = check_version_epochs(1, [1], 2).unwrap_err();
+        assert_eq!(
+            err,
+            EpochRefused::Old {
+                epoch: 1,
+                required: 2
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "version encrypted under epoch 1; this share requires >= 2 after a revocation"
+        );
+    }
+
+    #[test]
+    fn old_blobs_under_a_current_manifest_are_refused() {
+        // The manifest is under the current key but a file is old
+        // ciphertext, which the revoked member could read.
+        assert_eq!(
+            check_version_epochs(2, [2, 1, 2], 2),
+            Err(EpochRefused::Mixed {
+                manifest_epoch: 2,
+                blob_epoch: 1
+            })
+        );
+        // Mixed epochs are refused even with no revocation at all.
+        assert!(check_version_epochs(2, [3], 1).is_err());
+    }
+
+    #[test]
+    fn an_epoch_refusal_is_distinguishable_from_a_missing_key() {
+        let refused: anyhow::Error = check_version_epochs(1, std::iter::empty::<u64>(), 2)
+            .unwrap_err()
+            .into();
+        assert!(refused.downcast_ref::<EpochRefused>().is_some());
+        let ring = {
+            let td =
+                std::env::temp_dir().join(format!("peerdup-ep-{:016x}", rand::random::<u64>()));
+            let r = crypto::load_or_create_keyring(&td, "s").unwrap();
+            std::fs::remove_dir_all(&td).unwrap();
+            r
+        };
+        let mut blob = crypto::encrypt(&ring, b"x").unwrap();
+        blob[..8].copy_from_slice(&7u64.to_le_bytes());
+        let missing = crypto::decrypt(&ring, &blob).unwrap_err();
+        assert!(missing.downcast_ref::<EpochRefused>().is_none());
     }
 
     #[test]
@@ -760,7 +899,13 @@ mod tests {
         c.remember("a".into(), "p1".into(), h, 1);
         assert_eq!(c.reuse("a", "p1", 1), Some(h));
         assert_eq!(c.reuse("a", "p2", 1), None);
+        // A rotation means re-encrypting: epoch-1 ciphertext is never
+        // reused for a version published under epoch 2.
         assert_eq!(c.reuse("a", "p1", 2), None);
+        let h2 = Hash::new(b"ct2");
+        c.remember("a".into(), "p1".into(), h2, 2);
+        assert_eq!(c.reuse("a", "p1", 2), Some(h2));
+        assert_eq!(c.reuse("a", "p1", 1), None);
         c.retain_paths(&["b".to_string()]);
         assert_eq!(c.reuse("a", "p1", 1), None);
     }
