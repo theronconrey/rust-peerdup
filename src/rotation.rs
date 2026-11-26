@@ -292,6 +292,9 @@ pub fn verify_and_decrypt(
     VerifyOutcome::OkForUs(out)
 }
 
+/// Largest pending-rotation file we read; a chunk is about 35 KiB.
+pub const MAX_PENDING_ROTATION_BYTES: usize = 1024 * 1024;
+
 /// Per-share directory for queued rotations the daemon hasn't broadcast yet.
 pub fn pending_dir(data_dir: &Path, share_id: &str) -> PathBuf {
     data_dir::shares_dir(data_dir)
@@ -331,9 +334,17 @@ pub fn load_pending(data_dir: &Path, share_id: &str) -> Result<Vec<SignedRotatio
             continue;
         }
         let bytes = fs::read(&path).with_context(|| format!("reading {path:?}"))?;
-        let (rot, _): (SignedRotation, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                .with_context(|| format!("decoding {path:?}"))?;
+        if bytes.len() > MAX_PENDING_ROTATION_BYTES {
+            return Err(anyhow!(
+                "{path:?} is {} bytes, over the {MAX_PENDING_ROTATION_BYTES}-byte limit",
+                bytes.len()
+            ));
+        }
+        let (rot, _): (SignedRotation, _) = bincode::serde::decode_from_slice(
+            &bytes,
+            bincode::config::standard().with_limit::<MAX_PENDING_ROTATION_BYTES>(),
+        )
+        .with_context(|| format!("decoding {path:?}"))?;
         out.push(rot);
     }
     out.sort_by_key(|r| r.epoch);

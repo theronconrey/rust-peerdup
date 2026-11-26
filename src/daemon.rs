@@ -28,6 +28,11 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::task::JoinSet;
 
+/// Overall limit on fetching one remote version. Each blob also has its
+/// own limit (`transfer.rs`); this bounds a version with many files from a
+/// provider that is slow but never quite stalls.
+const VERSION_FETCH_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 /// Cap the in-memory buffer of out-of-order key rotations per share. 64 epochs
 /// is far more than expected; we evict the oldest if we somehow run past it.
 const ROTATION_BUFFER_CAP: usize = 64;
@@ -608,6 +613,16 @@ async fn sync_loop(
     announce_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     announce_tick.tick().await;
 
+    // Remote versions are fetched and staged off this loop, so a slow
+    // provider can't hold up IPC commands, auth ops, rotations or local
+    // changes. At most one fetch runs per share; the newest announce that
+    // arrives meanwhile waits in `next`. Dropping `fetch` aborts the task,
+    // and its staged files are removed.
+    let (fetch_tx, mut fetch_rx) = mpsc::channel::<FetchDone>(1);
+    let mut fetch: Option<FetchTask> = None;
+    let mut next: Option<RemoteVersion> = None;
+    let mut generation: u64 = 0;
+
     loop {
         tokio::select! {
             Some(()) = debounce(&mut watch_rx, Duration::from_millis(500)) => {
@@ -713,70 +728,94 @@ async fn sync_loop(
                     ..
                 } = ann;
 
-                let cmp = state.as_ref().map(|s| s.clock.compare(&remote_clock));
-                match cmp {
-                    Some(ClockOrdering::Equal) => continue,
-                    Some(ClockOrdering::SelfDominates) => {
-                        tracing::debug!(share_id = %config.id, "ignoring older remote announce");
-                        continue;
+                let remote = RemoteVersion {
+                    manifest,
+                    provider,
+                    version_hash: remote_vhash,
+                    clock: remote_clock,
+                    timestamp: remote_ts,
+                };
+                match judge(&config.id, state.as_ref(), &remote) {
+                    Verdict::Ignore => {}
+                    Verdict::LocalWins(new_state) => {
+                        if let Err(e) = persist(&data_dir, &config.id, &new_state) {
+                            tracing::warn!(error = ?e, "could not persist state");
+                        }
+                        publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
+                        state = Some(new_state);
                     }
-                    Some(ClockOrdering::Concurrent) => {
-                        let local = state.as_ref().unwrap();
-                        let we_win = lww_we_win(local.timestamp, &local.version_hash, remote_ts, &remote_vhash);
-                        if we_win {
-                            // Local wins. Merge remote's clock into ours (so future
-                            // announces dominate), persist, re-announce. No fetch.
-                            let mut clock = local.clock.clone();
-                            clock.merge(&remote_clock);
-                            let new_state = ShareState { clock, ..local.clone() };
-                            tracing::warn!(
-                                share_id = %config.id,
-                                local_ts = %new_state.timestamp,
-                                remote_ts = %remote_ts,
-                                "concurrent edits; LWW: local wins"
-                            );
+                    Verdict::Fetch if fetch.is_some() => {
+                        // One fetch per share at a time; keep the newest
+                        // version that isn't older than the one waiting.
+                        let older = next
+                            .as_ref()
+                            .is_some_and(|n| n.clock.compare(&remote.clock) == ClockOrdering::SelfDominates);
+                        if !older {
+                            tracing::debug!(share_id = %config.id, "a fetch is running; queued the announce");
+                            next = Some(remote);
+                        }
+                    }
+                    Verdict::Fetch => {
+                        fetch = Some(start_fetch(&mut generation, remote, &config.id, &transfer, &root, &key, &fetch_tx).await);
+                    }
+                }
+            }
+            Some(done) = fetch_rx.recv() => {
+                if fetch.as_ref().map(|f| f.generation) != Some(done.generation) {
+                    tracing::debug!(share_id = %config.id, "discarding the result of a superseded fetch");
+                    continue;
+                }
+                fetch = None;
+                let FetchDone { remote, result, .. } = done;
+                match result {
+                    Err(e) => tracing::warn!(error = ?e, share_id = %config.id, "apply_remote failed"),
+                    // The share may have moved on while the fetch ran (a
+                    // local edit, or a version applied in between), so
+                    // decide again before touching the root.
+                    Ok(staged) => match judge(&config.id, state.as_ref(), &remote) {
+                        Verdict::Ignore => {
+                            tracing::info!(share_id = %config.id, version_hash = %remote.version_hash,
+                                "fetched version is no longer newer; discarding");
+                        }
+                        Verdict::LocalWins(new_state) => {
+                            drop(staged);
                             if let Err(e) = persist(&data_dir, &config.id, &new_state) {
                                 tracing::warn!(error = ?e, "could not persist state");
                             }
                             publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
                             state = Some(new_state);
-                            continue;
                         }
-                        tracing::warn!(
-                            share_id = %config.id,
-                            local_ts = %local.timestamp,
-                            remote_ts = %remote_ts,
-                            "concurrent edits; LWW: remote wins, fetching"
-                        );
-                        // fall through to apply remote
-                    }
-                    Some(ClockOrdering::OtherDominates) | None => {}
+                        Verdict::Fetch => match commit_remote(&root, staged, &remote, state.as_ref(), &mut cache) {
+                            Ok(new_state) => {
+                                tracing::info!(share_id = %config.id, version_hash = %new_state.version_hash,
+                                    "applied remote version");
+                                if let Err(e) = persist(&data_dir, &config.id, &new_state) {
+                                    tracing::warn!(error = ?e, "could not persist state");
+                                }
+                                if let Err(e) = cache.save(&data_dir, &config.id) {
+                                    tracing::warn!(error = ?e, "could not save blob cache");
+                                }
+                                publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
+                                state = Some(new_state);
+                            }
+                            Err(e) => tracing::warn!(error = ?e, share_id = %config.id, "apply_remote failed"),
+                        },
+                    },
                 }
-
-                tracing::info!(
-                    share_id = %config.id,
-                    %remote_vhash,
-                    %manifest,
-                    %provider,
-                    remote_clock = ?remote_clock.0,
-                    "received remote announce; applying"
-                );
-                let apply_outcome = {
-                    let k = key.read().await;
-                    apply_remote_sync(&transfer, &root, &provider, &manifest, &remote_vhash, &remote_clock, remote_ts, &k, state.as_ref(), &mut cache).await
-                };
-                match apply_outcome {
-                    Ok(new_state) => {
-                        if let Err(e) = persist(&data_dir, &config.id, &new_state) {
-                            tracing::warn!(error = ?e, "could not persist state");
+                if let Some(queued) = next.take() {
+                    match judge(&config.id, state.as_ref(), &queued) {
+                        Verdict::Fetch => {
+                            fetch = Some(start_fetch(&mut generation, queued, &config.id, &transfer, &root, &key, &fetch_tx).await);
                         }
-                        if let Err(e) = cache.save(&data_dir, &config.id) {
-                            tracing::warn!(error = ?e, "could not save blob cache");
+                        Verdict::LocalWins(new_state) => {
+                            if let Err(e) = persist(&data_dir, &config.id, &new_state) {
+                                tracing::warn!(error = ?e, "could not persist state");
+                            }
+                            publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
+                            state = Some(new_state);
                         }
-                        publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
-                        state = Some(new_state);
+                        Verdict::Ignore => {}
                     }
-                    Err(e) => tracing::warn!(error = ?e, share_id = %config.id, "apply_remote failed"),
                 }
             }
         }
@@ -1155,27 +1194,158 @@ fn has_content(root: &Path) -> Result<bool> {
     Ok(!paths.is_empty())
 }
 
-/// Fetch a remote version, verify it, and apply it to the share root.
-/// Nothing in the root changes until every file has been fetched,
-/// decrypted and checked against the manifest, and the manifest against
-/// the announced version hash.
-#[allow(clippy::too_many_arguments)]
-async fn apply_remote_sync(
-    transfer: &Transfer,
+/// A verified remote version that may be fetched.
+#[derive(Clone, Debug)]
+struct RemoteVersion {
+    manifest: String,
+    provider: String,
+    version_hash: String,
+    clock: VectorClock,
+    timestamp: DateTime<Utc>,
+}
+
+/// What to do with a remote version, given where the share is now.
+enum Verdict {
+    /// Older than or equal to ours.
+    Ignore,
+    /// Concurrent, and ours wins last-writer-wins: keep our content with
+    /// both clocks merged (so our next announce dominates).
+    LocalWins(ShareState),
+    /// Newer, or concurrent and it wins: fetch and apply it.
+    Fetch,
+}
+
+fn judge(share_id: &str, state: Option<&ShareState>, remote: &RemoteVersion) -> Verdict {
+    let Some(local) = state else {
+        return Verdict::Fetch;
+    };
+    match local.clock.compare(&remote.clock) {
+        ClockOrdering::Equal => Verdict::Ignore,
+        ClockOrdering::SelfDominates => {
+            tracing::debug!(share_id, "ignoring older remote announce");
+            Verdict::Ignore
+        }
+        ClockOrdering::OtherDominates => Verdict::Fetch,
+        ClockOrdering::Concurrent => {
+            if lww_we_win(
+                local.timestamp,
+                &local.version_hash,
+                remote.timestamp,
+                &remote.version_hash,
+            ) {
+                let mut clock = local.clock.clone();
+                clock.merge(&remote.clock);
+                tracing::warn!(
+                    share_id,
+                    local_ts = %local.timestamp,
+                    remote_ts = %remote.timestamp,
+                    "concurrent edits; LWW: local wins"
+                );
+                Verdict::LocalWins(ShareState {
+                    clock,
+                    ..local.clone()
+                })
+            } else {
+                tracing::warn!(
+                    share_id,
+                    local_ts = %local.timestamp,
+                    remote_ts = %remote.timestamp,
+                    "concurrent edits; LWW: remote wins, fetching"
+                );
+                Verdict::Fetch
+            }
+        }
+    }
+}
+
+/// A fetch running in its own task. Dropping this aborts it.
+struct FetchTask {
+    generation: u64,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for FetchTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+struct FetchDone {
+    generation: u64,
+    remote: RemoteVersion,
+    result: Result<transfer::StagedVersion>,
+}
+
+/// Fetch, verify and stage `remote` in a task of its own, with a copy of
+/// the keyring (a read lock held across the fetch would block a rotation
+/// from installing). The result comes back on `tx`, tagged with a fresh
+/// generation.
+async fn start_fetch(
+    generation: &mut u64,
+    remote: RemoteVersion,
+    share_id: &str,
+    transfer: &Arc<Transfer>,
     root: &Path,
-    provider: &str,
-    manifest_hash: &str,
-    remote_vhash: &str,
-    remote_clock: &VectorClock,
-    remote_timestamp: DateTime<Utc>,
-    key: &KeyRing,
+    key: &Arc<RwLock<KeyRing>>,
+    tx: &mpsc::Sender<FetchDone>,
+) -> FetchTask {
+    *generation += 1;
+    let generation = *generation;
+    tracing::info!(
+        share_id,
+        remote_vhash = %remote.version_hash,
+        manifest = %remote.manifest,
+        provider = %remote.provider,
+        remote_clock = ?remote.clock.0,
+        "received remote announce; applying"
+    );
+    let transfer = transfer.clone();
+    let root = root.to_path_buf();
+    let key = key.read().await.clone();
+    let tx = tx.clone();
+    let handle = tokio::spawn(async move {
+        let result = tokio::time::timeout(
+            VERSION_FETCH_TIMEOUT,
+            transfer.fetch(
+                &remote.provider,
+                &remote.manifest,
+                &remote.version_hash,
+                &root,
+                &key,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow!(
+                "fetching the version took longer than {VERSION_FETCH_TIMEOUT:?}"
+            ))
+        });
+        // If the share loop is gone, the staged files are removed when the
+        // unsent result drops.
+        let _ = tx
+            .send(FetchDone {
+                generation,
+                remote,
+                result,
+            })
+            .await;
+    });
+    FetchTask { generation, handle }
+}
+
+/// Apply a fetched, verified version to the share root: rename the staged
+/// files into place, remove the files the new version dropped, and merge
+/// the clocks. Runs on the share loop, after `judge` said the version
+/// still wins.
+fn commit_remote(
+    root: &Path,
+    staged: transfer::StagedVersion,
+    remote: &RemoteVersion,
     current: Option<&ShareState>,
     cache: &mut BlobCache,
 ) -> Result<ShareState> {
-    let staged = transfer
-        .fetch(provider, manifest_hash, remote_vhash, root, key, cache)
-        .await?;
     let new_manifest: BTreeSet<PathBuf> = staged.files.iter().map(|(p, _)| p.clone()).collect();
+    staged.apply_to_cache(cache);
     staged.commit(root)?;
 
     if let Some(s) = current {
@@ -1183,13 +1353,13 @@ async fn apply_remote_sync(
     }
 
     let mut clock = current.map(|s| s.clock.clone()).unwrap_or_default();
-    clock.merge(remote_clock);
+    clock.merge(&remote.clock);
 
     Ok(ShareState {
-        version_hash: remote_vhash.to_string(),
-        manifest_hash: manifest_hash.to_string(),
+        version_hash: remote.version_hash.clone(),
+        manifest_hash: remote.manifest.clone(),
         clock,
-        timestamp: remote_timestamp,
+        timestamp: remote.timestamp,
         manifest: new_manifest,
     })
 }

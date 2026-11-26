@@ -22,7 +22,7 @@ guesses, not commitments. Add 50% if part-time, double for "with surprises."
 | 6a. Transport decision | ✅ Decided: iroh-blobs over iroh (see `INTEGRATION_NOTES.md`, "Transport: iroh-blobs"); spike checks open | — |
 | 6. Swarm admission gate | ✅ Replaced: members-only connection gate on the iroh endpoint (`access.rs`); no librqbit hook needed | — |
 | 7. D-Bus IPC surface | ⚠️ Partial: methods and activation done; no signals, bus name not final | 1 week |
-| 7.5. Make it real across machines | 👉 In progress: cross-network sync, members-only connections and signed announces done (all in CI); conflict copies, random topics, size limits still to do | 2–3 weeks left |
+| 7.5. Make it real across machines | 👉 In progress: cross-network sync, members-only connections and signed announces, fetches off the loop and size limits done (all in CI); conflict copies, random topics still to do | 2–3 weeks left |
 | 7.6. Formats and release engineering | Planned | 1–2 weeks |
 | 8. Linux UI (GTK4/libadwaita app) | Planned | 6–10 weeks |
 | 9. Other platforms (Linux Flatpak GUI; Windows, macOS) | Planned | 8–12 weeks |
@@ -335,9 +335,9 @@ would put these gaps in front of users.
 **Key deliverables:**
 - Announce reachable addresses, or move transfer onto iroh (Phase 6a).
 - Timeouts on every fetch, run off the share's select loop, so one bad
-  announce can't stall a share. *Timeouts done (30 s connect, 300 s per
-  blob); fetches still run on the select loop, so a slow provider stalls
-  the share for that long.*
+  announce can't stall a share. *Done: 30 s connect, 300 s per blob, one
+  hour per version, fetched in a task off the loop; size limits (16 MiB
+  manifest, 1 GiB file) checked before transfer.*
 - Signed announces: each announce signed with `identity.key` over the share,
   info-hash, version hash, clock and timestamp; only current Writers and
   Owners are applied. New versions under old key epochs are refused.
@@ -385,7 +385,9 @@ strand them.
   the signed bytes and the wire and disk formats. Define the canonical
   signing bytes explicitly. This invalidates existing signatures, so it
   has to happen before 1.0. Until then, set decode size limits on
-  everything that comes from peers and tickets.
+  everything that comes from peers and tickets. *Done: gossip 64 KiB,
+  tickets 1 MiB, auth ops 64 KiB, `auth.log` 16 MiB, pending rotations
+  1 MiB.*
 - `cargo deny` (advisories, licenses, bans) in CI.
 - Fuzzing (`cargo fuzz`) for the ticket, gossip and auth decoders.
 - Release process: semver policy, NEWS file, signed tags, rpmautospec

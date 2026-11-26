@@ -11,6 +11,9 @@
 #   3. A new file in a subdirectory on A arrives at B.
 #   4. A deletion on A is applied at B.
 #   5. Nothing leaks into either share root (no staging files left over).
+#   6. While B fetches a large file from A, and A is stalled mid-transfer
+#      (SIGSTOP), B's share loop still runs: a local edit on B is noticed
+#      within seconds. Fetches run off the loop.
 #
 # Usage: tests/e2e-sync.sh [path/to/rust-peerdup]   (default: target/debug)
 # Peers find each other on the local network (mDNS), so this runs on one
@@ -28,6 +31,7 @@ ROOT_A="$SCRATCH/share-a"; ROOT_B="$SCRATCH/share-b"
 LOG_A="$SCRATCH/a.log"; LOG_B="$SCRATCH/b.log"
 PID_A=""; PID_B=""
 TIMEOUT="${PEERDUP_E2E_TIMEOUT:-90}"
+BIG_MB="${PEERDUP_E2E_BIG_MB:-256}"
 
 ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -40,7 +44,7 @@ fail() {
 
 cleanup() {
     set +e
-    for pid in $PID_A $PID_B; do kill -TERM "$pid" 2>/dev/null; done
+    for pid in $PID_A $PID_B; do kill -CONT "$pid" 2>/dev/null; kill -TERM "$pid" 2>/dev/null; done
     for pid in $PID_A $PID_B; do wait "$pid" 2>/dev/null; done
     if [ -n "${KEEP_SCRATCH:-}" ]; then echo "kept $SCRATCH"; else rm -rf "$SCRATCH"; fi
 }
@@ -58,6 +62,20 @@ wait_for() {
 }
 
 same_tree() { diff -r --exclude=.peerdup "$ROOT_A" "$ROOT_B"; }
+
+# within <seconds> <description> <command...>: like wait_for, shorter.
+within() {
+    local secs="$1" what="$2"; shift 2
+    local deadline=$((SECONDS + secs))
+    until "$@" >/dev/null 2>&1; do
+        [ "$SECONDS" -lt "$deadline" ] || fail "not within ${secs}s: $what"
+        sleep 0.2
+    done
+    ok "$what (within ${secs}s)"
+}
+
+count() { grep -c "$1" "$2" || true; }
+more_than() { [ "$(count "$1" "$2")" -gt "$3" ]; }
 
 export RUST_LOG="${RUST_LOG:-rust_peerdup=info}"
 
@@ -95,6 +113,33 @@ info "Deleting a file on A"
 rm "$ROOT_A/docs/blob.bin"
 wait_for "deletion is applied at B" test ! -e "$ROOT_B/docs/blob.bin"
 wait_for "trees agree after the deletion" same_tree
+
+info "Fetching a ${BIG_MB} MiB file while its provider stalls"
+fetches_before="$(count "fetching a large file" "$LOG_B")"
+applied_before="$(count "applied remote version" "$LOG_B")"
+changes_before="$(count "local change detected" "$LOG_B")"
+# Written beside the root and renamed in, so A publishes it once, whole.
+head -c "$((BIG_MB * 1024 * 1024))" /dev/urandom > "$SCRATCH/big.bin"
+mv "$SCRATCH/big.bin" "$ROOT_A/big.bin"
+deadline=$((SECONDS + TIMEOUT))
+until more_than "fetching a large file" "$LOG_B" "$fetches_before"; do
+    [ "$SECONDS" -lt "$deadline" ] || fail "B never started fetching big.bin"
+    sleep 0.05
+done
+kill -STOP "$PID_A"
+ok "B started fetching big.bin; A is stopped"
+if more_than "applied remote version" "$LOG_B" "$applied_before"; then
+    fail "B finished fetching before A was stopped; raise PEERDUP_E2E_BIG_MB"
+fi
+echo "edited on B during the fetch" > "$ROOT_B/during-fetch.txt"
+within 10 "B notices a local edit while its fetch is stalled" \
+    more_than "local change detected" "$LOG_B" "$changes_before"
+[ ! -e "$ROOT_B/big.bin" ] || fail "big.bin applied while its provider was stopped"
+kill -CONT "$PID_A"
+# B's edit and A's big file are concurrent versions. Last-writer-wins
+# picks one whole version (B's, the later), so big.bin doesn't survive;
+# what matters here is that B kept running and both sides converge.
+wait_for "trees agree after the stalled fetch" same_tree
 
 if find "$ROOT_A" "$ROOT_B" -name '*.peerdup-tmp' | grep -q .; then
     fail "staging files left in a share root"

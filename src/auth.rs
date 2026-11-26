@@ -204,9 +204,11 @@ impl SignedOp {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let (op, _): (Self, _) =
-            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-                .context("decoding signed op")?;
+        let (op, _): (Self, _) = bincode::serde::decode_from_slice(
+            bytes,
+            bincode::config::standard().with_limit::<MAX_OP_BYTES>(),
+        )
+        .context("decoding signed op")?;
         Ok(op)
     }
 }
@@ -255,6 +257,13 @@ impl Orderer<MemberId, OpId, GroupControlMessage<MemberId, ()>> for NoOpOrderer 
         Ok((y, None))
     }
 }
+
+/// Largest `auth.log` we read: about 80,000 ops.
+pub const MAX_AUTH_LOG_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest single encoded op: an op's deps are the heads it was authored
+/// on, so this is generous.
+pub const MAX_OP_BYTES: usize = 64 * 1024;
 
 /// Cap on ops buffered while their dependencies are missing.
 const MAX_PENDING_OPS: usize = 256;
@@ -558,9 +567,17 @@ pub fn load(data_dir: &Path, share_id: &str) -> Result<AuthState> {
         return Ok(AuthState::empty_for(group));
     }
     let bytes = fs::read(&path).with_context(|| format!("reading {path:?}"))?;
-    let (ops, _): (Vec<SignedOp>, _) =
-        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-            .with_context(|| format!("decoding {path:?}"))?;
+    if bytes.len() > MAX_AUTH_LOG_BYTES {
+        return Err(anyhow!(
+            "{path:?} is {} bytes, over the {MAX_AUTH_LOG_BYTES}-byte limit",
+            bytes.len()
+        ));
+    }
+    let (ops, _): (Vec<SignedOp>, _) = bincode::serde::decode_from_slice(
+        &bytes,
+        bincode::config::standard().with_limit::<MAX_AUTH_LOG_BYTES>(),
+    )
+    .with_context(|| format!("decoding {path:?}"))?;
     let mut state = AuthState::empty_for(group);
     for op in ops {
         state

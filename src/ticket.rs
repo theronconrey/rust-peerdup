@@ -7,6 +7,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
+/// Largest decoded ticket. A ticket holds the keyring and the whole auth
+/// log (about 200 bytes an op), so this is thousands of members.
+pub const MAX_TICKET_BYTES: usize = 1024 * 1024;
+
 /// Current ticket schema version. 2 added the auth-log snapshot (Phase 5c);
 /// 3 added the inviter's network address. Older tickets are refused.
 pub const TICKET_VERSION: u8 = 3;
@@ -60,12 +64,19 @@ impl Ticket {
     }
 
     pub fn decode(s: &str) -> Result<Self> {
+        let s = s.trim();
+        // base64 is 4 characters per 3 bytes.
+        if s.len() / 4 * 3 > MAX_TICKET_BYTES {
+            return Err(anyhow!("ticket is over {MAX_TICKET_BYTES} bytes"));
+        }
         let bytes = URL_SAFE_NO_PAD
-            .decode(s.trim())
+            .decode(s)
             .context("ticket is not valid base64")?;
-        let (ticket, _read): (Ticket, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                .context("ticket payload is malformed")?;
+        let (ticket, _read): (Ticket, _) = bincode::serde::decode_from_slice(
+            &bytes,
+            bincode::config::standard().with_limit::<MAX_TICKET_BYTES>(),
+        )
+        .context("ticket payload is malformed")?;
         if ticket.version != TICKET_VERSION {
             return Err(anyhow!(
                 "unsupported ticket version: {} (this build expects v{TICKET_VERSION})",
@@ -281,6 +292,13 @@ mod tests {
             .expect("refused")
             .to_string();
         assert!(err.contains("missing dependencies"), "{err}");
+    }
+
+    #[test]
+    fn rejects_oversize_tickets() {
+        let huge = "A".repeat(MAX_TICKET_BYTES / 3 * 4 + 8);
+        let err = Ticket::decode(&huge).unwrap_err().to_string();
+        assert!(err.contains("over"), "{err}");
     }
 
     #[test]

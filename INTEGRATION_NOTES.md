@@ -25,12 +25,38 @@ almost none of BitTorrent: DHT off, no trackers, no UPnP, one known peer.
   announces") carries the manifest hash, the
   provider's node id (= identity key hex; p2panda's `NodeId` is
   `VerifyingKey`), the version hash, clock and timestamp.
-- Receive: connect (30 s timeout), fetch the manifest, decrypt, refuse
-  paths that are absolute, contain `..` or `.peerdup`, check the manifest
-  against the announced version hash, then fetch (300 s timeout per blob),
+- Receive: connect (30 s timeout), fetch the manifest, decrypt, validate
+  it (`validate_manifest`: at most 100,000 entries and 4,096 bytes a
+  path, no duplicates, no path that is both a file and a directory of
+  another, nothing absolute or with `..` or `.peerdup`), check it against
+  the announced version hash, then fetch (300 s timeout per blob),
   decrypt and blake3-check each file and stage it as `*.peerdup-tmp` beside
   its destination. Only when everything passes are the files renamed in
   and orphans deleted.
+- Size limits, checked before transfer: the provider must prove a blob's
+  size (`iroh_blobs::get::request::get_verified_size` checks the last
+  chunk against the hash; a blob already complete in our store uses
+  `BlobStatus::Complete { size }`). A manifest over 16 MiB or a file blob
+  over 1 GiB (`MAX_BLOB_BYTES`) is refused: a whole file is held in memory
+  twice while it is decrypted and checked (and while encrypted on the
+  sender) until encryption streams.
+- Staging never writes through a symlinked directory: every directory
+  between the root and the file is checked with `symlink_metadata` (and
+  made if missing), at staging and again at commit. Temp files are
+  created with `create_new`.
+- `StagedVersion` removes its uncommitted temp files on drop, so every
+  error path, the per-version timeout and an aborted fetch task clean up.
+- The fetch runs off the share's select loop (`daemon::start_fetch`): a
+  spawned task with a copy of the keyring (a read lock held across the
+  fetch would block a rotation's write lock, and with it the loop),
+  bounded by a one-hour limit per version. At most one per share; the
+  newest announce that arrives meanwhile waits in `next`. The result
+  comes back on a channel tagged with a generation; the loop judges the
+  version again against the state it has *now* (a local edit or another
+  version may have landed) and only then commits on the loop. Cache
+  updates travel with the staged version and are applied there, since
+  the loop owns the `BlobCache`. `tests/e2e-sync.sh` stalls the provider
+  with SIGSTOP mid-fetch and checks a local edit is still noticed.
 - `BlobCache` (`shares/<id>/blobs.json`) maps `path -> (plaintext hash,
   blob hash, epoch)`. Unchanged files reuse their ciphertext, so their blob
   hash is stable and receivers fetch nothing for them. Receivers record
