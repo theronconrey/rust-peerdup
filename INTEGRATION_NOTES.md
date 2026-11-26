@@ -330,7 +330,9 @@ matches what it published and that rule would overwrite it silently. So:
   name (merged), and one unchanged since the base that they dropped is
   deleted.
 After an apply that kept files, the loop asks the watcher for a re-check,
-so they are published.
+so they are published. The winner of the LWW comparison keeps its clock
+unmerged (see "The LWW winner doesn't merge the loser's clock"), so the
+loser always takes the concurrent path.
 
 Known limits: the base is per share, not per peer, so with three or more
 peers editing concurrently it can be out of date and produce an extra
@@ -563,6 +565,20 @@ the broadcast tick doesn't lose the rotation.
 *History:* the three librqbit items below were about the librqbit
 session, which no longer exists. For the current equivalents see "Transport: iroh-blobs"
 (the blob cache, the staging step, and the `.peerdup` path filters).
+
+### The LWW winner doesn't merge the loser's clock
+Looks like the winner of a concurrent edit should merge the other clock
+into its version so its next announce dominates. It must not: that
+version would then dominate the loser's without containing the loser's
+changes, the loser would apply it as a fast-forward (which only keeps
+*unannounced* edits) and lose its announced edit without a conflict
+copy. The fedora.yml e2e run caught this (a queued, merged re-announce
+overtook the concurrent one after connect retries). The winner keeps its
+version and clock (`Verdict::LocalWins`); the loser, which loses the same
+deterministic comparison, applies the winner's version as a concurrent
+one, keeps its changes as conflict copies, and its merged clock then
+dominates both. Invariant: a version that dominates ours includes our
+content.
 
 ### `AuthState::apply_remote` refuses a well-signed `Create`
 Looks like it breaks replaying a log into a fresh state. It doesn't: the

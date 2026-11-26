@@ -758,14 +758,7 @@ async fn sync_loop(
                     }
                 }
                 match judge(&config.id, state.as_ref(), &remote) {
-                    Verdict::Ignore => {}
-                    Verdict::LocalWins(new_state) => {
-                        if let Err(e) = persist(&data_dir, &config.id, &new_state) {
-                            tracing::warn!(error = ?e, "could not persist state");
-                        }
-                        publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
-                        state = Some(new_state);
-                    }
+                    Verdict::Ignore | Verdict::LocalWins => {}
                     Verdict::Fetch { .. } if fetch.is_some() => {
                         // One fetch per share at a time; keep the newest
                         // version that isn't older than the one waiting.
@@ -799,14 +792,7 @@ async fn sync_loop(
                             tracing::info!(share_id = %config.id, version_hash = %remote.version_hash,
                                 "fetched version is no longer newer; discarding");
                         }
-                        Verdict::LocalWins(new_state) => {
-                            drop(staged);
-                            if let Err(e) = persist(&data_dir, &config.id, &new_state) {
-                                tracing::warn!(error = ?e, "could not persist state");
-                            }
-                            publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
-                            state = Some(new_state);
-                        }
+                        Verdict::LocalWins => drop(staged),
                         Verdict::Fetch { concurrent } => match commit_remote(&root, staged, &remote, state.as_ref(), &mut cache, concurrent, &peer_id_hex[..8]) {
                             Ok((new_state, rescan)) => {
                                 if rescan {
@@ -834,14 +820,7 @@ async fn sync_loop(
                         Verdict::Fetch { .. } => {
                             fetch = Some(start_fetch(&mut generation, queued, &config.id, &transfer, &root, &key, &fetch_tx).await);
                         }
-                        Verdict::LocalWins(new_state) => {
-                            if let Err(e) = persist(&data_dir, &config.id, &new_state) {
-                                tracing::warn!(error = ?e, "could not persist state");
-                            }
-                            publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
-                            state = Some(new_state);
-                        }
-                        Verdict::Ignore => {}
+                        Verdict::Ignore | Verdict::LocalWins => {}
                     }
                 }
             }
@@ -1264,9 +1243,14 @@ struct RemoteVersion {
 enum Verdict {
     /// Older than or equal to ours.
     Ignore,
-    /// Concurrent, and ours wins last-writer-wins: keep our content with
-    /// both clocks merged (so our next announce dominates).
-    LocalWins(ShareState),
+    /// Concurrent, and ours wins last-writer-wins: keep our version as it
+    /// is. Our clock is deliberately *not* merged with theirs: that would
+    /// make our version dominate theirs without containing their changes,
+    /// and the other side would then apply it as a fast-forward and lose
+    /// those changes without a conflict copy. Instead the other side, which
+    /// loses the same comparison, applies ours as a concurrent version
+    /// (keeping conflict copies) and its merged result dominates both.
+    LocalWins,
     /// Newer (`concurrent: false`), or concurrent and it wins: fetch and
     /// apply it.
     Fetch { concurrent: bool },
@@ -1290,18 +1274,13 @@ fn judge(share_id: &str, state: Option<&ShareState>, remote: &RemoteVersion) -> 
                 remote.timestamp,
                 &remote.version_hash,
             ) {
-                let mut clock = local.clock.clone();
-                clock.merge(&remote.clock);
                 tracing::warn!(
                     share_id,
                     local_ts = %local.timestamp,
                     remote_ts = %remote.timestamp,
                     "concurrent edits; LWW: local wins"
                 );
-                Verdict::LocalWins(ShareState {
-                    clock,
-                    ..local.clone()
-                })
+                Verdict::LocalWins
             } else {
                 tracing::warn!(
                     share_id,
@@ -2013,6 +1992,42 @@ mod tests {
 
     fn at() -> DateTime<Utc> {
         "2026-11-26T01:38:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn the_lww_winner_keeps_its_clock_so_the_loser_applies_concurrently() {
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        let mut base = VectorClock::new();
+        base.increment(&a);
+        let mut ours = base.clone();
+        ours.increment(&b);
+        let mut theirs = base.clone();
+        theirs.increment(&a);
+        let mut local = state(FileMap::new(), FileMap::new());
+        local.clock = ours.clone();
+        local.timestamp = at() + chrono::TimeDelta::seconds(1);
+        let remote = RemoteVersion {
+            clock: theirs.clone(),
+            ..remote()
+        };
+        // We are later: we win and change nothing.
+        assert!(matches!(
+            judge("s", Some(&local), &remote),
+            Verdict::LocalWins
+        ));
+        // The other side, earlier, sees our version as concurrent (not
+        // dominating), so its apply keeps conflict copies.
+        let mut other = state(FileMap::new(), FileMap::new());
+        other.clock = theirs;
+        let ours_remote = RemoteVersion {
+            clock: ours,
+            timestamp: local.timestamp,
+            ..remote()
+        };
+        assert!(matches!(
+            judge("s", Some(&other), &ours_remote),
+            Verdict::Fetch { concurrent: true }
+        ));
     }
 
     #[test]

@@ -42,8 +42,8 @@ ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 fail() {
     printf '\033[1;31mFAIL\033[0m %s\n' "$*" >&2
-    echo "---- daemon A log (tail) ----" >&2; tail -n 60 "$LOG_A" >&2 || true
-    echo "---- daemon B log (tail) ----" >&2; tail -n 60 "$LOG_B" >&2 || true
+    echo "---- daemon A log (tail) ----" >&2; tail -n 120 "$LOG_A" >&2 || true
+    echo "---- daemon B log (tail) ----" >&2; tail -n 120 "$LOG_B" >&2 || true
     exit 1
 }
 
