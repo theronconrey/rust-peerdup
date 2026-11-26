@@ -184,17 +184,21 @@ impl Access {
                         Some(node) => self.blob_verdict(&node, &req.hash, single),
                         None => Err(Refusal::UnknownConnection),
                     };
-                    if let Err(refusal) = &result {
-                        tracing::warn!(
-                            node = %node.map(hex).unwrap_or_default(),
-                            blob = %req.hash.to_hex(),
-                            "refused a blob request: {refusal}"
-                        );
-                    }
-                    msg.tx
-                        .send(result.map_err(|_| AbortReason::Permission))
-                        .await
-                        .ok();
+                    let decision = match result {
+                        Ok(share) => {
+                            tracing::debug!(share_id = %share, blob = %req.hash.to_hex(), "serving a blob");
+                            Ok(())
+                        }
+                        Err(refusal) => {
+                            tracing::warn!(
+                                node = %node.map(hex).unwrap_or_default(),
+                                blob = %req.hash.to_hex(),
+                                "refused a blob request: {refusal}"
+                            );
+                            Err(AbortReason::Permission)
+                        }
+                    };
+                    msg.tx.send(decision).await.ok();
                 }
                 // Push, observe and get-many are disabled in the event
                 // mask; if one arrives anyway, dropping it refuses it.
