@@ -9,58 +9,33 @@ use crate::share::{ShareConfig, ShareRole};
 use crate::share_state::{self, PersistedState};
 use crate::ticket::{self, Ticket, TICKET_VERSION};
 use crate::transfer::{self, BlobCache, FileHash, Transfer, PEERDUP_DIR_NAME};
+use crate::wire::{self, ShareMsg};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use p2panda_core::{SigningKey, Topic};
 use p2panda_net::addrs::NodeInfo;
-use p2panda_net::gossip::GossipHandle;
+use p2panda_net::gossip::{GossipConfig, GossipHandle};
 use p2panda_net::iroh_endpoint::RelayUrl;
 use p2panda_net::iroh_mdns::MdnsDiscoveryMode;
 use p2panda_net::{AddressBook, Discovery, Endpoint, Gossip, MdnsDiscovery};
-use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::task::JoinSet;
+
+/// Overall limit on fetching one remote version. Each blob also has its
+/// own limit (`transfer.rs`); this bounds a version with many files from a
+/// provider that is slow but never quite stalls.
+const VERSION_FETCH_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// Cap the in-memory buffer of out-of-order key rotations per share. 64 epochs
 /// is far more than expected; we evict the oldest if we somehow run past it.
 const ROTATION_BUFFER_CAP: usize = 64;
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(tag = "kind")]
-enum ShareMsg {
-    /// A version of the share: its manifest hash, where to fetch it and
-    /// the version's hash, clock and timestamp, signed by the sender
-    /// (`announce.rs`). Receivers apply it only if the signer is a current
-    /// Writer or Owner. Earlier unsigned announces had other tags and are
-    /// ignored.
-    #[serde(rename = "share_announce_v3")]
-    Announce(Announce),
-    /// Phase 5c: full snapshot of this peer's known auth ops for the share.
-    /// Receivers verify each, dedupe by op id, and apply via
-    /// `AuthState::apply_remote`. Periodic re-broadcasts ensure late joiners
-    /// catch up; receivers ignore ops they already hold so reflood is cheap.
-    /// `bincode`-encoded `SignedOp`s are inlined as `Vec<u8>` so a peer can
-    /// decode the envelope (`serde_json` here) without depending on the
-    /// inner schema.
-    #[serde(rename = "share_auth_ops")]
-    AuthOps { ops: Vec<Vec<u8>> },
-    /// Phase 5d: a freshly-rotated epoch key, sealed once per remaining
-    /// member (sealed-box-style envelope). Rebroadcast on every announce
-    /// tick until the manager either confirms membership has stabilised or
-    /// removes the file from `pending_rotations/`. Receivers verify the
-    /// outer signature against `rotator_pubkey`, check that pubkey is a
-    /// current Owner in their local auth state, then decrypt the envelope
-    /// addressed to them and `install_epoch_key` the result.
-    #[serde(rename = "share_key_rotation")]
-    KeyRotation(SignedRotation),
-}
 
 /// Command sent from an IPC handler into the running share task. Each variant
 /// pairs a request with a `oneshot::Sender` for the reply, so per-share state
@@ -88,15 +63,9 @@ pub enum ShareCommand {
     },
 }
 
-fn auth_announce_bytes(state: &AuthState) -> Result<Vec<u8>> {
-    let ops: Result<Vec<Vec<u8>>> = state.ops().iter().map(SignedOp::encode).collect();
-    let msg = ShareMsg::AuthOps { ops: ops? };
-    Ok(serde_json::to_vec(&msg)?)
-}
-
 /// Apply an incoming `AuthOps` payload to the share's auth state. Persists
 /// the log on disk if any op was newly applied. The `payload` is the parsed
-/// `ShareMsg::AuthOps.ops` vector.
+/// `wire::ShareMsg::AuthOps.ops` vector (one chunk of the sender's log).
 fn apply_auth_ops(
     state: &mut AuthState,
     payload: Vec<Vec<u8>>,
@@ -184,7 +153,14 @@ pub async fn start_runtime(
     let _discovery = Discovery::builder(address_book.clone(), endpoint.clone())
         .spawn()
         .await?;
+    // p2panda-net's default limit is 4 KiB, too small for the auth log
+    // and key rotations of any real share. Every peer must use the same
+    // limit (wire.rs).
     let gossip = Gossip::builder(address_book.clone(), endpoint.clone())
+        .config(GossipConfig {
+            max_message_size: wire::MAX_GOSSIP_MESSAGE,
+            ..Default::default()
+        })
         .spawn()
         .await?;
     // Leak the discovery handles into a background task so they live for the
@@ -296,6 +272,16 @@ pub async fn spawn_share_task(
         Ok(s) => s,
         Err(e) => return Err(e.context("loading auth log")),
     };
+    if auth_state.is_empty() {
+        // Without its Create op nobody is a member, and the first op that
+        // arrived over gossip would define the group. A share gets its log
+        // from share-add or from a ticket; anything else is damage.
+        return Err(anyhow!(
+            "share {} has no auth log ({}); remove it and join again from a fresh ticket",
+            config.id,
+            auth::auth_log_path(&rt.data_dir, &config.id).display()
+        ));
+    }
     let pending_rotations = match rotation::load_pending(&rt.data_dir, &config.id) {
         Ok(p) => p,
         Err(e) => {
@@ -621,15 +607,37 @@ async fn sync_loop(
         publish_sync_announce(&topic_handle, s, &identity, group_id, &auth_state).await;
     }
 
-    let (_watcher, mut watch_rx) =
+    let (_watcher, watch_tx, mut watch_rx) =
         spawn_fs_watcher(&root).with_context(|| format!("watching {root:?}"))?;
     let mut announce_tick = tokio::time::interval(Duration::from_secs(10));
     announce_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     announce_tick.tick().await;
 
+    // Remote versions are fetched and staged off this loop, so a slow
+    // provider can't hold up IPC commands, auth ops, rotations or local
+    // changes. At most one fetch runs per share; the newest announce that
+    // arrives meanwhile waits in `next`. Dropping `fetch` aborts the task,
+    // and its staged files are removed.
+    let (fetch_tx, mut fetch_rx) = mpsc::channel::<FetchDone>(1);
+    const SETTLE: Duration = Duration::from_millis(500);
+    let mut change_due: Option<tokio::time::Instant> = None;
+    let mut fetch: Option<FetchTask> = None;
+    let mut next: Option<RemoteVersion> = None;
+    let mut generation: u64 = 0;
+
     loop {
         tokio::select! {
-            Some(()) = debounce(&mut watch_rx, Duration::from_millis(500)) => {
+            // Debounce: every event pushes the deadline back; the check runs
+            // once things have been quiet for SETTLE. Both arms are
+            // cancel-safe, so an event is never lost when another arm wins
+            // the select (the old `debounce()` future consumed the first
+            // event and dropped it whenever that happened).
+            Some(()) = watch_rx.recv() => {
+                change_due = Some(tokio::time::Instant::now() + SETTLE);
+            }
+            _ = sleep_until_due(change_due) => {
+                change_due = None;
+                tracing::debug!(share_id = %config.id, "filesystem changed; checking for a new version");
                 let outcome = {
                     let k = key.read().await;
                     handle_local_change(&config, &transfer, &root, &data_dir, &peer_id_hex, &k, state.as_ref(), &mut cache).await
@@ -685,9 +693,9 @@ async fn sync_loop(
                     Ok(p) => p,
                     Err(e) => { tracing::debug!(error = %e, "gossip lag"); continue; }
                 };
-                let msg = match serde_json::from_slice::<ShareMsg>(&payload) {
-                    Ok(m) => m,
-                    Err(_) => continue,
+                let Some(msg) = wire::decode(&payload) else {
+                    tracing::debug!(share_id = %config.id, len = payload.len(), "ignoring a message that isn't wire v4");
+                    continue;
                 };
                 let ann = match msg {
                     ShareMsg::Announce(ann) => ann,
@@ -732,70 +740,88 @@ async fn sync_loop(
                     ..
                 } = ann;
 
-                let cmp = state.as_ref().map(|s| s.clock.compare(&remote_clock));
-                match cmp {
-                    Some(ClockOrdering::Equal) => continue,
-                    Some(ClockOrdering::SelfDominates) => {
-                        tracing::debug!(share_id = %config.id, "ignoring older remote announce");
-                        continue;
-                    }
-                    Some(ClockOrdering::Concurrent) => {
-                        let local = state.as_ref().unwrap();
-                        let we_win = lww_we_win(local.timestamp, &local.version_hash, remote_ts, &remote_vhash);
-                        if we_win {
-                            // Local wins. Merge remote's clock into ours (so future
-                            // announces dominate), persist, re-announce. No fetch.
-                            let mut clock = local.clock.clone();
-                            clock.merge(&remote_clock);
-                            let new_state = ShareState { clock, ..local.clone() };
-                            tracing::warn!(
-                                share_id = %config.id,
-                                local_ts = %new_state.timestamp,
-                                remote_ts = %remote_ts,
-                                "concurrent edits; LWW: local wins"
-                            );
-                            if let Err(e) = persist(&data_dir, &config.id, &new_state) {
-                                tracing::warn!(error = ?e, "could not persist state");
-                            }
-                            publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
-                            state = Some(new_state);
-                            continue;
-                        }
-                        tracing::warn!(
-                            share_id = %config.id,
-                            local_ts = %local.timestamp,
-                            remote_ts = %remote_ts,
-                            "concurrent edits; LWW: remote wins, fetching"
-                        );
-                        // fall through to apply remote
-                    }
-                    Some(ClockOrdering::OtherDominates) | None => {}
-                }
-
-                tracing::info!(
-                    share_id = %config.id,
-                    %remote_vhash,
-                    %manifest,
-                    %provider,
-                    remote_clock = ?remote_clock.0,
-                    "received remote announce; applying"
-                );
-                let apply_outcome = {
-                    let k = key.read().await;
-                    apply_remote_sync(&transfer, &root, &provider, &manifest, &remote_vhash, &remote_clock, remote_ts, &k, state.as_ref(), &mut cache).await
+                let remote = RemoteVersion {
+                    manifest,
+                    provider,
+                    version_hash: remote_vhash,
+                    clock: remote_clock,
+                    timestamp: remote_ts,
                 };
-                match apply_outcome {
-                    Ok(new_state) => {
-                        if let Err(e) = persist(&data_dir, &config.id, &new_state) {
+                // A peer announcing our exact version has it: it becomes
+                // the base later concurrent edits are measured against.
+                if let Some(s) = state.as_mut() {
+                    if s.clock == remote.clock && s.version_hash == remote.version_hash && s.base != s.manifest {
+                        s.base = s.manifest.clone();
+                        if let Err(e) = persist(&data_dir, &config.id, s) {
                             tracing::warn!(error = ?e, "could not persist state");
                         }
-                        if let Err(e) = cache.save(&data_dir, &config.id) {
-                            tracing::warn!(error = ?e, "could not save blob cache");
-                        }
-                        publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
-                        state = Some(new_state);
                     }
+                }
+                match judge(&config.id, state.as_ref(), &remote) {
+                    Verdict::Ignore | Verdict::LocalWins => {}
+                    Verdict::Fetch { .. } if fetch.is_some() => {
+                        // One fetch per share at a time; keep the newest
+                        // version that isn't older than the one waiting.
+                        let older = next
+                            .as_ref()
+                            .is_some_and(|n| n.clock.compare(&remote.clock) == ClockOrdering::SelfDominates);
+                        if !older {
+                            tracing::debug!(share_id = %config.id, "a fetch is running; queued the announce");
+                            next = Some(remote);
+                        }
+                    }
+                    Verdict::Fetch { .. } => {
+                        fetch = Some(start_fetch(&mut generation, remote, &config.id, &transfer, &root, &key, &fetch_tx).await);
+                    }
+                }
+            }
+            Some(done) = fetch_rx.recv() => {
+                if fetch.as_ref().map(|f| f.generation) != Some(done.generation) {
+                    tracing::debug!(share_id = %config.id, "discarding the result of a superseded fetch");
+                    continue;
+                }
+                fetch = None;
+                let FetchDone { remote, result, .. } = done;
+                match result {
                     Err(e) => tracing::warn!(error = ?e, share_id = %config.id, "apply_remote failed"),
+                    // The share may have moved on while the fetch ran (a
+                    // local edit, or a version applied in between), so
+                    // decide again before touching the root.
+                    Ok(staged) => match judge(&config.id, state.as_ref(), &remote) {
+                        Verdict::Ignore => {
+                            tracing::info!(share_id = %config.id, version_hash = %remote.version_hash,
+                                "fetched version is no longer newer; discarding");
+                        }
+                        Verdict::LocalWins => drop(staged),
+                        Verdict::Fetch { concurrent } => match commit_remote(&root, staged, &remote, state.as_ref(), &mut cache, concurrent, &peer_id_hex[..8]) {
+                            Ok((new_state, rescan)) => {
+                                if rescan {
+                                    // Conflict copies or files kept from our
+                                    // side: publish them as a newer version.
+                                    let _ = watch_tx.send(());
+                                }
+                                tracing::info!(share_id = %config.id, version_hash = %new_state.version_hash,
+                                    "applied remote version");
+                                if let Err(e) = persist(&data_dir, &config.id, &new_state) {
+                                    tracing::warn!(error = ?e, "could not persist state");
+                                }
+                                if let Err(e) = cache.save(&data_dir, &config.id) {
+                                    tracing::warn!(error = ?e, "could not save blob cache");
+                                }
+                                publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
+                                state = Some(new_state);
+                            }
+                            Err(e) => tracing::warn!(error = ?e, share_id = %config.id, "apply_remote failed"),
+                        },
+                    },
+                }
+                if let Some(queued) = next.take() {
+                    match judge(&config.id, state.as_ref(), &queued) {
+                        Verdict::Fetch { .. } => {
+                            fetch = Some(start_fetch(&mut generation, queued, &config.id, &transfer, &root, &key, &fetch_tx).await);
+                        }
+                        Verdict::Ignore | Verdict::LocalWins => {}
+                    }
                 }
             }
         }
@@ -960,12 +986,12 @@ async fn handle_revoke(
         *key.write().await = fresh;
     }
 
-    let rotation_msg =
+    let chunks =
         rotation::build_signed_rotation(identity, group_id, new_epoch, &new_key_bytes, &remaining)?;
-    rotation::save_pending(data_dir, &config.id, &rotation_msg)?;
+    rotation::save_pending(data_dir, &config.id, &chunks)?;
     // Live broadcasting: append to the in-memory queue so the next announce
     // tick picks it up (no daemon restart needed).
-    pending_rotations.push(rotation_msg);
+    pending_rotations.extend(chunks);
 
     Ok(new_epoch)
 }
@@ -992,9 +1018,29 @@ struct ShareState {
     clock: VectorClock,
     /// When this version was created. Tiebreaker for LWW conflict resolution.
     timestamp: DateTime<Utc>,
-    /// Files in this version, relative to the share root. Used for orphan
-    /// deletion on apply: files in old manifest but not in new are removed.
-    manifest: BTreeSet<PathBuf>,
+    /// Files in this version, relative to the share root, with the
+    /// plaintext hash we published or applied. Orphan deletion and
+    /// conflict copies compare the disk against it.
+    manifest: FileMap,
+    /// Files of the last version known to be shared with a peer: one we
+    /// applied, or ours when a peer announced it back. A concurrent apply
+    /// counts a file as changed by us if it differs from this.
+    base: FileMap,
+}
+
+/// Path (relative to the share root) to the blake3 of its plaintext.
+type FileMap = BTreeMap<PathBuf, [u8; 32]>;
+
+fn to_hex_map(m: &FileMap) -> BTreeMap<PathBuf, String> {
+    m.iter()
+        .map(|(p, h)| (p.clone(), blake3::Hash::from_bytes(*h).to_hex().to_string()))
+        .collect()
+}
+
+fn from_hex_map(m: &BTreeMap<PathBuf, String>) -> FileMap {
+    m.iter()
+        .filter_map(|(p, h)| Some((p.clone(), *blake3::Hash::from_hex(h).ok()?.as_bytes())))
+        .collect()
 }
 
 fn persist(data_dir: &Path, share_id: &str, s: &ShareState) -> Result<()> {
@@ -1002,10 +1048,13 @@ fn persist(data_dir: &Path, share_id: &str, s: &ShareState) -> Result<()> {
         data_dir,
         share_id,
         &PersistedState {
+            format: share_state::STATE_FORMAT,
             version_hash: s.version_hash.clone(),
             clock: s.clock.clone(),
             timestamp: s.timestamp,
-            manifest: s.manifest.clone(),
+            manifest: s.manifest.keys().cloned().collect(),
+            files: to_hex_map(&s.manifest),
+            base: to_hex_map(&s.base),
         },
     )
 }
@@ -1056,6 +1105,7 @@ async fn reconcile_on_start(
                 clock: p.clock,
                 timestamp: p.timestamp,
                 manifest,
+                base: from_hex_map(&p.base),
             }));
         }
         Some(p) => {
@@ -1068,6 +1118,7 @@ async fn reconcile_on_start(
                 clock,
                 timestamp: Utc::now(),
                 manifest,
+                base: from_hex_map(&p.base),
             }
         }
         None => {
@@ -1080,6 +1131,7 @@ async fn reconcile_on_start(
                 clock,
                 timestamp: Utc::now(),
                 manifest,
+                base: FileMap::new(),
             }
         }
     };
@@ -1102,6 +1154,7 @@ async fn handle_local_change(
         return Ok(None);
     }
     let (new_vhash, new_manifest, files) = snapshot_content(root)?;
+    tracing::debug!(share_id = %config.id, files = files.len(), "snapshot taken");
     if current
         .map(|s| s.version_hash == new_vhash)
         .unwrap_or(false)
@@ -1109,6 +1162,7 @@ async fn handle_local_change(
         return Ok(None);
     }
     let manifest_hash = transfer.publish(root, &files, key, cache).await?;
+    tracing::debug!(share_id = %config.id, "published to the blob store");
     cache.save(data_dir, &config.id)?;
     let mut clock = current.map(|s| s.clock.clone()).unwrap_or_default();
     clock.increment(peer_id_hex);
@@ -1118,6 +1172,7 @@ async fn handle_local_change(
         clock,
         timestamp: Utc::now(),
         manifest: new_manifest,
+        base: current.map(|s| s.base.clone()).unwrap_or_default(),
     };
     persist(data_dir, &config.id, &new_state)?;
     Ok(Some(new_state))
@@ -1126,7 +1181,7 @@ async fn handle_local_change(
 /// Snapshot a share's content: the version hash, the set of relative
 /// paths, and each file's plaintext blake3. Every peer computes the same
 /// values for the same content.
-fn snapshot_content(root: &Path) -> Result<(String, BTreeSet<PathBuf>, Vec<FileHash>)> {
+fn snapshot_content(root: &Path) -> Result<(String, FileMap, Vec<FileHash>)> {
     let mut paths = Vec::new();
     collect_files(root, root, &mut paths)?;
     paths.sort();
@@ -1140,7 +1195,7 @@ fn snapshot_content(root: &Path) -> Result<(String, BTreeSet<PathBuf>, Vec<FileH
             .with_context(|| format!("hashing {abs:?}"))?;
         files.push((rel.clone(), *content_hasher.finalize().as_bytes()));
     }
-    let manifest = paths.into_iter().collect();
+    let manifest = files.iter().cloned().collect();
     Ok((transfer::version_hash_of(&files), manifest, files))
 }
 
@@ -1174,43 +1229,314 @@ fn has_content(root: &Path) -> Result<bool> {
     Ok(!paths.is_empty())
 }
 
-/// Fetch a remote version, verify it, and apply it to the share root.
-/// Nothing in the root changes until every file has been fetched,
-/// decrypted and checked against the manifest, and the manifest against
-/// the announced version hash.
-#[allow(clippy::too_many_arguments)]
-async fn apply_remote_sync(
-    transfer: &Transfer,
+/// A verified remote version that may be fetched.
+#[derive(Clone, Debug)]
+struct RemoteVersion {
+    manifest: String,
+    provider: String,
+    version_hash: String,
+    clock: VectorClock,
+    timestamp: DateTime<Utc>,
+}
+
+/// What to do with a remote version, given where the share is now.
+enum Verdict {
+    /// Older than or equal to ours.
+    Ignore,
+    /// Concurrent, and ours wins last-writer-wins: keep our version as it
+    /// is. Our clock is deliberately *not* merged with theirs: that would
+    /// make our version dominate theirs without containing their changes,
+    /// and the other side would then apply it as a fast-forward and lose
+    /// those changes without a conflict copy. Instead the other side, which
+    /// loses the same comparison, applies ours as a concurrent version
+    /// (keeping conflict copies) and its merged result dominates both.
+    LocalWins,
+    /// Newer (`concurrent: false`), or concurrent and it wins: fetch and
+    /// apply it.
+    Fetch { concurrent: bool },
+}
+
+fn judge(share_id: &str, state: Option<&ShareState>, remote: &RemoteVersion) -> Verdict {
+    let Some(local) = state else {
+        return Verdict::Fetch { concurrent: false };
+    };
+    match local.clock.compare(&remote.clock) {
+        ClockOrdering::Equal => Verdict::Ignore,
+        ClockOrdering::SelfDominates => {
+            tracing::debug!(share_id, "ignoring older remote announce");
+            Verdict::Ignore
+        }
+        ClockOrdering::OtherDominates => Verdict::Fetch { concurrent: false },
+        ClockOrdering::Concurrent => {
+            if lww_we_win(
+                local.timestamp,
+                &local.version_hash,
+                remote.timestamp,
+                &remote.version_hash,
+            ) {
+                tracing::warn!(
+                    share_id,
+                    local_ts = %local.timestamp,
+                    remote_ts = %remote.timestamp,
+                    "concurrent edits; LWW: local wins"
+                );
+                Verdict::LocalWins
+            } else {
+                tracing::warn!(
+                    share_id,
+                    local_ts = %local.timestamp,
+                    remote_ts = %remote.timestamp,
+                    "concurrent edits; LWW: remote wins, fetching"
+                );
+                Verdict::Fetch { concurrent: true }
+            }
+        }
+    }
+}
+
+/// A fetch running in its own task. Dropping this aborts it.
+struct FetchTask {
+    generation: u64,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for FetchTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+struct FetchDone {
+    generation: u64,
+    remote: RemoteVersion,
+    result: Result<transfer::StagedVersion>,
+}
+
+/// Fetch, verify and stage `remote` in a task of its own, with a copy of
+/// the keyring (a read lock held across the fetch would block a rotation
+/// from installing). The result comes back on `tx`, tagged with a fresh
+/// generation.
+async fn start_fetch(
+    generation: &mut u64,
+    remote: RemoteVersion,
+    share_id: &str,
+    transfer: &Arc<Transfer>,
     root: &Path,
-    provider: &str,
-    manifest_hash: &str,
-    remote_vhash: &str,
-    remote_clock: &VectorClock,
-    remote_timestamp: DateTime<Utc>,
-    key: &KeyRing,
+    key: &Arc<RwLock<KeyRing>>,
+    tx: &mpsc::Sender<FetchDone>,
+) -> FetchTask {
+    *generation += 1;
+    let generation = *generation;
+    tracing::info!(
+        share_id,
+        remote_vhash = %remote.version_hash,
+        manifest = %remote.manifest,
+        provider = %remote.provider,
+        remote_clock = ?remote.clock.0,
+        "received remote announce; applying"
+    );
+    let transfer = transfer.clone();
+    let root = root.to_path_buf();
+    let key = key.read().await.clone();
+    let tx = tx.clone();
+    let handle = tokio::spawn(async move {
+        let result = tokio::time::timeout(
+            VERSION_FETCH_TIMEOUT,
+            transfer.fetch(
+                &remote.provider,
+                &remote.manifest,
+                &remote.version_hash,
+                &root,
+                &key,
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow!(
+                "fetching the version took longer than {VERSION_FETCH_TIMEOUT:?}"
+            ))
+        });
+        // If the share loop is gone, the staged files are removed when the
+        // unsent result drops.
+        let _ = tx
+            .send(FetchDone {
+                generation,
+                remote,
+                result,
+            })
+            .await;
+    });
+    FetchTask { generation, handle }
+}
+
+/// Apply a fetched, verified version to the share root and return the new
+/// state, plus whether files of ours were kept (so the caller publishes
+/// them as a newer version). Runs on the share loop, after `judge` said
+/// the version still wins.
+///
+/// Local content is never silently lost. A file the new version would
+/// overwrite or remove is moved to a conflict copy
+/// (`name (conflict from <our id> <date>).ext`) when it holds changes the
+/// other side hasn't seen:
+/// - `concurrent: false` (the version descends from ours): the file
+///   differs from what we last published or applied (`manifest`), i.e. an
+///   edit not yet announced;
+/// - `concurrent: true` (both sides changed; theirs won last-writer-wins):
+///   the file differs from the last version both sides had (`base`). A
+///   file we added that the other side never had is kept under its own
+///   name; one unchanged since the base that they removed is removed.
+///
+/// Conflict copies and kept files are new local files: the watcher
+/// publishes them as a version that dominates, so both sides converge
+/// with one copy. Last-writer-wins only decides which content keeps the
+/// original name.
+fn commit_remote(
+    root: &Path,
+    staged: transfer::StagedVersion,
+    remote: &RemoteVersion,
     current: Option<&ShareState>,
     cache: &mut BlobCache,
-) -> Result<ShareState> {
-    let staged = transfer
-        .fetch(provider, manifest_hash, remote_vhash, root, key, cache)
-        .await?;
-    let new_manifest: BTreeSet<PathBuf> = staged.files.iter().map(|(p, _)| p.clone()).collect();
+    concurrent: bool,
+    me_short: &str,
+) -> Result<(ShareState, bool)> {
+    let incoming: FileMap = staged.files.iter().cloned().collect();
+    let empty = FileMap::new();
+    let (recorded, base) = current
+        .map(|s| (&s.manifest, &s.base))
+        .unwrap_or((&empty, &empty));
+    // Did we change this file, as far as the other side knows?
+    let ours = |rel: &Path, disk: &[u8; 32]| {
+        let known = if concurrent { base } else { recorded };
+        known.get(rel) != Some(disk)
+    };
+    let now = Utc::now();
+    let mut kept = false;
+
+    for (rel, theirs) in &incoming {
+        let Some(disk) = hash_existing_file(&root.join(rel))? else {
+            continue;
+        };
+        if disk != *theirs && ours(rel.as_path(), &disk) {
+            keep_as_conflict_copy(root, rel, me_short, now)?;
+            kept = true;
+        }
+    }
+
+    staged.apply_to_cache(cache);
     staged.commit(root)?;
 
-    if let Some(s) = current {
-        delete_orphans(root, &s.manifest, &new_manifest);
+    for rel in recorded.keys().filter(|p| !incoming.contains_key(*p)) {
+        let disk = match hash_existing_file(&root.join(rel)) {
+            Ok(Some(h)) => h,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(error = ?e, path = %rel.display(), "could not check a removed file; keeping it");
+                kept = true;
+                continue;
+            }
+        };
+        if concurrent && !base.contains_key(rel) {
+            tracing::info!(path = %rel.display(), "kept a file the other side doesn't have");
+            kept = true;
+        } else if ours(rel.as_path(), &disk) {
+            if let Err(e) = keep_as_conflict_copy(root, rel, me_short, now) {
+                tracing::warn!(error = ?e, path = %rel.display(), "could not keep a conflict copy; leaving the file");
+            }
+            kept = true;
+        } else {
+            match std::fs::remove_file(root.join(rel)) {
+                Ok(()) => tracing::info!(path = %rel.display(), "removed orphan"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %rel.display(), "failed to remove orphan")
+                }
+            }
+        }
     }
 
     let mut clock = current.map(|s| s.clock.clone()).unwrap_or_default();
-    clock.merge(remote_clock);
+    clock.merge(&remote.clock);
 
-    Ok(ShareState {
-        version_hash: remote_vhash.to_string(),
-        manifest_hash: manifest_hash.to_string(),
-        clock,
-        timestamp: remote_timestamp,
-        manifest: new_manifest,
-    })
+    Ok((
+        ShareState {
+            version_hash: remote.version_hash.clone(),
+            manifest_hash: remote.manifest.clone(),
+            clock,
+            timestamp: remote.timestamp,
+            base: incoming.clone(),
+            manifest: incoming,
+        },
+        kept,
+    ))
+}
+
+/// blake3 of a regular file's contents, or `None` if nothing (or not a
+/// regular file) is there.
+fn hash_existing_file(path: &Path) -> Result<Option<[u8; 32]>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow!("checking {path:?}: {e}")),
+    }
+    let mut file = std::fs::File::open(path).with_context(|| format!("opening {path:?}"))?;
+    let mut h = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut h).with_context(|| format!("hashing {path:?}"))?;
+    Ok(Some(*h.finalize().as_bytes()))
+}
+
+/// Move `rel` to a free conflict-copy name beside it.
+fn keep_as_conflict_copy(
+    root: &Path,
+    rel: &Path,
+    me_short: &str,
+    when: DateTime<Utc>,
+) -> Result<PathBuf> {
+    let copy = conflict_copy_name(rel, me_short, when, |p| {
+        std::fs::symlink_metadata(root.join(p)).is_ok()
+    });
+    let (from, to) = (root.join(rel), root.join(&copy));
+    std::fs::rename(&from, &to).with_context(|| format!("renaming {from:?} -> {to:?}"))?;
+    tracing::warn!(path = %rel.display(), copy = %copy.display(),
+        "concurrent change: kept our version as a conflict copy");
+    Ok(copy)
+}
+
+/// `dir/name (conflict from <peer> <YYYY-MM-DD HHMMSS> UTC).ext`, with
+/// `-2`, `-3`, ... before the extension if that is `taken`. The suffix goes
+/// before the last extension; a dotfile (`.bashrc`) keeps its whole name
+/// as the stem.
+fn conflict_copy_name(
+    rel: &Path,
+    me_short: &str,
+    when: DateTime<Utc>,
+    taken: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    let name = rel
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => name.split_at(i),
+        _ => (name.as_str(), ""),
+    };
+    let tag = format!(
+        "{stem} (conflict from {me_short} {})",
+        when.format("%Y-%m-%d %H%M%S UTC")
+    );
+    let parent = rel.parent().unwrap_or(Path::new(""));
+    let mut n = 1;
+    loop {
+        let candidate = if n == 1 {
+            parent.join(format!("{tag}{ext}"))
+        } else {
+            parent.join(format!("{tag}-{n}{ext}"))
+        };
+        if !taken(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// LWW tiebreak: later timestamp wins; on tie, lexicographically larger
@@ -1228,35 +1554,36 @@ fn lww_we_win(
     }
 }
 
-fn delete_orphans(root: &Path, old: &BTreeSet<PathBuf>, new: &BTreeSet<PathBuf>) {
-    for rel in old.difference(new) {
-        let abs = root.join(rel);
-        match std::fs::remove_file(&abs) {
-            Ok(()) => tracing::info!(path = %rel.display(), "removed orphan"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(error = %e, path = %rel.display(), "failed to remove orphan"),
-        }
-    }
-}
-
 /// Watch the share root recursively. Returns the watcher (which must be kept
 /// alive for events to flow) and an unbounded receiver of "something changed"
 /// notifications. We don't care about event details — any change just means
 /// "recompute the version hash."
-fn spawn_fs_watcher(root: &Path) -> Result<(notify::RecommendedWatcher, UnboundedReceiver<()>)> {
+/// The sender is handed back too, so the share loop can ask for a re-check
+/// itself (after an apply that kept local files).
+fn spawn_fs_watcher(
+    root: &Path,
+) -> Result<(
+    notify::RecommendedWatcher,
+    UnboundedSender<()>,
+    UnboundedReceiver<()>,
+)> {
     use notify::{RecommendedWatcher, RecursiveMode, Watcher};
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let tx_loop = tx.clone();
     let mut watcher: RecommendedWatcher =
         notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
             Ok(ev) => {
                 // Skip events fully inside the shadow dir — those are our
                 // own writes; reacting would make us recompute and re-encrypt
                 // forever.
+                // Staged downloads (`*.peerdup-tmp`) are ours too; their
+                // rename into place still counts, since it names the
+                // destination as well.
                 let all_in_shadow = !ev.paths.is_empty()
-                    && ev
-                        .paths
-                        .iter()
-                        .all(|p| p.components().any(|c| c.as_os_str() == PEERDUP_DIR_NAME));
+                    && ev.paths.iter().all(|p| {
+                        p.components().any(|c| c.as_os_str() == PEERDUP_DIR_NAME)
+                            || p.to_string_lossy().ends_with(".peerdup-tmp")
+                    });
                 if !all_in_shadow {
                     let _ = tx.send(());
                 }
@@ -1267,23 +1594,14 @@ fn spawn_fs_watcher(root: &Path) -> Result<(notify::RecommendedWatcher, Unbounde
     watcher
         .watch(root, RecursiveMode::Recursive)
         .with_context(|| format!("watching {root:?}"))?;
-    Ok((watcher, rx))
+    Ok((watcher, tx_loop, rx))
 }
 
-/// Read one event, then keep reading until `settle` elapses without another
-/// event, then resolve. Collapses bursts (like an editor's atomic save:
-/// unlink + rename + write) into a single "change happened" signal.
-///
-/// Returns `Some(())` when a debounced change is ready, `None` when the
-/// watcher channel has closed.
-async fn debounce(rx: &mut UnboundedReceiver<()>, settle: Duration) -> Option<()> {
-    rx.recv().await?;
-    loop {
-        match tokio::time::timeout(settle, rx.recv()).await {
-            Ok(Some(())) => continue,
-            Ok(None) => return Some(()), // channel closed mid-debounce; deliver what we have
-            Err(_) => return Some(()),   // settled
-        }
+/// Resolves at `due`, or never if there is no change waiting.
+async fn sleep_until_due(due: Option<tokio::time::Instant>) {
+    match due {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -1307,10 +1625,13 @@ async fn publish_sync_announce(
         state.clock.clone(),
         state.timestamp,
     );
-    if let Ok(bytes) = serde_json::to_vec(&ShareMsg::Announce(ann)) {
-        if let Err(e) = handle.publish(bytes).await {
-            tracing::warn!(error = %e, "gossip publish failed");
+    match wire::encode(ShareMsg::Announce(ann)) {
+        Ok(bytes) => {
+            if let Err(e) = handle.publish(bytes).await {
+                tracing::warn!(error = %e, "gossip publish failed");
+            }
         }
+        Err(e) => tracing::warn!(error = %e, "encoding announce failed"),
     }
 }
 
@@ -1318,15 +1639,17 @@ async fn publish_auth_ops(handle: &GossipHandle, auth_state: &AuthState, share_i
     if auth_state.is_empty() {
         return;
     }
-    let bytes = match auth_announce_bytes(auth_state) {
-        Ok(b) => b,
+    let messages = match wire::auth_ops_messages(auth_state) {
+        Ok(m) => m,
         Err(e) => {
             tracing::warn!(error = %e, share_id = %share_id, "encoding auth ops failed");
             return;
         }
     };
-    if let Err(e) = handle.publish(bytes).await {
-        tracing::warn!(error = %e, share_id = %share_id, "gossip publish (auth ops) failed");
+    for bytes in messages {
+        if let Err(e) = handle.publish(bytes).await {
+            tracing::warn!(error = %e, share_id = %share_id, "gossip publish (auth ops) failed");
+        }
     }
 }
 
@@ -1338,8 +1661,7 @@ async fn publish_pending_rotations(
     share_id: &str,
 ) {
     for rot in pending {
-        let msg = ShareMsg::KeyRotation(rot.clone());
-        let bytes = match serde_json::to_vec(&msg) {
+        let bytes = match wire::encode(ShareMsg::KeyRotation(rot.clone())) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(error = %e, share_id = %share_id, epoch = rot.epoch,
@@ -1518,8 +1840,10 @@ async fn drain_rotation_buffer(
 }
 
 /// Bounded push: drop the oldest (lowest-epoch) entry once the buffer fills.
+/// Only a chunk that carries our envelope is ever buffered, and an epoch
+/// has one such chunk per rotator, so this dedups by signature.
 fn buffer_push(buf: &mut Vec<SignedRotation>, rot: SignedRotation) {
-    if buf.iter().any(|r| r.epoch == rot.epoch) {
+    if buf.iter().any(|r| r.signature == rot.signature) {
         return;
     }
     if buf.len() >= ROTATION_BUFFER_CAP {
@@ -1579,7 +1903,7 @@ mod tests {
         let config = ShareConfig::new(topic, td.path().join("share-root"), ShareRole::Sync);
         config.save(td.path()).unwrap();
         let group = group_id_for(&config.id);
-        let mut auth_state = AuthState::empty();
+        let mut auth_state = AuthState::empty_for(group);
         auth_state.create_group(&identity, group).unwrap();
         auth::save(td.path(), &config.id, &auth_state).unwrap();
         let ring = crypto::load_or_create_keyring(td.path(), &config.id).unwrap();
@@ -1649,7 +1973,7 @@ mod tests {
         .unwrap();
         assert_eq!(new_epoch, 2);
 
-        // Pending in-memory queue should have one entry; on disk too.
+        // Pending in-memory queue should have one chunk; on disk too.
         assert_eq!(pending.len(), 1);
         let on_disk = rotation::load_pending(td.path(), &config.id).unwrap();
         assert_eq!(on_disk.len(), 1);
@@ -1662,6 +1986,247 @@ mod tests {
         // The in-memory keyring (held via Arc<RwLock<...>>) must have the
         // new epoch too.
         assert_eq!(key.read().await.current_epoch(), 2);
+    }
+
+    const ME: &str = "abcd1234";
+
+    fn at() -> DateTime<Utc> {
+        "2026-11-26T01:38:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn the_lww_winner_keeps_its_clock_so_the_loser_applies_concurrently() {
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        let mut base = VectorClock::new();
+        base.increment(&a);
+        let mut ours = base.clone();
+        ours.increment(&b);
+        let mut theirs = base.clone();
+        theirs.increment(&a);
+        let mut local = state(FileMap::new(), FileMap::new());
+        local.clock = ours.clone();
+        local.timestamp = at() + chrono::TimeDelta::seconds(1);
+        let theirs_remote = RemoteVersion {
+            clock: theirs.clone(),
+            ..remote()
+        };
+        // We are later: we win and change nothing.
+        assert!(matches!(
+            judge("s", Some(&local), &theirs_remote),
+            Verdict::LocalWins
+        ));
+        // The other side, earlier, sees our version as concurrent (not
+        // dominating), so its apply keeps conflict copies.
+        let mut other = state(FileMap::new(), FileMap::new());
+        other.clock = theirs;
+        let ours_remote = RemoteVersion {
+            clock: ours,
+            timestamp: local.timestamp,
+            ..remote()
+        };
+        assert!(matches!(
+            judge("s", Some(&other), &ours_remote),
+            Verdict::Fetch { concurrent: true }
+        ));
+    }
+
+    #[test]
+    fn conflict_copy_names() {
+        let free = |_: &Path| false;
+        let name = |p: &str| conflict_copy_name(Path::new(p), ME, at(), free);
+        let tag = "(conflict from abcd1234 2026-11-26 013800 UTC)";
+        assert_eq!(name("notes.txt"), PathBuf::from(format!("notes {tag}.txt")));
+        assert_eq!(name("Makefile"), PathBuf::from(format!("Makefile {tag}")));
+        assert_eq!(name(".bashrc"), PathBuf::from(format!(".bashrc {tag}")));
+        assert_eq!(
+            name("dir/archive.tar.gz"),
+            PathBuf::from(format!("dir/archive.tar {tag}.gz"))
+        );
+        // Taken names get a counter before the extension.
+        let first = PathBuf::from(format!("notes {tag}.txt"));
+        let second = PathBuf::from(format!("notes {tag}-2.txt"));
+        let taken = |p: &Path| p == first.as_path() || p == second.as_path();
+        assert_eq!(
+            conflict_copy_name(Path::new("notes.txt"), ME, at(), taken),
+            PathBuf::from(format!("notes {tag}-3.txt"))
+        );
+        // Every generated name is a valid manifest path.
+        for p in [
+            "notes.txt",
+            "Makefile",
+            ".bashrc",
+            "dir/archive.tar.gz",
+            "a/b/.env",
+        ] {
+            let copy = name(p);
+            let s = copy.to_str().unwrap();
+            assert_eq!(transfer::manifest_path_to_rel(s).unwrap(), copy, "{s}");
+        }
+    }
+
+    fn h(b: &[u8]) -> [u8; 32] {
+        *blake3::hash(b).as_bytes()
+    }
+
+    fn files(entries: &[(&str, &[u8])]) -> FileMap {
+        entries
+            .iter()
+            .map(|(p, b)| (PathBuf::from(p), h(b)))
+            .collect()
+    }
+
+    fn remote() -> RemoteVersion {
+        let mut clock = VectorClock::new();
+        clock.increment(&"ee".repeat(32));
+        RemoteVersion {
+            manifest: "aa".repeat(32),
+            provider: "ee".repeat(32),
+            version_hash: "bb".repeat(32),
+            clock,
+            timestamp: at(),
+        }
+    }
+
+    fn state(manifest: FileMap, base: FileMap) -> ShareState {
+        ShareState {
+            version_hash: "cc".repeat(32),
+            manifest_hash: "dd".repeat(32),
+            clock: VectorClock::new(),
+            timestamp: at(),
+            manifest,
+            base,
+        }
+    }
+
+    fn write(root: &Path, rel: &str, b: &[u8]) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b).unwrap();
+    }
+
+    fn copies(root: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_name().to_string_lossy().contains("(conflict from "))
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(e.path()).unwrap(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn fast_forward_keeps_unannounced_edits_as_conflict_copies() {
+        let td = TmpDir::new("ff");
+        let root = td.path();
+        // We last had a=v1, b=v1, c=v1; a and c were edited since,
+        // without being announced.
+        write(root, "a.txt", b"local edit");
+        write(root, "b.txt", b"v1");
+        write(root, "c.txt", b"local edit of c");
+        let current = state(
+            files(&[("a.txt", b"v1"), ("b.txt", b"v1"), ("c.txt", b"v1")]),
+            FileMap::new(),
+        );
+        // Their newer version changes a and drops b and c.
+        let staged = transfer::staged_for_test(root, &[("a.txt", b"theirs")]);
+        let mut cache = BlobCache::default();
+        let (next, kept) = commit_remote(
+            root,
+            staged,
+            &remote(),
+            Some(&current),
+            &mut cache,
+            false,
+            ME,
+        )
+        .unwrap();
+        assert!(kept);
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"theirs");
+        assert!(!root.join("b.txt").exists(), "unchanged orphan is removed");
+        assert!(!root.join("c.txt").exists());
+        let c = copies(root);
+        assert_eq!(c.len(), 2, "{c:?}");
+        assert!(c
+            .iter()
+            .any(|(n, b)| n.starts_with("a ") && b == b"local edit"));
+        assert!(c
+            .iter()
+            .any(|(n, b)| n.starts_with("c ") && b == b"local edit of c"));
+        assert_eq!(next.manifest, files(&[("a.txt", b"theirs")]));
+        assert_eq!(next.base, next.manifest);
+    }
+
+    #[test]
+    fn fast_forward_overwrites_files_we_did_not_change() {
+        let td = TmpDir::new("ff-clean");
+        let root = td.path();
+        write(root, "a.txt", b"v1");
+        let current = state(files(&[("a.txt", b"v1")]), FileMap::new());
+        let staged = transfer::staged_for_test(root, &[("a.txt", b"v2")]);
+        let (_, kept) = commit_remote(
+            root,
+            staged,
+            &remote(),
+            Some(&current),
+            &mut BlobCache::default(),
+            false,
+            ME,
+        )
+        .unwrap();
+        assert!(!kept);
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v2");
+        assert!(copies(root).is_empty());
+    }
+
+    #[test]
+    fn concurrent_apply_measures_against_the_shared_base() {
+        let td = TmpDir::new("concurrent");
+        let root = td.path();
+        // Both sides had a=v0, b=v0, gone=v0. We changed a and added
+        // new; they changed b, and removed gone. Their version won.
+        write(root, "a.txt", b"ours");
+        write(root, "b.txt", b"v0");
+        write(root, "gone.txt", b"v0");
+        write(root, "new.txt", b"added by us");
+        let base = files(&[("a.txt", b"v0"), ("b.txt", b"v0"), ("gone.txt", b"v0")]);
+        let current = state(
+            files(&[
+                ("a.txt", b"ours"),
+                ("b.txt", b"v0"),
+                ("gone.txt", b"v0"),
+                ("new.txt", b"added by us"),
+            ]),
+            base,
+        );
+        let staged = transfer::staged_for_test(root, &[("a.txt", b"v0"), ("b.txt", b"theirs")]);
+        let (_, kept) = commit_remote(
+            root,
+            staged,
+            &remote(),
+            Some(&current),
+            &mut BlobCache::default(),
+            true,
+            ME,
+        )
+        .unwrap();
+        assert!(kept);
+        // Our edit to a survives as a copy; theirs keeps the name.
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v0");
+        let c = copies(root);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert!(c[0].0.starts_with("a (conflict from abcd1234 ") && c[0].1 == b"ours");
+        // Only they changed b: no copy, their content.
+        assert_eq!(std::fs::read(root.join("b.txt")).unwrap(), b"theirs");
+        // Unchanged since the base and dropped by them: removed.
+        assert!(!root.join("gone.txt").exists());
+        // Added by us, unknown to them: kept under its own name.
+        assert_eq!(std::fs::read(root.join("new.txt")).unwrap(), b"added by us");
     }
 
     #[tokio::test]

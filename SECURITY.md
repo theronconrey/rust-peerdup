@@ -37,8 +37,6 @@ them do):
 - By default peers that can't connect directly meet through n0's public
   relays, which see who talks to whom (not what). `--relay-url` changes
   this.
-- Concurrent edits to the same file resolve by last-writer-wins; the
-  other side's change is lost, not kept as a conflict copy.
 - Some vendored crates bring their own crypto and CA list instead of
   following Fedora's crypto-policies (CONTRIBUTING.md, section 3).
 

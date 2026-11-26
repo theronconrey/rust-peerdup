@@ -204,9 +204,11 @@ impl SignedOp {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let (op, _): (Self, _) =
-            bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-                .context("decoding signed op")?;
+        let (op, _): (Self, _) = bincode::serde::decode_from_slice(
+            bytes,
+            bincode::config::standard().with_limit::<MAX_OP_BYTES>(),
+        )
+        .context("decoding signed op")?;
         Ok(op)
     }
 }
@@ -256,6 +258,13 @@ impl Orderer<MemberId, OpId, GroupControlMessage<MemberId, ()>> for NoOpOrderer 
     }
 }
 
+/// Largest `auth.log` we read: about 80,000 ops.
+pub const MAX_AUTH_LOG_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest single encoded op: an op's deps are the heads it was authored
+/// on, so this is generous.
+pub const MAX_OP_BYTES: usize = 64 * 1024;
+
 /// Cap on ops buffered while their dependencies are missing.
 const MAX_PENDING_OPS: usize = 256;
 
@@ -264,6 +273,9 @@ type Crdt = GroupCrdt<MemberId, OpId, (), Resolver, NoOpOrderer>;
 type CrdtState = GroupCrdtState<MemberId, OpId, (), NoOpOrderer>;
 
 pub struct AuthState {
+    /// The share's group. Every op must be for it, and the first one must
+    /// be its `Create`.
+    group: MemberId,
     crdt: CrdtState,
     /// Causally-ordered log of applied operations. Mirrors `auth.log` on disk.
     ops: Vec<SignedOp>,
@@ -273,8 +285,11 @@ pub struct AuthState {
 }
 
 impl AuthState {
-    pub fn empty() -> Self {
+    /// An empty state for `group`. Its first op must be that group's
+    /// `Create`; ops for any other group are refused.
+    pub fn empty_for(group: MemberId) -> Self {
         Self {
+            group,
             crdt: CrdtState::new(()),
             ops: Vec::new(),
             pending: Vec::new(),
@@ -289,8 +304,16 @@ impl AuthState {
         self.ops.is_empty()
     }
 
+    /// Ops held back because a dependency hasn't arrived.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Author and apply the group's `Create` operation. Self becomes manager.
     pub fn create_group(&mut self, my_key: &SigningKey, group_id: MemberId) -> Result<SignedOp> {
+        if group_id != self.group {
+            return Err(anyhow!("this auth state is for another group"));
+        }
         if !self.ops.is_empty() {
             return Err(anyhow!(
                 "auth state already has {} operation(s); refusing to re-create group",
@@ -363,20 +386,19 @@ impl AuthState {
         op.verify().context("verifying remote auth op")?;
         // One AuthState is one share's group. Ops for any other group are
         // someone else's (or an attempt to mix logs) and are refused.
-        if let Some(group) = self.group_id() {
-            if op.payload.group_id != group {
-                return Err(anyhow!(
-                    "auth op is for a different group ({:?}, this share is {:?})",
-                    op.payload.group_id,
-                    group
-                ));
-            }
+        if op.payload.group_id != self.group {
+            return Err(anyhow!(
+                "auth op is for a different group ({:?}, this share is {:?})",
+                op.payload.group_id,
+                self.group
+            ));
         }
         let op_id = op.id();
         if self.ops.iter().any(|o| o.id() == op_id) || self.pending.iter().any(|o| o.id() == op_id)
         {
             return Ok(false);
         }
+        self.check_shape(&op)?;
 
         let known: HashSet<OpId> = self.ops.iter().map(|o| o.id()).collect();
         if !op.deps.iter().all(|d| known.contains(d)) {
@@ -394,6 +416,36 @@ impl AuthState {
         self.process(op)?;
         self.drain_pending()?;
         Ok(true)
+    }
+
+    /// A group has exactly one `Create`, its root: it has no deps and is
+    /// the first op applied. Every other op builds on earlier ones. A
+    /// second `Create`, signed by anyone, would otherwise be processed by
+    /// p2panda-auth as a fresh group definition (review finding 1; see
+    /// INTEGRATION_NOTES.md, "p2panda-auth: a second Create resets group
+    /// state").
+    fn check_shape(&self, op: &SignedOp) -> Result<()> {
+        match &op.payload.action {
+            GroupAction::Create { .. } => {
+                if !op.deps.is_empty() {
+                    return Err(anyhow!("refusing a Create with dependencies"));
+                }
+                if !self.ops.is_empty() {
+                    return Err(anyhow!(
+                        "refusing a second Create for an existing group (from {})",
+                        op.author.to_hex()
+                    ));
+                }
+            }
+            _ => {
+                if op.deps.is_empty() {
+                    return Err(anyhow!(
+                        "refusing an auth op with no dependencies that is not the group's Create"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn process(&mut self, op: SignedOp) -> Result<()> {
@@ -443,12 +495,9 @@ impl AuthState {
         }
     }
 
-    /// The group this state belongs to: the group of its first op.
-    fn group_id(&self) -> Option<MemberId> {
-        self.ops
-            .first()
-            .or_else(|| self.pending.first())
-            .map(|op| op.payload.group_id)
+    /// The group this state belongs to.
+    pub fn group_id(&self) -> MemberId {
+        self.group
     }
 
     /// `member`'s current role in `group_id`, if it is a member.
@@ -513,14 +562,23 @@ pub fn auth_log_path(data_dir: &Path, share_id: &str) -> PathBuf {
 /// state if no log exists. Verifies every signature on the way in.
 pub fn load(data_dir: &Path, share_id: &str) -> Result<AuthState> {
     let path = auth_log_path(data_dir, share_id);
+    let group = group_id_for(share_id);
     if !path.exists() {
-        return Ok(AuthState::empty());
+        return Ok(AuthState::empty_for(group));
     }
     let bytes = fs::read(&path).with_context(|| format!("reading {path:?}"))?;
-    let (ops, _): (Vec<SignedOp>, _) =
-        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-            .with_context(|| format!("decoding {path:?}"))?;
-    let mut state = AuthState::empty();
+    if bytes.len() > MAX_AUTH_LOG_BYTES {
+        return Err(anyhow!(
+            "{path:?} is {} bytes, over the {MAX_AUTH_LOG_BYTES}-byte limit",
+            bytes.len()
+        ));
+    }
+    let (ops, _): (Vec<SignedOp>, _) = bincode::serde::decode_from_slice(
+        &bytes,
+        bincode::config::standard().with_limit::<MAX_AUTH_LOG_BYTES>(),
+    )
+    .with_context(|| format!("decoding {path:?}"))?;
+    let mut state = AuthState::empty_for(group);
     for op in ops {
         state
             .apply_remote(op)
@@ -584,7 +642,7 @@ mod tests {
         let bob = fresh_key();
         let carol = fresh_key();
         let group = group_id_for("share-reject");
-        let mut state = AuthState::empty();
+        let mut state = AuthState::empty_for(group);
         state.create_group(&alice, group).unwrap();
         state
             .add_member(&alice, group, me_of(&bob), AuthRole::Writer)
@@ -597,14 +655,92 @@ mod tests {
         assert!(!state.is_member(group, me_of(&carol)));
     }
 
+    /// Sign an op with arbitrary deps, the way a malicious peer can.
+    fn forge(
+        key: &SigningKey,
+        deps: Vec<OpId>,
+        action: GroupAction<MemberId, ()>,
+        group: MemberId,
+    ) -> SignedOp {
+        let author = me_of(key);
+        let payload = GroupControlMessage {
+            group_id: group,
+            action,
+        };
+        let canonical =
+            bincode::serde::encode_to_vec((&author, &deps, &payload), bincode::config::standard())
+                .unwrap();
+        SignedOp {
+            author,
+            deps,
+            payload,
+            signature: key.sign(&canonical).to_bytes(),
+        }
+    }
+
+    fn sorted_members(state: &AuthState, group: MemberId) -> Vec<(MemberId, AuthRole)> {
+        let mut m = state.members(group);
+        m.sort_by_key(|(id, _)| id.0);
+        m
+    }
+
+    /// Review finding 1: a second `Create` for an existing group, signed
+    /// by a Reader or by someone outside the share, must not reset the
+    /// group or hand the attacker a role.
+    #[test]
+    fn stranger_create_for_existing_group_is_refused() {
+        let owner = fresh_key();
+        let writer = fresh_key();
+        let reader = fresh_key();
+        let stranger = fresh_key();
+        let group = group_id_for("share-takeover");
+        let mut state = AuthState::empty_for(group);
+        state.create_group(&owner, group).unwrap();
+        state
+            .add_member(&owner, group, me_of(&writer), AuthRole::Writer)
+            .unwrap();
+        state
+            .add_member(&owner, group, me_of(&reader), AuthRole::Reader)
+            .unwrap();
+        let before = sorted_members(&state, group);
+
+        for (attacker, role_before) in [(&reader, Some(AuthRole::Reader)), (&stranger, None)] {
+            let create = |deps: Vec<OpId>| {
+                forge(
+                    attacker,
+                    deps,
+                    GroupAction::Create {
+                        initial_members: vec![(
+                            GroupMember::Individual(me_of(attacker)),
+                            Access::manage(),
+                        )],
+                    },
+                    group,
+                )
+            };
+            // A Create with no deps (a fresh root) and one built on the
+            // current heads (as if authored with a full copy of the log).
+            let heads: Vec<OpId> = state.crdt.inner.heads().into_iter().collect();
+            for op in [create(Vec::new()), create(heads)] {
+                let _ = state.apply_remote(op);
+                assert_eq!(
+                    sorted_members(&state, group),
+                    before,
+                    "a forged Create changed the membership"
+                );
+                assert_eq!(state.role_of(group, me_of(attacker)), role_before);
+            }
+        }
+    }
+
     #[test]
     fn ops_for_another_group_are_refused() {
         let alice = fresh_key();
         let group_a = group_id_for("share-a");
         let group_b = group_id_for("share-b");
-        let mut a = AuthState::empty();
+        let mut a = AuthState::empty_for(group_a);
         a.create_group(&alice, group_a).unwrap();
-        let mut b = AuthState::empty();
+        let mut b = AuthState::empty_for(group_b);
         let op_b = b.create_group(&alice, group_b).unwrap();
         let err = a.apply_remote(op_b).unwrap_err().to_string();
         assert!(err.contains("different group"), "{err}");
@@ -615,7 +751,7 @@ mod tests {
         let alice = fresh_key();
         let bob = fresh_key();
         let group = group_id_for("share-owner");
-        let mut state = AuthState::empty();
+        let mut state = AuthState::empty_for(group);
         state.create_group(&alice, group).unwrap();
         state
             .add_member(&alice, group, me_of(&bob), AuthRole::Writer)
@@ -630,7 +766,7 @@ mod tests {
         let bob = fresh_key();
         let group = group_id_for("share-1");
 
-        let mut state = AuthState::empty();
+        let mut state = AuthState::empty_for(group);
         let _create_op = state.create_group(&alice, group).unwrap();
         let _add_op = state
             .add_member(&alice, group, me_of(&bob), AuthRole::Writer)
@@ -651,7 +787,7 @@ mod tests {
         let alice = fresh_key();
         let group = group_id_for("share-roundtrip");
 
-        let mut state = AuthState::empty();
+        let mut state = AuthState::empty_for(group);
         let op = state.create_group(&alice, group).unwrap();
 
         let bytes = op.encode().unwrap();
@@ -667,7 +803,7 @@ mod tests {
     fn tampered_op_fails_verify() {
         let alice = fresh_key();
         let group = group_id_for("share-tamper");
-        let mut state = AuthState::empty();
+        let mut state = AuthState::empty_for(group);
         let op = state.create_group(&alice, group).unwrap();
 
         let mut bad = op.clone();
@@ -686,14 +822,14 @@ mod tests {
         let group = group_id_for("share-converge");
 
         // Alice authors locally.
-        let mut alice_state = AuthState::empty();
+        let mut alice_state = AuthState::empty_for(group);
         let op1 = alice_state.create_group(&alice, group).unwrap();
         let op2 = alice_state
             .add_member(&alice, group, me_of(&bob), AuthRole::Reader)
             .unwrap();
 
         // Bob replays from gossip in original order.
-        let mut bob_state = AuthState::empty();
+        let mut bob_state = AuthState::empty_for(group);
         assert!(bob_state.apply_remote(op1.clone()).unwrap());
         assert!(bob_state.apply_remote(op2.clone()).unwrap());
 
@@ -710,13 +846,13 @@ mod tests {
         let bob = fresh_key();
         let group = group_id_for("share-ooo");
 
-        let mut alice_state = AuthState::empty();
+        let mut alice_state = AuthState::empty_for(group);
         let op1 = alice_state.create_group(&alice, group).unwrap();
         let op2 = alice_state
             .add_member(&alice, group, me_of(&bob), AuthRole::Writer)
             .unwrap();
 
-        let mut bob_state = AuthState::empty();
+        let mut bob_state = AuthState::empty_for(group);
         // Apply op2 first; it has an unmet dep so it stays pending.
         assert!(!bob_state.apply_remote(op2.clone()).unwrap());
         assert!(bob_state.members(group).is_empty());
@@ -736,7 +872,7 @@ mod tests {
     fn duplicate_apply_is_a_noop() {
         let alice = fresh_key();
         let group = group_id_for("share-dup");
-        let mut state = AuthState::empty();
+        let mut state = AuthState::empty_for(group);
         let op = state.create_group(&alice, group).unwrap();
 
         // The locally-applied op was already added; replaying it should be a noop.
@@ -749,7 +885,7 @@ mod tests {
         let alice = fresh_key();
         let bob = fresh_key();
         let group = group_id_for("share-revoke");
-        let mut state = AuthState::empty();
+        let mut state = AuthState::empty_for(group);
         state.create_group(&alice, group).unwrap();
         state
             .add_member(&alice, group, me_of(&bob), AuthRole::Writer)

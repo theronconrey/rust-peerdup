@@ -16,6 +16,7 @@ mod share;
 mod share_state;
 mod ticket;
 mod transfer;
+mod wire;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -444,13 +445,21 @@ fn cmd_share_add_direct(
         return Err(anyhow!("seed path does not exist: {path:?}"));
     }
     let config = ShareConfig::new(topic, path, role);
-    config.save(&data_dir)?;
+    if share::load_all(&data_dir)?
+        .iter()
+        .any(|c| c.id == config.id)
+    {
+        return Err(anyhow!("share {} is already configured", config.id));
+    }
 
+    // Auth log first, share.json last: the daemon only starts shares that
+    // have both.
     let identity = identity::load_or_create(&data_dir::identity_path(&data_dir))?;
     let group_id = auth::group_id_for(&config.id);
-    let mut auth_state = auth::AuthState::empty();
+    let mut auth_state = auth::AuthState::empty_for(group_id);
     auth_state.create_group(&identity, group_id)?;
     auth::save(&data_dir, &config.id, &auth_state)?;
+    config.save(&data_dir)?;
 
     println!("Added share {} ({})", config.id, config.topic);
     println!(
@@ -586,9 +595,9 @@ fn cmd_share_revoke_direct(data_dir: PathBuf, id: String, peer_pubkey_hex: Strin
             .ok_or_else(|| anyhow!("rotated keyring missing epoch {new_epoch}"))?
     };
 
-    let rotation_msg =
+    let chunks =
         rotation::build_signed_rotation(&identity, group_id, new_epoch, &new_key, &remaining)?;
-    rotation::save_pending(&data_dir, &id, &rotation_msg)?;
+    rotation::save_pending(&data_dir, &id, &chunks)?;
 
     println!("Revoked {} from share {id}", peer_pubkey_hex);
     println!("Rotated keyring to epoch {new_epoch}.");
@@ -665,23 +674,16 @@ fn cmd_share_invite_direct(
 
 fn cmd_share_join_direct(data_dir: PathBuf, ticket_str: String, path: PathBuf) -> Result<()> {
     let _lock = lock_for_direct_write(&data_dir)?;
+    // Everything in the ticket is checked before anything is written.
     let ticket = ticket::Ticket::decode(&ticket_str)?;
+    let identity = identity::load_or_create(&data_dir::identity_path(&data_dir))?;
+    let auth_state =
+        ticket.verified_auth_state(auth::MemberId(*identity.verifying_key().as_bytes()))?;
     let configs = share::load_all(&data_dir)?;
     if configs.iter().any(|c| c.id == ticket.share_id) {
         return Err(anyhow!(
             "share {} is already configured locally; remove it first if you want to re-join",
             ticket.share_id
-        ));
-    }
-
-    let identity = identity::load_or_create(&data_dir::identity_path(&data_dir))?;
-    let me = *identity.verifying_key().as_bytes();
-    if ticket.invitee_pubkey != me {
-        return Err(anyhow!(
-            "ticket was issued for a different public key (expected {}, this peer is {}); \
-             ask the inviter to re-run `share invite` with the correct key",
-            auth::MemberId(ticket.invitee_pubkey).to_hex(),
-            identity.verifying_key().to_hex()
         ));
     }
 
@@ -691,37 +693,7 @@ fn cmd_share_join_direct(data_dir: PathBuf, ticket_str: String, path: PathBuf) -
         std::env::current_dir()?.join(path)
     };
     std::fs::create_dir_all(&path)?;
-
-    let cfg = ShareConfig {
-        id: ticket.share_id.clone(),
-        topic: ticket.topic.clone(),
-        root_path: path,
-        role: ticket.role,
-        created_at: chrono::Utc::now(),
-    };
-    cfg.save(&data_dir)?;
-    if let Some(addr) = &ticket.inviter_addr {
-        bootstrap::save_share_bootstrap(&data_dir, &ticket.share_id, addr)?;
-    }
-
-    crypto::install_keyring(&data_dir, &ticket.share_id, &ticket.keys)?;
-
-    let mut auth_state = auth::AuthState::empty();
-    for op in &ticket.auth_log {
-        auth_state.apply_remote(op.clone()).with_context(|| {
-            format!(
-                "applying auth log op while joining share {}",
-                ticket.share_id
-            )
-        })?;
-    }
-    let group_id = auth::group_id_for(&ticket.share_id);
-    if !auth_state.is_member(group_id, auth::MemberId(me)) {
-        return Err(anyhow!(
-            "ticket's auth log does not list us as a member; refusing to join"
-        ));
-    }
-    auth::save(&data_dir, &ticket.share_id, &auth_state)?;
+    let cfg = ticket::install_join(&data_dir, &ticket, &auth_state, path)?;
 
     println!(
         "Joined share {} ({}) at {}",

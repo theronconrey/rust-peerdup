@@ -24,12 +24,13 @@
 
 use crate::crypto::{self, KeyRing, EPOCH_LEN};
 use anyhow::{anyhow, Context, Result};
+use iroh_blobs::api::blobs::BlobStatus;
 use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobsProtocol, Hash};
 use p2panda_core::VerifyingKey;
 use p2panda_net::Endpoint;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
@@ -43,6 +44,22 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Upper bound for connecting to a provider.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Largest encrypted manifest we fetch. At about 200 bytes an entry this
+/// is far above `MAX_MANIFEST_ENTRIES`.
+pub const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Largest file blob we fetch. A whole file is held in memory twice
+/// (ciphertext, then plaintext) while it is decrypted and checked, and on
+/// the sender while it is encrypted, until encryption is streamed. Larger
+/// files are refused by the receiver.
+pub const MAX_BLOB_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Most files in one version.
+pub const MAX_MANIFEST_ENTRIES: usize = 100_000;
+
+/// Longest manifest path, in bytes (Linux's PATH_MAX).
+pub const MAX_PATH_BYTES: usize = 4096;
 
 /// Directory name inside the share root that holds peerdup's own files.
 /// The plaintext walk skips it, and manifest paths may never start with it.
@@ -67,26 +84,58 @@ struct Manifest {
 /// One file of a version: relative path plus blake3 of its plaintext.
 pub type FileHash = (PathBuf, [u8; 32]);
 
-/// A fetched, verified version, staged next to its final paths.
+/// A fetched, verified version, staged next to its final paths. Dropping
+/// it removes every staged file not yet committed, so an error, a timeout
+/// or an aborted fetch task leaves no `*.peerdup-tmp` behind.
 pub struct StagedVersion {
     /// `(final path relative to the root, temp file holding the plaintext)`.
     staged: Vec<(PathBuf, PathBuf)>,
     pub files: Vec<FileHash>,
+    /// What the fetch learned for the `BlobCache`, applied by the share
+    /// loop (which owns the cache) when it commits.
+    cache_updates: Vec<(String, String, Hash, u64)>,
 }
 
 impl StagedVersion {
-    /// Move every staged file into place.
-    pub fn commit(self, root: &Path) -> Result<()> {
-        for (rel, tmp) in &self.staged {
-            let dest = root.join(rel);
-            std::fs::rename(tmp, &dest).with_context(|| format!("renaming {tmp:?} -> {dest:?}"))?;
+    fn new(files: Vec<FileHash>) -> Self {
+        Self {
+            staged: Vec::new(),
+            files,
+            cache_updates: Vec::new(),
+        }
+    }
+
+    /// Move every staged file into place. A file that can't be moved stays
+    /// staged and is removed when `self` drops.
+    pub fn commit(mut self, root: &Path) -> Result<()> {
+        while let Some((rel, tmp)) = self.staged.last().cloned() {
+            check_parents(root, &rel, false)?;
+            let dest = root.join(&rel);
+            std::fs::rename(&tmp, &dest)
+                .with_context(|| format!("renaming {tmp:?} -> {dest:?}"))?;
+            self.staged.pop();
         }
         Ok(())
     }
 
-    /// Remove the staged files without applying them.
-    pub fn discard(self) {
-        for (_, tmp) in &self.staged {
+    /// Record what this version's files are encrypted as, so re-announces
+    /// and our own next publish reuse the blobs.
+    pub fn apply_to_cache(&self, cache: &mut BlobCache) {
+        for (path, plain, blob, epoch) in &self.cache_updates {
+            cache.remember(path.clone(), plain.clone(), *blob, *epoch);
+        }
+        let keep: Vec<String> = self
+            .files
+            .iter()
+            .filter_map(|(rel, _)| rel_to_manifest_path(rel).ok())
+            .collect();
+        cache.retain_paths(&keep);
+    }
+}
+
+impl Drop for StagedVersion {
+    fn drop(&mut self) {
+        for (_, tmp) in self.staged.drain(..) {
             let _ = std::fs::remove_file(tmp);
         }
     }
@@ -254,7 +303,8 @@ impl Transfer {
     /// Fetch the version `manifest_hex` from `provider_hex`, check it
     /// against `version_hash`, decrypt and verify every file, and stage the
     /// plaintext next to its destination under `root`. Nothing in the share
-    /// root changes until the caller commits the result.
+    /// root changes until the caller commits the result; if this fails or
+    /// is cancelled, the staged files are removed.
     pub async fn fetch(
         &self,
         provider_hex: &str,
@@ -262,7 +312,6 @@ impl Transfer {
         version_hash: &str,
         root: &Path,
         key: &KeyRing,
-        cache: &mut BlobCache,
     ) -> Result<StagedVersion> {
         let provider = VerifyingKey::from_str(provider_hex)
             .map_err(|e| anyhow!("bad provider id {provider_hex:?}: {e:?}"))?;
@@ -277,7 +326,8 @@ impl Transfer {
         .map_err(|_| anyhow!("timed out connecting to {provider_hex}"))?
         .map_err(|e| anyhow!("connecting to {provider_hex}: {e:?}"))?;
 
-        self.fetch_blob(&conn, manifest_hash).await?;
+        self.fetch_blob(&conn, manifest_hash, MAX_MANIFEST_BYTES)
+            .await?;
         let manifest_ct = self.read(manifest_hash).await?;
         let manifest_pt = crypto::decrypt(key, &manifest_ct).context("decrypting manifest")?;
         let manifest: Manifest =
@@ -286,13 +336,9 @@ impl Transfer {
             return Err(anyhow!("unsupported manifest version {}", manifest.version));
         }
 
-        // Check the manifest against the announced version hash before
-        // fetching anything else.
-        let mut files = Vec::with_capacity(manifest.entries.len());
-        for e in &manifest.entries {
-            let rel = manifest_path_to_rel(&e.path)?;
-            files.push((rel, parse_hex32(&e.plain)?));
-        }
+        // Check the manifest, and it against the announced version hash,
+        // before fetching anything else.
+        let mut files = validate_manifest(&manifest.entries)?;
         files.sort();
         let computed = version_hash_of(&files);
         if computed != version_hash {
@@ -301,58 +347,71 @@ impl Transfer {
             ));
         }
 
-        let mut staged = StagedVersion {
-            staged: Vec::new(),
-            files: files.clone(),
-        };
-        let result = async {
-            for e in &manifest.entries {
-                let rel = manifest_path_to_rel(&e.path)?;
-                let blob =
-                    Hash::from_str(&e.blob).map_err(|err| anyhow!("bad blob hash: {err:?}"))?;
-                self.fetch_blob(&conn, blob).await?;
-                let ct = self.read(blob).await?;
-                let pt =
-                    crypto::decrypt(key, &ct).with_context(|| format!("decrypting {}", e.path))?;
-                if blake3::hash(&pt).to_hex().as_str() != e.plain {
-                    return Err(anyhow!("{} does not match its manifest hash", e.path));
-                }
-                let dest = root.join(&rel);
-                if let Some(parent) = dest.parent() {
-                    std::fs::create_dir_all(parent)
-                        .with_context(|| format!("create_dir_all {parent:?}"))?;
-                }
-                let tmp = staging_path(&dest)?;
-                std::fs::write(&tmp, &pt).with_context(|| format!("writing {tmp:?}"))?;
-                staged.staged.push((rel, tmp));
-                if ct.len() >= EPOCH_LEN {
-                    let mut ep = [0u8; EPOCH_LEN];
-                    ep.copy_from_slice(&ct[..EPOCH_LEN]);
-                    cache.remember(
-                        e.path.clone(),
-                        e.plain.clone(),
-                        blob,
-                        u64::from_le_bytes(ep),
-                    );
-                }
+        let mut staged = StagedVersion::new(files);
+        for e in &manifest.entries {
+            let rel = manifest_path_to_rel(&e.path)?;
+            let blob = Hash::from_str(&e.blob).map_err(|err| anyhow!("bad blob hash: {err:?}"))?;
+            self.fetch_blob(&conn, blob, MAX_BLOB_BYTES).await?;
+            let ct = self.read(blob).await?;
+            let pt = crypto::decrypt(key, &ct).with_context(|| format!("decrypting {}", e.path))?;
+            if blake3::hash(&pt).to_hex().as_str() != e.plain {
+                return Err(anyhow!("{} does not match its manifest hash", e.path));
             }
-            Ok::<(), anyhow::Error>(())
-        }
-        .await;
-        match result {
-            Ok(()) => {
-                let keep: Vec<String> = manifest.entries.iter().map(|e| e.path.clone()).collect();
-                cache.retain_paths(&keep);
-                Ok(staged)
-            }
-            Err(e) => {
-                staged.discard();
-                Err(e)
+            check_parents(root, &rel, true)?;
+            let dest = root.join(&rel);
+            let tmp = staging_path(&dest)?;
+            // Registered before it is written, so a failed write is cleaned
+            // up too.
+            staged.staged.push((rel, tmp.clone()));
+            write_new(&tmp, &pt)?;
+            if ct.len() >= EPOCH_LEN {
+                let mut ep = [0u8; EPOCH_LEN];
+                ep.copy_from_slice(&ct[..EPOCH_LEN]);
+                staged.cache_updates.push((
+                    e.path.clone(),
+                    e.plain.clone(),
+                    blob,
+                    u64::from_le_bytes(ep),
+                ));
             }
         }
+        Ok(staged)
     }
 
-    async fn fetch_blob(&self, conn: &iroh::endpoint::Connection, hash: Hash) -> Result<()> {
+    /// Fetch `hash` unless the store already has it, refusing a blob over
+    /// `max` bytes before transferring it: the provider must prove the
+    /// size (`get_verified_size` checks the last chunk against the hash).
+    async fn fetch_blob(
+        &self,
+        conn: &iroh::endpoint::Connection,
+        hash: Hash,
+        max: u64,
+    ) -> Result<()> {
+        if let Ok(BlobStatus::Complete { size }) = self.store.blobs().status(hash).await {
+            if size > max {
+                return Err(anyhow!(
+                    "blob {} is {size} bytes, over the {max}-byte limit",
+                    hash.to_hex()
+                ));
+            }
+            return Ok(());
+        }
+        let (size, _) = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            iroh_blobs::get::request::get_verified_size(conn, &hash),
+        )
+        .await
+        .map_err(|_| anyhow!("timed out asking for the size of blob {}", hash.to_hex()))?
+        .map_err(|e| anyhow!("asking for the size of blob {}: {e:?}", hash.to_hex()))?;
+        if size > max {
+            return Err(anyhow!(
+                "blob {} is {size} bytes, over the {max}-byte limit",
+                hash.to_hex()
+            ));
+        }
+        if size >= LARGE_BLOB_BYTES {
+            tracing::info!(blob = %hash.to_hex(), size, "fetching a large file");
+        }
         let progress = self.store.remote().fetch(conn.clone(), hash);
         tokio::time::timeout(FETCH_TIMEOUT, async move { progress.await })
             .await
@@ -360,6 +419,119 @@ impl Transfer {
             .map_err(|e| anyhow!("fetching blob {}: {e:?}", hash.to_hex()))?;
         Ok(())
     }
+}
+
+/// A staged version of `files` (path, plaintext) under `root`, for tests
+/// of what the share loop does with one.
+#[cfg(test)]
+pub(crate) fn staged_for_test(root: &Path, files: &[(&str, &[u8])]) -> StagedVersion {
+    let mut staged = StagedVersion::new(
+        files
+            .iter()
+            .map(|(p, b)| (PathBuf::from(p), *blake3::hash(b).as_bytes()))
+            .collect(),
+    );
+    for (p, b) in files {
+        let rel = PathBuf::from(p);
+        check_parents(root, &rel, true).unwrap();
+        let tmp = staging_path(&root.join(&rel)).unwrap();
+        write_new(&tmp, b).unwrap();
+        staged.staged.push((rel, tmp));
+    }
+    staged
+}
+
+/// Blobs at least this big get an info line when their fetch starts.
+const LARGE_BLOB_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Check a peer's manifest entries and turn them into relative paths:
+/// at most `MAX_MANIFEST_ENTRIES`, every path safe
+/// (`manifest_path_to_rel`) and at most `MAX_PATH_BYTES`, no path twice,
+/// and no path that is both a file and a directory of another path
+/// (`a` and `a/b`), which could never be applied.
+pub fn validate_manifest(entries: &[ManifestEntry]) -> Result<Vec<FileHash>> {
+    if entries.len() > MAX_MANIFEST_ENTRIES {
+        return Err(anyhow!(
+            "manifest has {} entries (limit {MAX_MANIFEST_ENTRIES})",
+            entries.len()
+        ));
+    }
+    let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
+    for e in entries {
+        if e.path.len() > MAX_PATH_BYTES {
+            return Err(anyhow!(
+                "manifest path of {} bytes (limit {MAX_PATH_BYTES})",
+                e.path.len()
+            ));
+        }
+        if !seen.insert(e.path.as_str()) {
+            return Err(anyhow!("manifest lists {:?} twice", e.path));
+        }
+    }
+    let mut files = Vec::with_capacity(entries.len());
+    for e in entries {
+        let rel = manifest_path_to_rel(&e.path)?;
+        // Every ancestor must be a directory, not another entry's file.
+        let mut prefix = e.path.as_str();
+        while let Some(i) = prefix.rfind('/') {
+            prefix = &prefix[..i];
+            if seen.contains(prefix) {
+                return Err(anyhow!(
+                    "manifest has {prefix:?} both as a file and as a directory of {:?}",
+                    e.path
+                ));
+            }
+        }
+        files.push((rel, parse_hex32(&e.plain)?));
+    }
+    Ok(files)
+}
+
+/// Walk the directories between `root` and the file `rel`, refusing a
+/// symlink or a non-directory on the way, so nothing is written outside
+/// the root through a symlinked directory. With `create`, missing
+/// directories are made.
+fn check_parents(root: &Path, rel: &Path, create: bool) -> Result<()> {
+    let mut dir = root.to_path_buf();
+    let parents: Vec<_> = rel
+        .parent()
+        .into_iter()
+        .flat_map(|p| p.components())
+        .collect();
+    for c in parents {
+        dir.push(c);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(anyhow!("refusing to write through the symlink {dir:?}"));
+            }
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Err(anyhow!("{dir:?} is in the way: not a directory")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && create => {
+                std::fs::create_dir(&dir).with_context(|| format!("create_dir {dir:?}"))?;
+            }
+            Err(e) => return Err(anyhow!("checking {dir:?}: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// Write `bytes` to a new file at `path`, replacing whatever was there
+/// (a stale temp file) without following a symlink.
+fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow!("removing stale {path:?}: {e}")),
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("creating {path:?}"))?;
+    f.write_all(bytes)
+        .with_context(|| format!("writing {path:?}"))?;
+    Ok(())
 }
 
 /// blake3 over sorted `(len(path), path, blake3(content))`, the same value
@@ -474,6 +646,111 @@ mod tests {
             top.update(blake3::hash(content).as_bytes());
         }
         assert_eq!(version_hash_of(&files), top.finalize().to_hex().to_string());
+    }
+
+    fn entry(path: &str) -> ManifestEntry {
+        ManifestEntry {
+            path: path.to_string(),
+            plain: hex32(blake3::hash(path.as_bytes()).as_bytes()),
+            blob: hex32(&[0u8; 32]),
+        }
+    }
+
+    fn scratch(label: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "peerdup-transfer-{label}-{:016x}",
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn manifest_validation_accepts_a_normal_tree() {
+        let files =
+            validate_manifest(&[entry("a.txt"), entry("dir/b.txt"), entry("dir/sub/c")]).unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[1].0, PathBuf::from("dir").join("b.txt"));
+    }
+
+    #[test]
+    fn manifest_validation_refuses_duplicates() {
+        let err = validate_manifest(&[entry("a"), entry("b"), entry("a")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("twice"), "{err}");
+    }
+
+    #[test]
+    fn manifest_validation_refuses_a_file_that_is_also_a_directory() {
+        for entries in [
+            vec![entry("a"), entry("a/b")],
+            vec![entry("x/y/z"), entry("x/y")],
+            vec![entry("d/e/f/g"), entry("d")],
+        ] {
+            let err = validate_manifest(&entries).unwrap_err().to_string();
+            assert!(err.contains("both as a file and as a directory"), "{err}");
+        }
+        // Sharing a name prefix is fine.
+        validate_manifest(&[entry("a"), entry("ab/c"), entry("a-b")]).unwrap();
+    }
+
+    #[test]
+    fn manifest_validation_refuses_oversize_input() {
+        let long = "x".repeat(MAX_PATH_BYTES + 1);
+        let err = validate_manifest(&[entry(&long)]).unwrap_err().to_string();
+        assert!(err.contains("limit"), "{err}");
+        let many: Vec<ManifestEntry> = (0..=MAX_MANIFEST_ENTRIES)
+            .map(|i| ManifestEntry {
+                path: format!("f{i}"),
+                plain: String::new(),
+                blob: String::new(),
+            })
+            .collect();
+        let err = validate_manifest(&many).unwrap_err().to_string();
+        assert!(err.contains("entries"), "{err}");
+        // Unsafe paths are still refused.
+        assert!(validate_manifest(&[entry("../x")]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_never_go_through_a_symlinked_directory() {
+        let root = scratch("symlink");
+        let outside = scratch("outside");
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+        let err = check_parents(&root, Path::new("link/x.txt"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("symlink"), "{err}");
+        // A file where a directory should be.
+        std::fs::write(root.join("file"), b"x").unwrap();
+        assert!(check_parents(&root, Path::new("file/x.txt"), true).is_err());
+        // Missing directories are made.
+        check_parents(&root, Path::new("new/deeper/x.txt"), true).unwrap();
+        assert!(root.join("new/deeper").is_dir());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&outside).unwrap();
+    }
+
+    #[test]
+    fn staged_files_are_removed_unless_committed() {
+        let root = scratch("staged");
+        let tmp = root.join("a.txt.peerdup-tmp");
+        write_new(&tmp, b"hello").unwrap();
+        let mut staged = StagedVersion::new(Vec::new());
+        staged.staged.push((PathBuf::from("a.txt"), tmp.clone()));
+        drop(staged);
+        assert!(!tmp.exists(), "dropping a staged version must clean up");
+
+        write_new(&tmp, b"hello").unwrap();
+        let mut staged = StagedVersion::new(Vec::new());
+        staged.staged.push((PathBuf::from("a.txt"), tmp.clone()));
+        staged.commit(&root).unwrap();
+        assert!(!tmp.exists());
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"hello");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

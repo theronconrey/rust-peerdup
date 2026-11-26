@@ -17,7 +17,7 @@
 use crate::auth::{self, MemberId};
 use crate::daemon::{spawn_share_task, DaemonRuntime, ShareCommand};
 use crate::share::{self, ShareConfig, ShareRole};
-use crate::{crypto, identity, share_state};
+use crate::{identity, share_state};
 use anyhow::Context;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -109,15 +109,22 @@ impl Daemon1Iface {
             )));
         }
 
-        // Bootstrap auth group with us as Owner.
+        let configs = share::load_all(&self.rt.data_dir).map_err(fdo_err)?;
+        if configs.iter().any(|c| c.id == share_id) {
+            return Err(fdo_err(anyhow::anyhow!(
+                "share {share_id} is already configured"
+            )));
+        }
+
+        // Bootstrap auth group with us as Owner. Auth log first,
+        // share.json last.
         let group_id = auth::group_id_for(&config.id);
-        let mut auth_state = auth::AuthState::empty();
+        let mut auth_state = auth::AuthState::empty_for(group_id);
         auth_state
             .create_group(&self.rt.identity, group_id)
             .map_err(fdo_err)?;
-
-        config.save(&self.rt.data_dir).map_err(fdo_err)?;
         auth::save(&self.rt.data_dir, &config.id, &auth_state).map_err(fdo_err)?;
+        config.save(&self.rt.data_dir).map_err(fdo_err)?;
 
         // Spawn the share task and register the sender.
         let cmd_tx = spawn_share_task(&self.rt, &mut tasks_guard, config.clone())
@@ -133,7 +140,10 @@ impl Daemon1Iface {
     /// id from the ticket.
     async fn share_join(&self, ticket: &str, path: &str) -> zbus::fdo::Result<String> {
         use crate::ticket;
+        // Everything in the ticket is checked before anything is written.
         let t = ticket::Ticket::decode(ticket).map_err(fdo_err)?;
+        let me = MemberId(*self.rt.identity.verifying_key().as_bytes());
+        let auth_state = t.verified_auth_state(me).map_err(fdo_err)?;
 
         let path = PathBuf::from(path);
         let path = if path.is_absolute() {
@@ -144,15 +154,6 @@ impl Daemon1Iface {
                 .map_err(fdo_err)?
                 .join(path)
         };
-
-        let me = *self.rt.identity.verifying_key().as_bytes();
-        if t.invitee_pubkey != me {
-            return Err(fdo_err(anyhow::anyhow!(
-                "ticket was issued for a different public key (expected {}, this daemon is {})",
-                MemberId(t.invitee_pubkey).to_hex(),
-                self.rt.identity.verifying_key().to_hex()
-            )));
-        }
 
         let mut shares_guard = self.rt.shares.lock().await;
         let mut tasks_guard = self.rt.tasks.lock().await;
@@ -173,36 +174,8 @@ impl Daemon1Iface {
         }
 
         std::fs::create_dir_all(&path).map_err(|e| fdo_err(anyhow::Error::new(e)))?;
-
-        let cfg = ShareConfig {
-            id: t.share_id.clone(),
-            topic: t.topic.clone(),
-            root_path: path,
-            role: t.role,
-            created_at: chrono::Utc::now(),
-        };
-        cfg.save(&self.rt.data_dir).map_err(fdo_err)?;
-        if let Some(addr) = &t.inviter_addr {
-            crate::bootstrap::save_share_bootstrap(&self.rt.data_dir, &t.share_id, addr)
-                .map_err(fdo_err)?;
-        }
-        crypto::install_keyring(&self.rt.data_dir, &t.share_id, &t.keys).map_err(fdo_err)?;
-
-        // Replay the auth log. Each op is signature-verified via apply_remote.
-        let mut auth_state = auth::AuthState::empty();
-        for op in &t.auth_log {
-            auth_state
-                .apply_remote(op.clone())
-                .with_context(|| format!("applying auth op while joining {}", t.share_id))
-                .map_err(fdo_err)?;
-        }
-        let group_id = auth::group_id_for(&t.share_id);
-        if !auth_state.is_member(group_id, MemberId(me)) {
-            return Err(fdo_err(anyhow::anyhow!(
-                "ticket's auth log does not list us as a member"
-            )));
-        }
-        auth::save(&self.rt.data_dir, &t.share_id, &auth_state).map_err(fdo_err)?;
+        let cfg =
+            ticket::install_join(&self.rt.data_dir, &t, &auth_state, path).map_err(fdo_err)?;
 
         let cmd_tx = spawn_share_task(&self.rt, &mut tasks_guard, cfg.clone())
             .await

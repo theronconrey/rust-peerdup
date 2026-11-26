@@ -6,8 +6,12 @@
 //! every protocol (gossip, discovery, blob transfer), is refused after the
 //! TLS handshake unless the other node is allowed. The allowed set is the
 //! union of the current members of every share this daemon runs. When a
-//! member is revoked and isn't in any other share, it is blocked: it can no
-//! longer fetch blobs (not even old ciphertext) or hear announces.
+//! member is revoked and isn't in any other share, it is blocked: it can't
+//! open a new connection to fetch blobs (not even old ciphertext) or hear
+//! announces. `ConnectionBlockList::block` only affects new connections; a
+//! connection the node already has open stays up until it closes, so
+//! revocation isn't instant at the transport level (the key rotation and
+//! the Writer check on announces are what cut it off from new content).
 //!
 //! This replaces ROADMAP phase 6 (a BitTorrent admission hook in librqbit):
 //! iroh connections are authenticated by node id, and the node id is the

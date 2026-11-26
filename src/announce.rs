@@ -25,6 +25,22 @@ const DOMAIN: &[u8] = b"peerdup-announce-v1";
 /// more than any real share, small enough that a peer can't bloat ours.
 const MAX_CLOCK_ENTRIES: usize = 1024;
 
+/// Largest clock counter accepted from a peer: one edit a millisecond for
+/// 34 years. Without a bound a Writer could send `u64::MAX`; `increment`
+/// saturates there, so every later version compares `Equal` and the share
+/// is frozen for good.
+pub const MAX_CLOCK_VALUE: u64 = 1 << 40;
+
+/// How far in the future an announce's timestamp may be. A later
+/// timestamp always wins last-writer-wins, so an unbounded one would win
+/// every conflict.
+pub const MAX_CLOCK_SKEW_MINUTES: i64 = 10;
+
+/// Clock keys are peer ids: 64 lowercase hex characters.
+fn is_peer_id_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Announce {
     /// Hash of the encrypted manifest blob (hex).
@@ -108,6 +124,22 @@ impl Announce {
                 self.clock.0.len()
             ));
         }
+        for (peer, &value) in &self.clock.0 {
+            if !is_peer_id_hex(peer) {
+                return Err(anyhow!("clock key {peer:?} is not a peer id"));
+            }
+            if value > MAX_CLOCK_VALUE {
+                return Err(anyhow!(
+                    "clock value {value} is above the limit {MAX_CLOCK_VALUE}"
+                ));
+            }
+        }
+        if self.timestamp > Utc::now() + chrono::TimeDelta::minutes(MAX_CLOCK_SKEW_MINUTES) {
+            return Err(anyhow!(
+                "timestamp {} is more than {MAX_CLOCK_SKEW_MINUTES} minutes in the future",
+                self.timestamp
+            ));
+        }
         let key = VerifyingKey::from_str(&self.provider)
             .map_err(|e| anyhow!("bad provider key: {e:?}"))?;
         let signature =
@@ -153,7 +185,7 @@ mod tests {
         let writer = SigningKey::generate();
         let reader = SigningKey::generate();
         let group = group_id_for("announce-test");
-        let mut state = AuthState::empty();
+        let mut state = AuthState::empty_for(group);
         state.create_group(&owner, group).unwrap();
         state
             .add_member(&owner, group, me(&writer), AuthRole::Writer)
@@ -213,10 +245,76 @@ mod tests {
         let (group, state, owner, _, _) = setup();
         let mut clock = VectorClock::new();
         for i in 0..=MAX_CLOCK_ENTRIES {
-            clock.increment(&format!("peer-{i}"));
+            clock.increment(&format!("{i:064x}"));
         }
         let a = Announce::sign(&owner, group, "aa".into(), "bb".into(), clock, Utc::now());
         assert!(a.verify(&state, group).is_err());
+    }
+
+    fn signed_with(
+        owner: &SigningKey,
+        group: MemberId,
+        clock: VectorClock,
+        ts: DateTime<Utc>,
+    ) -> Announce {
+        Announce::sign(owner, group, "aa".repeat(32), "bb".repeat(32), clock, ts)
+    }
+
+    #[test]
+    fn clock_values_above_the_limit_are_refused() {
+        let (group, state, owner, _, _) = setup();
+        let me = owner.verifying_key().to_hex();
+        let mut clock = VectorClock::new();
+        clock.0.insert(me.clone(), MAX_CLOCK_VALUE);
+        signed_with(&owner, group, clock.clone(), Utc::now())
+            .verify(&state, group)
+            .unwrap();
+        clock.0.insert(me, MAX_CLOCK_VALUE + 1);
+        let err = signed_with(&owner, group, clock, Utc::now())
+            .verify(&state, group)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("above the limit"), "{err}");
+        let mut max = VectorClock::new();
+        max.0.insert("ab".repeat(32), u64::MAX);
+        assert!(signed_with(&owner, group, max, Utc::now())
+            .verify(&state, group)
+            .is_err());
+    }
+
+    #[test]
+    fn clock_keys_must_be_peer_ids() {
+        let (group, state, owner, _, _) = setup();
+        let upper = owner.verifying_key().to_hex().to_uppercase();
+        for bad in [
+            "peer-1".to_string(),
+            "ab".repeat(31),
+            "ab".repeat(33),
+            upper,
+        ] {
+            let mut clock = VectorClock::new();
+            clock.0.insert(bad.clone(), 1);
+            let err = signed_with(&owner, group, clock, Utc::now())
+                .verify(&state, group)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not a peer id"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn timestamps_far_in_the_future_are_refused() {
+        let (group, state, owner, _, _) = setup();
+        let soon = Utc::now() + chrono::TimeDelta::minutes(5);
+        signed_with(&owner, group, VectorClock::new(), soon)
+            .verify(&state, group)
+            .unwrap();
+        let later = Utc::now() + chrono::TimeDelta::minutes(MAX_CLOCK_SKEW_MINUTES + 1);
+        let err = signed_with(&owner, group, VectorClock::new(), later)
+            .verify(&state, group)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("in the future"), "{err}");
     }
 
     #[test]

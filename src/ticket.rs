@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: MIT
-use crate::auth::SignedOp;
+use crate::auth::{group_id_for, AuthState, MemberId, SignedOp};
 use crate::crypto::KEY_LEN;
-use crate::share::ShareRole;
+use crate::share::{ShareConfig, ShareRole};
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+
+/// Largest decoded ticket. A ticket holds the keyring and the whole auth
+/// log (about 200 bytes an op), so this is thousands of members.
+pub const MAX_TICKET_BYTES: usize = 1024 * 1024;
 
 /// Current ticket schema version. 2 added the auth-log snapshot (Phase 5c);
 /// 3 added the inviter's network address. Older tickets are refused.
@@ -60,12 +64,19 @@ impl Ticket {
     }
 
     pub fn decode(s: &str) -> Result<Self> {
+        let s = s.trim();
+        // base64 is 4 characters per 3 bytes.
+        if s.len() / 4 * 3 > MAX_TICKET_BYTES {
+            return Err(anyhow!("ticket is over {MAX_TICKET_BYTES} bytes"));
+        }
         let bytes = URL_SAFE_NO_PAD
-            .decode(s.trim())
+            .decode(s)
             .context("ticket is not valid base64")?;
-        let (ticket, _read): (Ticket, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-                .context("ticket payload is malformed")?;
+        let (ticket, _read): (Ticket, _) = bincode::serde::decode_from_slice(
+            &bytes,
+            bincode::config::standard().with_limit::<MAX_TICKET_BYTES>(),
+        )
+        .context("ticket payload is malformed")?;
         if ticket.version != TICKET_VERSION {
             return Err(anyhow!(
                 "unsupported ticket version: {} (this build expects v{TICKET_VERSION})",
@@ -89,6 +100,86 @@ impl Ticket {
         ticket.role.ensure_encrypted()?;
         Ok(ticket)
     }
+
+    /// Replay and verify the ticket's auth log for `me`, before anything
+    /// is written to disk: every op's signature, the group (the first op
+    /// must be this share's `Create`), no op left waiting for a missing
+    /// dependency, and `me` a member at the end.
+    pub fn verified_auth_state(&self, me: MemberId) -> Result<AuthState> {
+        if self.invitee_pubkey != me.0 {
+            return Err(anyhow!(
+                "ticket was issued for a different public key (expected {}, this peer is {}); \
+                 ask the inviter to re-run `share invite` with the correct key",
+                MemberId(self.invitee_pubkey).to_hex(),
+                me.to_hex()
+            ));
+        }
+        let group = group_id_for(&self.share_id);
+        let mut state = AuthState::empty_for(group);
+        for op in &self.auth_log {
+            state.apply_remote(op.clone()).with_context(|| {
+                format!("applying auth log op while joining share {}", self.share_id)
+            })?;
+        }
+        if state.pending_len() > 0 {
+            return Err(anyhow!(
+                "ticket's auth log has {} op(s) with missing dependencies",
+                state.pending_len()
+            ));
+        }
+        if !state.is_member(state.group_id(), me) {
+            return Err(anyhow!(
+                "ticket's auth log does not list us as a member; refusing to join"
+            ));
+        }
+        Ok(state)
+    }
+}
+
+/// Write a joined share to disk, after `Ticket::verified_auth_state`
+/// passed: keyring, auth log and bootstrap address first, `share.json`
+/// last, so the daemon never sees a configured share whose keys or
+/// membership are missing. A share directory without `share.json` is the
+/// leftover of an interrupted join and is replaced; if any write fails,
+/// the directory is removed again.
+pub fn install_join(
+    data_dir: &std::path::Path,
+    ticket: &Ticket,
+    auth_state: &AuthState,
+    root_path: std::path::PathBuf,
+) -> Result<ShareConfig> {
+    crate::share::validate_id(&ticket.share_id)?;
+    let dir = crate::data_dir::shares_dir(data_dir).join(&ticket.share_id);
+    if dir.join("share.json").exists() {
+        return Err(anyhow!(
+            "share {} is already configured locally; remove it first if you want to re-join",
+            ticket.share_id
+        ));
+    }
+    if dir.exists() {
+        tracing::warn!(share_id = %ticket.share_id, "replacing the leftovers of an interrupted join");
+        std::fs::remove_dir_all(&dir).with_context(|| format!("removing {dir:?}"))?;
+    }
+    let cfg = ShareConfig {
+        id: ticket.share_id.clone(),
+        topic: ticket.topic.clone(),
+        root_path,
+        role: ticket.role,
+        created_at: chrono::Utc::now(),
+    };
+    let written = (|| -> Result<()> {
+        crate::crypto::install_keyring(data_dir, &ticket.share_id, &ticket.keys)?;
+        crate::auth::save(data_dir, &ticket.share_id, auth_state)?;
+        if let Some(addr) = &ticket.inviter_addr {
+            crate::bootstrap::save_share_bootstrap(data_dir, &ticket.share_id, addr)?;
+        }
+        cfg.save(data_dir)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e.context(format!("writing share {}", ticket.share_id)));
+    }
+    Ok(cfg)
 }
 
 #[cfg(test)]
@@ -98,10 +189,14 @@ mod tests {
     use p2panda_core::SigningKey;
 
     fn make_log() -> (SigningKey, SigningKey, Vec<SignedOp>) {
+        make_log_for("demo")
+    }
+
+    fn make_log_for(topic: &str) -> (SigningKey, SigningKey, Vec<SignedOp>) {
         let alice = SigningKey::generate();
         let bob = SigningKey::generate();
-        let group = group_id_for("ticket-test");
-        let mut state = AuthState::empty();
+        let group = group_id_for(&crate::share::id_from_topic(topic));
+        let mut state = AuthState::empty_for(group);
         state.create_group(&alice, group).unwrap();
         state
             .add_member(
@@ -139,6 +234,71 @@ mod tests {
         for op in &back.auth_log {
             op.verify().unwrap();
         }
+    }
+
+    fn ticket_with(log: Vec<SignedOp>, invitee: &SigningKey) -> Ticket {
+        Ticket {
+            version: TICKET_VERSION,
+            share_id: crate::share::id_from_topic("demo"),
+            topic: "demo".into(),
+            keys: vec![[1u8; KEY_LEN]],
+            auth_log: log,
+            invitee_pubkey: *invitee.verifying_key().as_bytes(),
+            role: ShareRole::Sync,
+            inviter_addr: None,
+        }
+    }
+
+    fn me(k: &SigningKey) -> MemberId {
+        MemberId(*k.verifying_key().as_bytes())
+    }
+
+    #[test]
+    fn join_verifies_the_auth_log_for_us() {
+        let (alice, bob, log) = make_log();
+        let state = ticket_with(log.clone(), &bob)
+            .verified_auth_state(me(&bob))
+            .unwrap();
+        assert!(state.is_member(state.group_id(), me(&alice)));
+        assert!(state.is_member(state.group_id(), me(&bob)));
+
+        // Issued for someone else.
+        let carol = SigningKey::generate();
+        let err = ticket_with(log.clone(), &bob)
+            .verified_auth_state(me(&carol))
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(err.contains("different public key"), "{err}");
+
+        // A log for another share's group.
+        let (_, other_bob, other_log) = make_log_for("another-share");
+        assert!(ticket_with(other_log, &other_bob)
+            .verified_auth_state(me(&other_bob))
+            .is_err());
+
+        // A log that never adds us.
+        let err = ticket_with(log[..1].to_vec(), &bob)
+            .verified_auth_state(me(&bob))
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(err.contains("not list us"), "{err}");
+
+        // A log missing its Create: the Add waits forever.
+        let err = ticket_with(log[1..].to_vec(), &bob)
+            .verified_auth_state(me(&bob))
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(err.contains("missing dependencies"), "{err}");
+    }
+
+    #[test]
+    fn rejects_oversize_tickets() {
+        let huge = "A".repeat(MAX_TICKET_BYTES / 3 * 4 + 8);
+        let err = Ticket::decode(&huge).unwrap_err().to_string();
+        assert!(err.contains("over"), "{err}");
     }
 
     #[test]

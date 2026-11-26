@@ -16,13 +16,13 @@ guesses, not commitments. Add 50% if part-time, double for "with surprises."
 |---|---|---|
 | 1. Foundation | ✅ Done | — |
 | 2. Persistent state & daemon | ✅ Done | — |
-| 3. Multi-master sync | ⚠️ Partial: works on one host; concurrent edits resolve by LWW and silently lose the other side (no conflict copies) | in 7.5 |
+| 3. Multi-master sync | ⚠️ Partial: works on one host; concurrent edits keep the losing content as a conflict copy (`tests/e2e-sync.sh`); multi-host and pause-and-ask still open | in 7.5 |
 | 4. Encryption at rest | ⚠️ Partial: file contents and names encrypted (iroh-blobs manifests); sizes of individual blobs visible to members; `p2panda-encryption` deferred | in 7.5 |
 | 5. ACL via p2panda-auth | ✅ Done: membership, invites, revocation, key rotation, members-only connections, signed announces applied only from Writers and Owners | — |
 | 6a. Transport decision | ✅ Decided: iroh-blobs over iroh (see `INTEGRATION_NOTES.md`, "Transport: iroh-blobs"); spike checks open | — |
 | 6. Swarm admission gate | ✅ Replaced: members-only connection gate on the iroh endpoint (`access.rs`); no librqbit hook needed | — |
 | 7. D-Bus IPC surface | ⚠️ Partial: methods and activation done; no signals, bus name not final | 1 week |
-| 7.5. Make it real across machines | 👉 In progress: cross-network sync, members-only connections and signed announces done (all in CI); conflict copies, random topics, size limits still to do | 2–3 weeks left |
+| 7.5. Make it real across machines | 👉 In progress: cross-network sync, members-only connections and signed announces, fetches off the loop, size limits and conflict copies done (all in CI); random topics still to do | 2–3 weeks left |
 | 7.6. Formats and release engineering | Planned | 1–2 weeks |
 | 8. Linux UI (GTK4/libadwaita app) | Planned | 6–10 weeks |
 | 9. Other platforms (Linux Flatpak GUI; Windows, macOS) | Planned | 8–12 weeks |
@@ -335,14 +335,18 @@ would put these gaps in front of users.
 **Key deliverables:**
 - Announce reachable addresses, or move transfer onto iroh (Phase 6a).
 - Timeouts on every fetch, run off the share's select loop, so one bad
-  announce can't stall a share.
+  announce can't stall a share. *Done: 30 s connect, 300 s per blob, one
+  hour per version, fetched in a task off the loop; size limits (16 MiB
+  manifest, 1 GiB file) checked before transfer.*
 - Signed announces: each announce signed with `identity.key` over the share,
   info-hash, version hash, clock and timestamp; only current Writers and
   Owners are applied. New versions under old key epochs are refused.
+  *Signing, the Writer/Owner check and bounds on clocks and timestamps
+  done; refusing new versions under old epochs is not done yet.*
 - Decrypt into a staging directory and check the version hash before
   anything is renamed into the share root.
 - Conflict copies (`name (conflict from <peer> <date>).ext`) instead of
-  silent last-write-wins.
+  silent last-write-wins. *Done (`daemon::commit_remote`).*
 - Random 32-byte share topics generated at `share-add` and carried in the
   ticket; the human-readable name becomes a label. Today's user-chosen
   topics collide and are guessable.
@@ -381,7 +385,9 @@ strand them.
   the signed bytes and the wire and disk formats. Define the canonical
   signing bytes explicitly. This invalidates existing signatures, so it
   has to happen before 1.0. Until then, set decode size limits on
-  everything that comes from peers and tickets.
+  everything that comes from peers and tickets. *Done: gossip 64 KiB,
+  tickets 1 MiB, auth ops 64 KiB, `auth.log` 16 MiB, pending rotations
+  1 MiB.*
 - `cargo deny` (advisories, licenses, bans) in CI.
 - Fuzzing (`cargo fuzz`) for the ticket, gossip and auth decoders.
 - Release process: semver policy, NEWS file, signed tags, rpmautospec

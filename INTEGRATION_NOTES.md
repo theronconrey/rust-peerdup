@@ -21,15 +21,42 @@ almost none of BitTorrent: DHT off, no trackers, no UPnP, one known peer.
   local yet.
 - A version = one ciphertext blob per file (`crypto::encrypt`, epoch header
   included) plus one encrypted JSON manifest of `(path, plaintext blake3,
-  blob hash)`. Gossip (`share_announce_v2`) carries the manifest hash, the
+  blob hash)`. Gossip (`share_announce_v3`, signed; see "Signed
+  announces") carries the manifest hash, the
   provider's node id (= identity key hex; p2panda's `NodeId` is
   `VerifyingKey`), the version hash, clock and timestamp.
-- Receive: connect (30 s timeout), fetch the manifest, decrypt, refuse
-  paths that are absolute, contain `..` or `.peerdup`, check the manifest
-  against the announced version hash, then fetch (300 s timeout per blob),
+- Receive: connect (30 s timeout), fetch the manifest, decrypt, validate
+  it (`validate_manifest`: at most 100,000 entries and 4,096 bytes a
+  path, no duplicates, no path that is both a file and a directory of
+  another, nothing absolute or with `..` or `.peerdup`), check it against
+  the announced version hash, then fetch (300 s timeout per blob),
   decrypt and blake3-check each file and stage it as `*.peerdup-tmp` beside
   its destination. Only when everything passes are the files renamed in
   and orphans deleted.
+- Size limits, checked before transfer: the provider must prove a blob's
+  size (`iroh_blobs::get::request::get_verified_size` checks the last
+  chunk against the hash; a blob already complete in our store uses
+  `BlobStatus::Complete { size }`). A manifest over 16 MiB or a file blob
+  over 1 GiB (`MAX_BLOB_BYTES`) is refused: a whole file is held in memory
+  twice while it is decrypted and checked (and while encrypted on the
+  sender) until encryption streams.
+- Staging never writes through a symlinked directory: every directory
+  between the root and the file is checked with `symlink_metadata` (and
+  made if missing), at staging and again at commit. Temp files are
+  created with `create_new`.
+- `StagedVersion` removes its uncommitted temp files on drop, so every
+  error path, the per-version timeout and an aborted fetch task clean up.
+- The fetch runs off the share's select loop (`daemon::start_fetch`): a
+  spawned task with a copy of the keyring (a read lock held across the
+  fetch would block a rotation's write lock, and with it the loop),
+  bounded by a one-hour limit per version. At most one per share; the
+  newest announce that arrives meanwhile waits in `next`. The result
+  comes back on a channel tagged with a generation; the loop judges the
+  version again against the state it has *now* (a local edit or another
+  version may have landed) and only then commits on the loop. Cache
+  updates travel with the staged version and are applied there, since
+  the loop owns the `BlobCache`. `tests/e2e-sync.sh` stalls the provider
+  with SIGSTOP mid-fetch and checks a local edit is still noticed.
 - `BlobCache` (`shares/<id>/blobs.json`) maps `path -> (plaintext hash,
   blob hash, epoch)`. Unchanged files reuse their ciphertext, so their blob
   hash is stable and receivers fetch nothing for them. Receivers record
@@ -62,8 +89,15 @@ network id into every ALPN, so blobs must go through p2panda's
   union of every running share's members; recomputed at share start,
   after auth ops apply, after invite/revoke, and when a share stops.
   Blocked nodes are refused after the TLS handshake with code 403 for
-  every ALPN, so a revoked member gets neither blobs nor gossip.
-  `allow()` lifts a block, so re-inviting works. Not yet per share: a
+  every ALPN, so a revoked member can't open a new connection for blobs
+  or gossip. **`ConnectionBlockList::block` only affects new
+  connections**: one the revoked node already has open stays up until it
+  closes (idle timeout, restart, network change), and it can keep
+  fetching blobs and receiving gossip over it until then. What it gets
+  is ciphertext; after the rotation it can't decrypt new versions, and
+  its announces are refused because it is no longer a Writer. Closing
+  live connections on revocation is still to do. `allow()` lifts a
+  block, so re-inviting works. Not yet per share: a
   member of share A could fetch share B's blobs if it learned their
   hashes (they are ciphertext under B's key).
 - Relays: the default is n0's public relays (rate-limited, meant for
@@ -117,6 +151,19 @@ Reader's daemon still records its local edits but doesn't announce them
 (it logs that), and the next newer version from a Writer replaces them.
 Unsigned announces (`share_announce_v2`, `share_announce`) are ignored.
 
+Bounds checked before the signature (`Announce::verify`):
+- at most 1,024 clock entries;
+- every clock key is a peer id, 64 lowercase hex characters;
+- every clock value is at most 2^40 (`MAX_CLOCK_VALUE`).
+  `VectorClock::increment` saturates, so before this bound a Writer
+  could send `u64::MAX` and every later version, ours included, would
+  compare `Equal` with it: the share froze for good;
+- the timestamp is at most 10 minutes ahead of our clock
+  (`MAX_CLOCK_SKEW_MINUTES`). A later timestamp always wins
+  last-writer-wins, so an unbounded one would win every conflict.
+  Peers whose clocks are more than 10 minutes apart see the faster one's
+  announces refused until the slower clock catches up; keep NTP on.
+
 Each send also carries a random `nonce` outside the signature. Gossip drops
 repeated messages, and Ed25519 signatures are deterministic, so without it
 the 10-second re-announces of one version are byte-identical and only the
@@ -124,6 +171,47 @@ first is delivered; a receiver whose fetch failed then never retries.
 `tests/e2e-revoke.sh` caught exactly that: a Reader got the post-revocation
 announce a second before the rotated key, failed to decrypt, and never saw
 the version again.
+
+## Gossip message size and wire format v4
+
+p2panda-net 0.8.1's gossip has `DEFAULT_MAX_MESSAGE_SIZE = 4096`
+(`GossipConfig::default()` uses it), and `GossipHandle::publish` returns
+`GossipPublishError::MessageTooLarge` above it. The daemon only logged
+that. Before v4 the envelope was JSON, which writes a bincode-encoded
+auth op as an array of numbers, about 700 bytes an op, so `AuthOps`
+(the whole log, every 10 s) failed past about five ops and a
+`KeyRotation` past about seven members. Beyond the smallest shares,
+members other than the inviter never heard of later Adds or Removes, or
+of rotated keys.
+
+Now (`src/wire.rs`):
+- Gossip runs with `GossipConfig { max_message_size: 64 * 1024, .. }`
+  (`wire::MAX_GOSSIP_MESSAGE`). **Every peer on a topic must use the same
+  limit**: a peer with a smaller one can't receive the larger messages.
+  There is no release yet, so no mixed versions to support.
+- Every message is `bincode((v = 4, nonce, ShareMsg))`, standard config,
+  decoded with `with_limit::<{ 64 * 1024 }>()`. `ShareMsg` is externally
+  tagged (bincode can't decode serde's internally tagged enums). The
+  first byte is the version: a v4 peer drops anything else, including the
+  old JSON (`{`); an old peer fails to parse v4 as JSON and drops it.
+- The random `nonce` makes every send unique. Gossip drops repeats, and
+  the periodic re-broadcasts of the auth log and pending rotations would
+  otherwise be byte-identical (the same problem the announce nonce
+  fixed).
+- Auth ops travel as raw `SignedOp::encode` bytes (about 200 bytes each),
+  split into messages of at most 48 KiB (`wire::CHUNK_BUDGET`). Each op
+  verifies on its own, and `AuthState`'s pending buffer (256 ops) puts
+  out-of-order chunks back in order.
+- A rotation is split into signed chunks of at most 256 envelopes
+  (`rotation::ENVELOPES_PER_CHUNK`, about 35 KiB). `install_epoch_key` is
+  idempotent (the same key for the current epoch is `Idempotent`), chunks
+  without our envelope are `NotForUs`, and only the chunk with our
+  envelope can be buffered, so the buffer dedups by signature.
+
+`wire.rs` tests that 300 auth ops and 200 envelopes fit after chunking,
+and that each chunk decodes and verifies; `tests/e2e-revoke.sh` runs a
+share whose auth log is well over 4 KiB and fails on any publish error
+in a daemon log.
 
 ## p2panda 0.8 (core, net) with p2panda-auth 0.5
 
@@ -209,29 +297,51 @@ when the rotation triggers go in).
 
 ## Deferred work
 
-### Phase 3.5 — alternate conflict strategies (not blocking)
-Phase 3.4 ships LWW as the only conflict strategy. The roadmap also calls
-for **rename** ("keep both, rename one to `foo.txt.conflict-from-<peer>`")
-and **pause-and-ask** ("mark conflicting and stop syncing until resolved").
-Both are configurable per-share extensions of the existing
-`Concurrent → lww_we_win` branch in `daemon::sync_loop`:
+### Phase 3.5 — conflict copies (done) and pause-and-ask (deferred)
+**Conflict copies are the behaviour now**, not an option
+(`daemon::commit_remote`). Last-writer-wins still picks which whole
+version wins, but it only decides which content keeps the original name:
+before a staged version is committed, a local file it would overwrite or
+remove is renamed to `name (conflict from <first 8 hex of our peer id>
+<YYYY-MM-DD HHMMSS> UTC).ext` (suffix before the last extension; a
+dotfile keeps its whole name as the stem; `-2`, `-3` if taken) when it
+holds a change the other side hasn't seen. The copy is a new local file,
+so the watcher publishes a version that dominates and both sides converge
+with exactly one copy (`tests/e2e-sync.sh` checks this).
 
-- **rename**: fetch remote into a staging copy, but instead of overwriting
-  the conflicting files, write each conflicting file to
-  `<basename>.conflict-from-<short-peer-id>.<ext>` alongside the local copy.
-  Both peers do this so the rename is visible everywhere.
-- **pause-and-ask**: set a per-share `paused_conflict: true` flag in
-  `PersistedState`, stop both publishing and applying for that share until
-  cleared via a new `peerdup share resolve <id>` subcommand.
+"A change the other side hasn't seen" needs a reference point, and the
+review's rule (on-disk hash differs from both the hash we last published
+or applied and the incoming one) only covers edits not yet announced. In
+the usual conflict the losing side *has* announced its edit, so its disk
+matches what it published and that rule would overwrite it silently. So:
+- `ShareState.manifest` maps each file to the plaintext hash we last
+  published or applied; `ShareState.base` holds the files of the last
+  version known to be shared with a peer (one we applied, or ours when a
+  peer announced the same clock and version hash back). Both persist in
+  `state.json` (format 2; a format-1 file has neither, the manifest is
+  rebuilt from the root at start, and an empty base counts every local
+  file as changed, so nothing is dropped).
+- A **fast-forward** (their clock dominates ours) compares the disk with
+  `manifest`: only unannounced edits become copies; unchanged orphans are
+  deleted, modified ones become copies.
+- A **concurrent** apply (theirs won LWW) compares with `base`: a file we
+  changed since the base becomes a copy, a file only they changed is
+  overwritten, a file we added that isn't in the base is kept under its
+  name (merged), and one unchanged since the base that they dropped is
+  deleted.
+After an apply that kept files, the loop asks the watcher for a re-check,
+so they are published. The winner of the LWW comparison keeps its clock
+unmerged (see "The LWW winner doesn't merge the loser's clock"), so the
+loser always takes the concurrent path.
 
-`ShareConfig` gains `conflict_strategy: ConflictStrategy` (default `Lww`).
-The Phase 3.4 LWW path stays as the default; the others are alternative
-branches in the existing concurrent handler. Estimate: 1–2 days for
-rename, ~1 day for pause-and-ask.
+Known limits: the base is per share, not per peer, so with three or more
+peers editing concurrently it can be out of date and produce an extra
+copy (never a loss). A conflict copy holds our whole file; there is no
+merge within a file.
 
-Skipped now because the Phase 3 done criterion is met by LWW alone, and
-real-world conflict-strategy preferences are likely to come out of user
-testing rather than upfront design.
+**pause-and-ask** ("mark conflicting and stop syncing until resolved") is
+still deferred: a per-share `paused_conflict` flag in `PersistedState`
+and a `share resolve <id>` subcommand.
 
 ## p2panda-auth (Phase 5c)
 
@@ -248,7 +358,7 @@ provide:
 - Storage (we append-log signed ops to `<data_dir>/shares/<id>/auth.log`
   and replay on daemon start).
 - Transport (we broadcast all known ops via gossip on every announce
-  tick; receivers dedupe by op id).
+  tick, in chunks of at most 48 KiB; receivers dedupe by op id).
 - Dependency ordering (auth ops can arrive out of order via gossip; we
   buffer them in `AuthState.pending` and drain on each new arrival).
 
@@ -320,7 +430,9 @@ given the rest of the threat model. Tracked as a possible later
 hardening.
 
 ### Wire format
-On the wire, a rotation rides as `ShareMsg::KeyRotation(SignedRotation)`:
+On the wire, a rotation rides as `wire::ShareMsg::KeyRotation(SignedRotation)`,
+one message per chunk of at most 256 envelopes (see "Gossip message size
+and wire format v4"):
 
 ```rust
 struct SignedRotation {
@@ -337,9 +449,13 @@ struct KeyEnvelope {
 }
 ```
 
-Canonical bytes signed = `bincode((epoch, rotator_pubkey, envelopes))`
-with `bincode::config::standard()`. Field tuple ordering is part of the
-protocol — re-ordering invalidates every old signature.
+Canonical bytes signed = `bincode(("peerdup-rotation-v2", group_id,
+epoch, rotator_pubkey, envelopes))` with `bincode::config::standard()`
+(see "Rotation signatures are bound to the share"). Field tuple ordering
+is part of the protocol — re-ordering invalidates every old signature.
+Each chunk is signed over exactly the envelopes it carries, with the same
+layout and tag; a recipient needs only the chunk with its envelope, and
+the others verify but return `NotForUs`.
 
 ### Manager-at-receive-vantage looseness
 The receiver checks "rotator is currently an Owner" against *its* local
@@ -353,9 +469,10 @@ alternative (track each rotation's "auth-state-at-author-time") would
 require carrying an extra dependency vector on every rotation.
 
 ### On-disk: `pending_rotations/`
-The CLI's `share-revoke` writes a per-rotation file at
-`<data_dir>/shares/<id>/pending_rotations/<epoch>.bin` (atomic
-tmp+rename, 0600 on Unix). The daemon loads all such files at start and
+`share-revoke` writes one file per chunk at
+`<data_dir>/shares/<id>/pending_rotations/<epoch>-<n>.bin` (atomic
+tmp+rename, 0600 on Unix), each a bincode `SignedRotation`; a
+`<epoch>.bin` from before chunking still loads. The daemon loads all such files at start and
 re-broadcasts each one on every announce tick until the operator
 manually clears them. There's no automatic GC yet — a rotation
 recipient who has come back online and installed the new epoch
@@ -445,9 +562,30 @@ the broadcast tick doesn't lose the rotation.
 
 ## Things that look wrong but aren't
 
-*History:* the three items below were about the librqbit session, which no
-longer exists. For the current equivalents see "Transport: iroh-blobs"
+*History:* the three librqbit items below were about the librqbit
+session, which no longer exists. For the current equivalents see "Transport: iroh-blobs"
 (the blob cache, the staging step, and the `.peerdup` path filters).
+
+### The LWW winner doesn't merge the loser's clock
+Looks like the winner of a concurrent edit should merge the other clock
+into its version so its next announce dominates. It must not: that
+version would then dominate the loser's without containing the loser's
+changes, the loser would apply it as a fast-forward (which only keeps
+*unannounced* edits) and lose its announced edit without a conflict
+copy. The fedora.yml e2e run caught this (a queued, merged re-announce
+overtook the concurrent one after connect retries). The winner keeps its
+version and clock (`Verdict::LocalWins`); the loser, which loses the same
+deterministic comparison, applies the winner's version as a concurrent
+one, keeps its changes as conflict copies, and its merged clock then
+dominates both. Invariant: a version that dominates ours includes our
+content.
+
+### `AuthState::apply_remote` refuses a well-signed `Create`
+Looks like it breaks replaying a log into a fresh state. It doesn't: the
+state is bound to its group (`AuthState::empty_for`), and a `Create` is
+accepted exactly once, as the first op with no dependencies. A second
+one would reset the group (see "p2panda-auth: a second Create resets
+group state"); don't relax `check_shape`.
 
 ### `disable_dht: true` in `SessionOptions`
 Looks like we crippled BitTorrent's peer discovery. We didn't — for this demo
@@ -577,6 +715,8 @@ so files the user added between snapshots — which aren't in the old
 manifest — are preserved through a concurrent apply.
 
 ### LWW conflict resolution: timestamp source
+(Since Phase 3.5 the losing side's changes are kept as conflict copies;
+see "Deferred work". The timestamp still decides which version wins.)
 Phase 3.4's LWW uses `Utc::now()` at the moment the daemon **notices** a
 local change (either the watcher debounce fires, or restart reconciliation
 detects out-of-band edits). It does *not* read the file's mtime.
@@ -813,6 +953,46 @@ empty group, after which every rotation was rejected as `NotAManager`. An
 `AuthState` also only accepts ops for the group of its first op, buffers
 at most 256 ops with missing dependencies, and invite/revoke check that
 the local identity is an Owner before authoring anything.
+
+## p2panda-auth: a second Create resets group state
+
+p2panda-auth 0.5.2's `GroupCrdt::process` handles a `Create` for a group
+that already exists as a fresh definition of the group: it does not check
+that the group is new, or that the author has any role in it. Review
+finding 1, confirmed by `stranger_create_for_existing_group_is_refused`
+failing in CI (spike run 45737164708): after an Owner created the group
+and added a Writer and a Reader, a Reader-signed `Create` with no
+dependencies, applied through `apply_remote`, left the group as
+`[(reader, Owner)]`. Anyone who could reach the gossip topic could have
+done the same.
+
+So `AuthState` enforces the shape of the log itself (`check_shape`):
+- an `AuthState` is bound to its share's group from the start
+  (`AuthState::empty_for(group_id_for(share_id))`);
+- a `Create` is accepted only as the first op, and only with no
+  dependencies;
+- every other op must have dependencies.
+
+The first `Create` therefore always comes from the share's creator: from
+`share-add` on their machine, or from the ticket on a joiner's, whose log
+is replayed and checked (`Ticket::verified_auth_state`) before anything
+is written. A share whose `auth.log` is empty is refused at start, since
+its first gossiped op would otherwise define the group. If you add
+another way to build an `AuthState`, start it with `empty_for` and feed
+it a log that begins with the real `Create`.
+
+## Joining writes share.json last
+
+`share-join` (direct and D-Bus) decodes the ticket, checks it was issued
+for our key, and replays and verifies its auth log, requiring that no op
+waits for a missing dependency and that we are a member, before it writes
+anything. Then `ticket::install_join` writes `keys.bin`, `auth.log` and
+`bootstrap.json`, and `share.json` last; `share::load_all` skips a share
+directory without `share.json`, so the daemon never starts a share with
+missing keys or membership. If a write fails the directory is removed,
+and a directory without `share.json` (an interrupted join) is replaced on
+the next join. `share-add` likewise writes `auth.log` before `share.json`
+and refuses a share that already exists.
 
 ## Direct mode takes the daemon lock
 

@@ -37,7 +37,7 @@ writing:
 |---|---|
 | 1. Foundation (Hello-World transfer) | ✅ Done |
 | 2. Persistent state & daemon | ✅ Done |
-| 3. Multi-master sync (watcher, vector clocks, LWW, orphan deletion) | ⚠️ Partial: single host; no conflict copies |
+| 3. Multi-master sync (watcher, vector clocks, LWW, orphan deletion, conflict copies) | ⚠️ Partial: tested on one host; concurrent edits keep the losing side as a conflict copy |
 | 4. Encryption at rest (file-level, KeyRing with epoch tagging, key rotation) | ✅ Contents and names encrypted on the wire |
 | 5a. Invite/join via copy-paste tickets | ✅ Done |
 | 5b. Peer activity listing (`share peers`) | ✅ Done |
@@ -47,8 +47,8 @@ writing:
 | Write permission enforced on sync announces (readers, revoked members) | ✅ Done (signed announces) |
 | 7. D-Bus IPC surface | ⚠️ Partial: CLI talks to the daemon over `org.peerdup.Daemon1`; no signals yet |
 | 6a. Transport: iroh-blobs over iroh | ✅ Done (spike checks open) |
-| 6. Only members can connect (replaces the BitTorrent admission gate) | ✅ Done |
-| 7.5. Sync across networks | ⚠️ In progress: works via relays; conflict copies and random topics next |
+| 6. Only members can connect (replaces the BitTorrent admission gate) | ✅ Done for new connections; a revoked member's open connection isn't closed yet |
+| 7.5. Sync across networks | ⚠️ In progress: works via relays; conflict copies done; random topics next |
 
 Detailed design notes, including non-obvious gotchas about iroh and
 p2panda, live in [`INTEGRATION_NOTES.md`](INTEGRATION_NOTES.md). Read it
@@ -184,6 +184,7 @@ churn — the container test rig depends on this.
 src/
 ├── main.rs           CLI: parsing, dispatch
 ├── daemon.rs         DaemonRuntime, per-share sync_loop, JoinSet, ShareCommand dispatch
+├── wire.rs           Gossip wire format v4: versioned bincode envelope, chunking
 ├── ipc.rs            org.peerdup.Daemon1 D-Bus interface (Phase 7)
 ├── client.rs         Thin DaemonClient wrapping zbus::Proxy (Phase 7)
 ├── transfer.rs       iroh-blobs store, encrypted manifests, fetch + verify
