@@ -597,6 +597,84 @@ mod tests {
         assert!(!state.is_member(group, me_of(&carol)));
     }
 
+    /// Sign an op with arbitrary deps, the way a malicious peer can.
+    fn forge(
+        key: &SigningKey,
+        deps: Vec<OpId>,
+        action: GroupAction<MemberId, ()>,
+        group: MemberId,
+    ) -> SignedOp {
+        let author = me_of(key);
+        let payload = GroupControlMessage {
+            group_id: group,
+            action,
+        };
+        let canonical =
+            bincode::serde::encode_to_vec((&author, &deps, &payload), bincode::config::standard())
+                .unwrap();
+        SignedOp {
+            author,
+            deps,
+            payload,
+            signature: key.sign(&canonical).to_bytes(),
+        }
+    }
+
+    fn sorted_members(state: &AuthState, group: MemberId) -> Vec<(MemberId, AuthRole)> {
+        let mut m = state.members(group);
+        m.sort_by_key(|(id, _)| id.0);
+        m
+    }
+
+    /// Review finding 1: a second `Create` for an existing group, signed
+    /// by a Reader or by someone outside the share, must not reset the
+    /// group or hand the attacker a role.
+    #[test]
+    fn stranger_create_for_existing_group_is_refused() {
+        let owner = fresh_key();
+        let writer = fresh_key();
+        let reader = fresh_key();
+        let stranger = fresh_key();
+        let group = group_id_for("share-takeover");
+        let mut state = AuthState::empty();
+        state.create_group(&owner, group).unwrap();
+        state
+            .add_member(&owner, group, me_of(&writer), AuthRole::Writer)
+            .unwrap();
+        state
+            .add_member(&owner, group, me_of(&reader), AuthRole::Reader)
+            .unwrap();
+        let before = sorted_members(&state, group);
+
+        for (attacker, role_before) in [(&reader, Some(AuthRole::Reader)), (&stranger, None)] {
+            let create = |deps: Vec<OpId>| {
+                forge(
+                    attacker,
+                    deps,
+                    GroupAction::Create {
+                        initial_members: vec![(
+                            GroupMember::Individual(me_of(attacker)),
+                            Access::manage(),
+                        )],
+                    },
+                    group,
+                )
+            };
+            // A Create with no deps (a fresh root) and one built on the
+            // current heads (as if authored with a full copy of the log).
+            let heads: Vec<OpId> = state.crdt.inner.heads().into_iter().collect();
+            for op in [create(Vec::new()), create(heads)] {
+                let _ = state.apply_remote(op);
+                assert_eq!(
+                    sorted_members(&state, group),
+                    before,
+                    "a forged Create changed the membership"
+                );
+                assert_eq!(state.role_of(group, me_of(attacker)), role_before);
+            }
+        }
+    }
+
     #[test]
     fn ops_for_another_group_are_refused() {
         let alice = fresh_key();
