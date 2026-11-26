@@ -33,7 +33,7 @@ jobs:
         run: >
           dnf -y install glibc-langpack-en git-core rpm-build rpmdevtools rpmlint
           cargo rust clippy rustfmt cargo-rpm-macros cargo-vendor-filterer xz
-          systemd
+          systemd dbus-daemon
 
       - uses: actions/checkout@v7
 
@@ -86,6 +86,8 @@ jobs:
           # Two installed daemons sync a share over iroh-blobs.
           tests/e2e-sync.sh /usr/bin/rust-peerdup
           tests/e2e-revoke.sh /usr/bin/rust-peerdup
+          # Per-share isolation and live revocation (A on a private bus).
+          tests/e2e-isolation.sh /usr/bin/rust-peerdup
           # Linked against Fedora's SQLite, not a bundled copy.
           ldd /usr/bin/rust-peerdup | grep -q libsqlite3
           cd /

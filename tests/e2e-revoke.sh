@@ -10,8 +10,9 @@
 #   4. A revokes B. A new file from A reaches C but never B (B is refused
 #      at the connection and can't decrypt the new epoch anyway).
 #   5. B's edits after its revocation never reach A.
-#   6. C learns of the revocation over gossip (B leaves its member list)
-#      and installs the rotated key, with an auth log well over 4 KiB:
+#   6. C learns of the revocation over gossip (B leaves its member list),
+#      blocks B and closes B's live connections, and installs the rotated
+#      key, with an auth log well over 4 KiB:
 #      A also invites $EXTRA throwaway members that never run a daemon.
 #      p2panda-net's default 4 KiB message limit used to drop these
 #      messages (wire format v4); no daemon may log a publish failure.
@@ -141,6 +142,12 @@ pd a share-members "$share" | grep -q "$pub_b" && fail "B still listed as a memb
 ok "B is no longer a member"
 wait_for "C learns over gossip that B was revoked" c_dropped_b
 wait_for "C installs the rotated key" c_rotated
+# C ran throughout; B was only a member of this share, so C blocks it and
+# closes the connections B has open to it, not just new ones.
+c_cut_b() { grep "no longer a member of any share" "$SCRATCH/c.log" | grep -q "node=$pub_b"; }
+wait_for "C cuts B off once it learns of the revocation" c_cut_b
+grep "no longer a member of any share" "$SCRATCH/c.log" | grep "node=$pub_b" | head -1 \
+    | cut -c1-220 | sed 's/^/    /'
 
 info "A adds a file after the revocation"
 echo "after revoking B" > "$(root a)/secret.txt"
