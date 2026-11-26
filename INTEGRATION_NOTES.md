@@ -146,6 +146,47 @@ first is delivered; a receiver whose fetch failed then never retries.
 announce a second before the rotated key, failed to decrypt, and never saw
 the version again.
 
+## Gossip message size and wire format v4
+
+p2panda-net 0.8.1's gossip has `DEFAULT_MAX_MESSAGE_SIZE = 4096`
+(`GossipConfig::default()` uses it), and `GossipHandle::publish` returns
+`GossipPublishError::MessageTooLarge` above it. The daemon only logged
+that. Before v4 the envelope was JSON, which writes a bincode-encoded
+auth op as an array of numbers, about 700 bytes an op, so `AuthOps`
+(the whole log, every 10 s) failed past about five ops and a
+`KeyRotation` past about seven members. Beyond the smallest shares,
+members other than the inviter never heard of later Adds or Removes, or
+of rotated keys.
+
+Now (`src/wire.rs`):
+- Gossip runs with `GossipConfig { max_message_size: 64 * 1024, .. }`
+  (`wire::MAX_GOSSIP_MESSAGE`). **Every peer on a topic must use the same
+  limit**: a peer with a smaller one can't receive the larger messages.
+  There is no release yet, so no mixed versions to support.
+- Every message is `bincode((v = 4, nonce, ShareMsg))`, standard config,
+  decoded with `with_limit::<{ 64 * 1024 }>()`. `ShareMsg` is externally
+  tagged (bincode can't decode serde's internally tagged enums). The
+  first byte is the version: a v4 peer drops anything else, including the
+  old JSON (`{`); an old peer fails to parse v4 as JSON and drops it.
+- The random `nonce` makes every send unique. Gossip drops repeats, and
+  the periodic re-broadcasts of the auth log and pending rotations would
+  otherwise be byte-identical (the same problem the announce nonce
+  fixed).
+- Auth ops travel as raw `SignedOp::encode` bytes (about 200 bytes each),
+  split into messages of at most 48 KiB (`wire::CHUNK_BUDGET`). Each op
+  verifies on its own, and `AuthState`'s pending buffer (256 ops) puts
+  out-of-order chunks back in order.
+- A rotation is split into signed chunks of at most 256 envelopes
+  (`rotation::ENVELOPES_PER_CHUNK`, about 35 KiB). `install_epoch_key` is
+  idempotent (the same key for the current epoch is `Idempotent`), chunks
+  without our envelope are `NotForUs`, and only the chunk with our
+  envelope can be buffered, so the buffer dedups by signature.
+
+`wire.rs` tests that 300 auth ops and 200 envelopes fit after chunking,
+and that each chunk decodes and verifies; `tests/e2e-revoke.sh` runs a
+share whose auth log is well over 4 KiB and fails on any publish error
+in a daemon log.
+
 ## p2panda 0.8 (core, net) with p2panda-auth 0.5
 
 p2panda-net 0.8 runs on iroh 1.x, which iroh-blobs needs. Our code moved to
@@ -269,7 +310,7 @@ provide:
 - Storage (we append-log signed ops to `<data_dir>/shares/<id>/auth.log`
   and replay on daemon start).
 - Transport (we broadcast all known ops via gossip on every announce
-  tick; receivers dedupe by op id).
+  tick, in chunks of at most 48 KiB; receivers dedupe by op id).
 - Dependency ordering (auth ops can arrive out of order via gossip; we
   buffer them in `AuthState.pending` and drain on each new arrival).
 
@@ -341,7 +382,9 @@ given the rest of the threat model. Tracked as a possible later
 hardening.
 
 ### Wire format
-On the wire, a rotation rides as `ShareMsg::KeyRotation(SignedRotation)`:
+On the wire, a rotation rides as `wire::ShareMsg::KeyRotation(SignedRotation)`,
+one message per chunk of at most 256 envelopes (see "Gossip message size
+and wire format v4"):
 
 ```rust
 struct SignedRotation {
@@ -358,9 +401,13 @@ struct KeyEnvelope {
 }
 ```
 
-Canonical bytes signed = `bincode((epoch, rotator_pubkey, envelopes))`
-with `bincode::config::standard()`. Field tuple ordering is part of the
-protocol — re-ordering invalidates every old signature.
+Canonical bytes signed = `bincode(("peerdup-rotation-v2", group_id,
+epoch, rotator_pubkey, envelopes))` with `bincode::config::standard()`
+(see "Rotation signatures are bound to the share"). Field tuple ordering
+is part of the protocol — re-ordering invalidates every old signature.
+Each chunk is signed over exactly the envelopes it carries, with the same
+layout and tag; a recipient needs only the chunk with its envelope, and
+the others verify but return `NotForUs`.
 
 ### Manager-at-receive-vantage looseness
 The receiver checks "rotator is currently an Owner" against *its* local
@@ -374,9 +421,10 @@ alternative (track each rotation's "auth-state-at-author-time") would
 require carrying an extra dependency vector on every rotation.
 
 ### On-disk: `pending_rotations/`
-The CLI's `share-revoke` writes a per-rotation file at
-`<data_dir>/shares/<id>/pending_rotations/<epoch>.bin` (atomic
-tmp+rename, 0600 on Unix). The daemon loads all such files at start and
+`share-revoke` writes one file per chunk at
+`<data_dir>/shares/<id>/pending_rotations/<epoch>-<n>.bin` (atomic
+tmp+rename, 0600 on Unix), each a bincode `SignedRotation`; a
+`<epoch>.bin` from before chunking still loads. The daemon loads all such files at start and
 re-broadcasts each one on every announce tick until the operator
 manually clears them. There's no automatic GC yet — a rotation
 recipient who has come back online and installed the new epoch

@@ -51,9 +51,11 @@ pub struct KeyEnvelope {
     pub ciphertext: Vec<u8>,
 }
 
-/// A full key-rotation broadcast: an epoch + author + envelopes, signed by
-/// the rotator. Wire format is bincode-encoded; the daemon wraps it in
-/// `ShareMsg::KeyRotation` for gossip.
+/// A key-rotation broadcast, or one chunk of it: an epoch + author + some
+/// of the envelopes, signed by the rotator over exactly the envelopes it
+/// carries. A rotation for many members is split into several of these
+/// (`build_signed_rotation`), so each fits in one gossip message; the
+/// daemon wraps each in `wire::ShareMsg::KeyRotation`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SignedRotation {
     pub epoch: u64,
@@ -84,7 +86,9 @@ pub enum VerifyOutcome {
 
 /// Domain tag for rotation signatures. v2 added the group id, so a
 /// rotation signed for one share can't be replayed into another share
-/// that has the same Owner and recipient.
+/// that has the same Owner and recipient. The layout is unchanged by
+/// chunking: a chunk is signed exactly like a whole rotation, over the
+/// envelopes it carries, so the tag stays v2.
 const ROTATION_SIG_DOMAIN: &[u8] = b"peerdup-rotation-v2";
 
 /// Canonical bytes signed by the rotator. Order is part of the wire
@@ -127,6 +131,58 @@ fn ed25519_priv_to_box_priv(identity: &SigningKey) -> BoxSecret {
     BoxSecret::from(scalar_bytes)
 }
 
+/// Envelopes per signed chunk. An envelope is about 137 bytes encoded, so
+/// a chunk stays near 35 KiB, under `wire::CHUNK_BUDGET`.
+pub const ENVELOPES_PER_CHUNK: usize = 256;
+
+/// Build the signed chunks of a rotation for `recipients`, at most
+/// `ENVELOPES_PER_CHUNK` envelopes each. Every chunk verifies on its own;
+/// a recipient needs only the one that carries its envelope.
+pub fn build_signed_rotation(
+    rotator: &SigningKey,
+    group_id: MemberId,
+    epoch: u64,
+    new_key: &Key,
+    recipients: &[MemberId],
+) -> Result<Vec<SignedRotation>> {
+    build_chunks(
+        rotator,
+        group_id,
+        epoch,
+        new_key,
+        recipients,
+        ENVELOPES_PER_CHUNK,
+    )
+}
+
+pub(crate) fn build_chunks(
+    rotator: &SigningKey,
+    group_id: MemberId,
+    epoch: u64,
+    new_key: &Key,
+    recipients: &[MemberId],
+    per_chunk: usize,
+) -> Result<Vec<SignedRotation>> {
+    let whole = build_one(rotator, group_id, epoch, new_key, recipients)?;
+    if whole.envelopes.len() <= per_chunk {
+        return Ok(vec![whole]);
+    }
+    let rotator_pubkey = whole.rotator_pubkey;
+    Ok(whole
+        .envelopes
+        .chunks(per_chunk.max(1))
+        .map(|envelopes| {
+            let canonical = canonical_bytes(&group_id, epoch, &rotator_pubkey, envelopes);
+            SignedRotation {
+                epoch,
+                rotator_pubkey,
+                signature: rotator.sign(&canonical).to_bytes(),
+                envelopes: envelopes.to_vec(),
+            }
+        })
+        .collect())
+}
+
 /// Build a fully-signed rotation envelope set for `recipients` (which should
 /// be the post-revocation membership minus the rotator themselves —
 /// `verify_and_decrypt` happily handles a self-envelope being absent).
@@ -134,7 +190,7 @@ fn ed25519_priv_to_box_priv(identity: &SigningKey) -> BoxSecret {
 /// Recipients are sorted by raw pubkey bytes for determinism (so two managers
 /// rotating concurrently with the same input set produce envelope vectors in
 /// the same order).
-pub fn build_signed_rotation(
+fn build_one(
     rotator: &SigningKey,
     group_id: MemberId,
     epoch: u64,
@@ -243,16 +299,20 @@ pub fn pending_dir(data_dir: &Path, share_id: &str) -> PathBuf {
         .join("pending_rotations")
 }
 
-/// Persist a rotation to `pending_rotations/<epoch>.bin`. Atomic via tmp +
+/// Persist a rotation's chunks to `pending_rotations/<epoch>-<n>.bin`, one
+/// `SignedRotation` per file (the format a whole rotation had before
+/// chunking, so older `<epoch>.bin` files still load). Atomic via tmp +
 /// rename; 0600 on Unix.
-pub fn save_pending(data_dir: &Path, share_id: &str, rotation: &SignedRotation) -> Result<()> {
+pub fn save_pending(data_dir: &Path, share_id: &str, chunks: &[SignedRotation]) -> Result<()> {
     let dir = pending_dir(data_dir, share_id);
     fs::create_dir_all(&dir).with_context(|| format!("create_dir_all {dir:?}"))?;
-    let bytes = bincode::serde::encode_to_vec(rotation, bincode::config::standard())
-        .context("encoding rotation")?;
-    let path = dir.join(format!("{}.bin", rotation.epoch));
-    crate::data_dir::write_private_atomic(&path, &bytes)
-        .with_context(|| format!("writing {path:?}"))?;
+    for (n, rotation) in chunks.iter().enumerate() {
+        let bytes = bincode::serde::encode_to_vec(rotation, bincode::config::standard())
+            .context("encoding rotation")?;
+        let path = dir.join(format!("{}-{n}.bin", rotation.epoch));
+        crate::data_dir::write_private_atomic(&path, &bytes)
+            .with_context(|| format!("writing {path:?}"))?;
+    }
     Ok(())
 }
 
@@ -293,6 +353,27 @@ mod tests {
         MemberId(*k.verifying_key().as_bytes())
     }
 
+    fn one(r: Result<Vec<SignedRotation>>) -> SignedRotation {
+        let mut chunks = r.unwrap();
+        assert_eq!(chunks.len(), 1);
+        chunks.remove(0)
+    }
+
+    #[test]
+    fn chunks_persist_and_reload() {
+        let dir = std::env::temp_dir().join(format!("peerdup-rot-{:016x}", rand::random::<u64>()));
+        let alice = fresh();
+        let group = group_id_for("rot-persist");
+        let ids: Vec<MemberId> = (0..10).map(|_| me_of(&fresh())).collect();
+        let chunks = build_chunks(&alice, group, 2, &[1u8; KEY_LEN], &ids, 4).unwrap();
+        assert_eq!(chunks.len(), 3);
+        save_pending(&dir, "0123456789abcdef", &chunks).unwrap();
+        let back = load_pending(&dir, "0123456789abcdef").unwrap();
+        assert_eq!(back.len(), 3);
+        assert_eq!(back.iter().map(|r| r.envelopes.len()).sum::<usize>(), 10);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn round_trip_envelope_seal_open() {
         let alice = fresh();
@@ -302,7 +383,13 @@ mod tests {
 
         let new_key: Key = [0xCDu8; KEY_LEN];
         // Address an envelope to alice herself (round trip).
-        let rot = build_signed_rotation(&alice, group, 2, &new_key, &[me_of(&alice)]).unwrap();
+        let rot = one(build_signed_rotation(
+            &alice,
+            group,
+            2,
+            &new_key,
+            &[me_of(&alice)],
+        ));
         match verify_and_decrypt(&rot, &state, group, &alice) {
             VerifyOutcome::OkForUs(k) => assert_eq!(k, new_key),
             other => panic!("expected OkForUs, got {other:?}"),
@@ -321,7 +408,13 @@ mod tests {
             .unwrap();
 
         let new_key: Key = [0x42u8; KEY_LEN];
-        let rot = build_signed_rotation(&alice, group, 2, &new_key, &[me_of(&bob)]).unwrap();
+        let rot = one(build_signed_rotation(
+            &alice,
+            group,
+            2,
+            &new_key,
+            &[me_of(&bob)],
+        ));
 
         // Bob's local replay of the auth log:
         let mut bob_state = AuthState::empty_for(group);
@@ -350,7 +443,13 @@ mod tests {
 
         let new_key: Key = [0x99u8; KEY_LEN];
         // Mallory signs a rotation envelope for bob.
-        let rot = build_signed_rotation(&mallory, group, 2, &new_key, &[me_of(&bob)]).unwrap();
+        let rot = one(build_signed_rotation(
+            &mallory,
+            group,
+            2,
+            &new_key,
+            &[me_of(&bob)],
+        ));
 
         // Bob applies the auth log and checks: rotator (mallory) is not a
         // manager, so reject.
@@ -376,7 +475,13 @@ mod tests {
             .unwrap();
 
         let new_key: Key = [0xAAu8; KEY_LEN];
-        let mut rot = build_signed_rotation(&alice, group, 2, &new_key, &[me_of(&bob)]).unwrap();
+        let mut rot = one(build_signed_rotation(
+            &alice,
+            group,
+            2,
+            &new_key,
+            &[me_of(&bob)],
+        ));
         // Flip a bit inside an envelope's ciphertext. The outer signature
         // covers the envelope, so verification should fail.
         rot.envelopes[0].ciphertext[0] ^= 0x01;
@@ -408,7 +513,13 @@ mod tests {
 
         let new_key: Key = [0x33u8; KEY_LEN];
         // Address only to charlie.
-        let rot = build_signed_rotation(&alice, group, 2, &new_key, &[me_of(&charlie)]).unwrap();
+        let rot = one(build_signed_rotation(
+            &alice,
+            group,
+            2,
+            &new_key,
+            &[me_of(&charlie)],
+        ));
 
         let mut bob_state = AuthState::empty_for(group);
         for op in state.ops() {
@@ -438,7 +549,13 @@ mod tests {
             bob_state.apply_remote(op.clone()).unwrap();
         }
         let new_key: Key = [0x42u8; KEY_LEN];
-        let rot = build_signed_rotation(&alice, group_a, 2, &new_key, &[me_of(&bob)]).unwrap();
+        let rot = one(build_signed_rotation(
+            &alice,
+            group_a,
+            2,
+            &new_key,
+            &[me_of(&bob)],
+        ));
         assert!(matches!(
             verify_and_decrypt(&rot, &bob_state, group_b, &bob),
             VerifyOutcome::BadSignature

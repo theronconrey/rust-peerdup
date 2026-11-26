@@ -16,6 +16,7 @@ mod share;
 mod share_state;
 mod ticket;
 mod transfer;
+mod wire;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -594,9 +595,9 @@ fn cmd_share_revoke_direct(data_dir: PathBuf, id: String, peer_pubkey_hex: Strin
             .ok_or_else(|| anyhow!("rotated keyring missing epoch {new_epoch}"))?
     };
 
-    let rotation_msg =
+    let chunks =
         rotation::build_signed_rotation(&identity, group_id, new_epoch, &new_key, &remaining)?;
-    rotation::save_pending(&data_dir, &id, &rotation_msg)?;
+    rotation::save_pending(&data_dir, &id, &chunks)?;
 
     println!("Revoked {} from share {id}", peer_pubkey_hex);
     println!("Rotated keyring to epoch {new_epoch}.");

@@ -10,6 +10,11 @@
 #   4. A revokes B. A new file from A reaches C but never B (B is refused
 #      at the connection and can't decrypt the new epoch anyway).
 #   5. B's edits after its revocation never reach A.
+#   6. C learns of the revocation over gossip (B leaves its member list)
+#      and installs the rotated key, with an auth log well over 4 KiB:
+#      A also invites $EXTRA throwaway members that never run a daemon.
+#      p2panda-net's default 4 KiB message limit used to drop these
+#      messages (wire format v4); no daemon may log a publish failure.
 #
 # Usage: tests/e2e-revoke.sh [path/to/rust-peerdup]   (default: target/debug)
 
@@ -22,6 +27,7 @@ BIN="${1:-$REPO_ROOT/target/debug/rust-peerdup}"
 SCRATCH="$(mktemp -d /tmp/peerdup-e2e-revoke.XXXXXX)"
 TIMEOUT="${PEERDUP_E2E_TIMEOUT:-90}"
 QUIET="${PEERDUP_E2E_QUIET:-20}"   # how long "never arrives" is watched
+EXTRA="${PEERDUP_E2E_EXTRA:-24}"   # throwaway members, to grow the auth log
 declare -A PID
 
 ok()   { printf '\033[1;32m  ok\033[0m %s\n' "$*"; }
@@ -85,9 +91,25 @@ pd a share-invite "$share" "$pub_b" --auth-role writer 2>/dev/null | pd b share-
 pd a share-invite "$share" "$pub_c" --auth-role reader 2>/dev/null | pd c share-join - --path "$(root c)" >/dev/null
 ok "share $share: A owner, B writer, C reader"
 
+# Invited after B and C, so B and C only hear of them over gossip.
+for i in $(seq 1 "$EXTRA"); do
+    pub_x="$(pd "x$i" whoami)"
+    pd a share-invite "$share" "$pub_x" --auth-role reader >/dev/null 2>&1
+done
+ops_bytes="$(stat -c %s "$(data a)/shares/$share/auth.log")"
+[ "$ops_bytes" -gt 4096 ] || fail "auth.log is only $ops_bytes bytes; want more than 4 KiB"
+ok "A invited $EXTRA throwaway readers (auth.log: $ops_bytes bytes)"
+
+# C's view of the members, read from its auth.log (no lock needed).
+members_c() { pd c share-members "$share"; }
+c_has_all_members() { [ "$(members_c | grep -c '^[0-9a-f]\{64\} ')" -ge $((EXTRA + 3)) ]; }
+c_dropped_b() { local m; m="$(members_c)" && ! grep -q "$pub_b" <<<"$m"; }
+c_rotated() { grep -q "installed rotated key" "$SCRATCH/c.log"; }
+
 start a; start b; start c
 wait_for "A's file reaches B" has b "hello from A" hello.txt
 wait_for "A's file reaches C" has c "hello from A" hello.txt
+wait_for "C learns every member over gossip" c_has_all_members
 
 info "B (writer) edits"
 echo "from B" >> "$(root b)/hello.txt"
@@ -105,6 +127,8 @@ pd a share-revoke "$share" "$pub_b" >/dev/null
 start a
 pd a share-members "$share" | grep -q "$pub_b" && fail "B still listed as a member"
 ok "B is no longer a member"
+wait_for "C learns over gossip that B was revoked" c_dropped_b
+wait_for "C installs the rotated key" c_rotated
 
 info "A adds a file after the revocation"
 echo "after revoking B" > "$(root a)/secret.txt"
@@ -119,4 +143,11 @@ for p in a b c; do
     kill -0 "${PID[$p]}" 2>/dev/null || fail "daemon ${p^^} exited early"
 done
 ok "all three daemons still running"
+
+for p in a b c; do
+    if grep -E "MessageTooLarge|gossip publish" "$SCRATCH/$p.log"; then
+        fail "daemon ${p^^} failed to publish a gossip message"
+    fi
+done
+ok "no gossip publish failures in any log"
 info "e2e-revoke passed"

@@ -184,6 +184,7 @@ churn — the container test rig depends on this.
 src/
 ├── main.rs           CLI: parsing, dispatch
 ├── daemon.rs         DaemonRuntime, per-share sync_loop, JoinSet, ShareCommand dispatch
+├── wire.rs           Gossip wire format v4: versioned bincode envelope, chunking
 ├── ipc.rs            org.peerdup.Daemon1 D-Bus interface (Phase 7)
 ├── client.rs         Thin DaemonClient wrapping zbus::Proxy (Phase 7)
 ├── transfer.rs       iroh-blobs store, encrypted manifests, fetch + verify

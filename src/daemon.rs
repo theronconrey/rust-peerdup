@@ -9,16 +9,16 @@ use crate::share::{ShareConfig, ShareRole};
 use crate::share_state::{self, PersistedState};
 use crate::ticket::{self, Ticket, TICKET_VERSION};
 use crate::transfer::{self, BlobCache, FileHash, Transfer, PEERDUP_DIR_NAME};
+use crate::wire::{self, ShareMsg};
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use p2panda_core::{SigningKey, Topic};
 use p2panda_net::addrs::NodeInfo;
-use p2panda_net::gossip::GossipHandle;
+use p2panda_net::gossip::{GossipConfig, GossipHandle};
 use p2panda_net::iroh_endpoint::RelayUrl;
 use p2panda_net::iroh_mdns::MdnsDiscoveryMode;
 use p2panda_net::{AddressBook, Discovery, Endpoint, Gossip, MdnsDiscovery};
-use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -31,36 +31,6 @@ use tokio::task::JoinSet;
 /// Cap the in-memory buffer of out-of-order key rotations per share. 64 epochs
 /// is far more than expected; we evict the oldest if we somehow run past it.
 const ROTATION_BUFFER_CAP: usize = 64;
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(tag = "kind")]
-enum ShareMsg {
-    /// A version of the share: its manifest hash, where to fetch it and
-    /// the version's hash, clock and timestamp, signed by the sender
-    /// (`announce.rs`). Receivers apply it only if the signer is a current
-    /// Writer or Owner. Earlier unsigned announces had other tags and are
-    /// ignored.
-    #[serde(rename = "share_announce_v3")]
-    Announce(Announce),
-    /// Phase 5c: full snapshot of this peer's known auth ops for the share.
-    /// Receivers verify each, dedupe by op id, and apply via
-    /// `AuthState::apply_remote`. Periodic re-broadcasts ensure late joiners
-    /// catch up; receivers ignore ops they already hold so reflood is cheap.
-    /// `bincode`-encoded `SignedOp`s are inlined as `Vec<u8>` so a peer can
-    /// decode the envelope (`serde_json` here) without depending on the
-    /// inner schema.
-    #[serde(rename = "share_auth_ops")]
-    AuthOps { ops: Vec<Vec<u8>> },
-    /// Phase 5d: a freshly-rotated epoch key, sealed once per remaining
-    /// member (sealed-box-style envelope). Rebroadcast on every announce
-    /// tick until the manager either confirms membership has stabilised or
-    /// removes the file from `pending_rotations/`. Receivers verify the
-    /// outer signature against `rotator_pubkey`, check that pubkey is a
-    /// current Owner in their local auth state, then decrypt the envelope
-    /// addressed to them and `install_epoch_key` the result.
-    #[serde(rename = "share_key_rotation")]
-    KeyRotation(SignedRotation),
-}
 
 /// Command sent from an IPC handler into the running share task. Each variant
 /// pairs a request with a `oneshot::Sender` for the reply, so per-share state
@@ -88,15 +58,9 @@ pub enum ShareCommand {
     },
 }
 
-fn auth_announce_bytes(state: &AuthState) -> Result<Vec<u8>> {
-    let ops: Result<Vec<Vec<u8>>> = state.ops().iter().map(SignedOp::encode).collect();
-    let msg = ShareMsg::AuthOps { ops: ops? };
-    Ok(serde_json::to_vec(&msg)?)
-}
-
 /// Apply an incoming `AuthOps` payload to the share's auth state. Persists
 /// the log on disk if any op was newly applied. The `payload` is the parsed
-/// `ShareMsg::AuthOps.ops` vector.
+/// `wire::ShareMsg::AuthOps.ops` vector (one chunk of the sender's log).
 fn apply_auth_ops(
     state: &mut AuthState,
     payload: Vec<Vec<u8>>,
@@ -184,7 +148,14 @@ pub async fn start_runtime(
     let _discovery = Discovery::builder(address_book.clone(), endpoint.clone())
         .spawn()
         .await?;
+    // p2panda-net's default limit is 4 KiB, too small for the auth log
+    // and key rotations of any real share. Every peer must use the same
+    // limit (wire.rs).
     let gossip = Gossip::builder(address_book.clone(), endpoint.clone())
+        .config(GossipConfig {
+            max_message_size: wire::MAX_GOSSIP_MESSAGE,
+            ..Default::default()
+        })
         .spawn()
         .await?;
     // Leak the discovery handles into a background task so they live for the
@@ -695,9 +666,9 @@ async fn sync_loop(
                     Ok(p) => p,
                     Err(e) => { tracing::debug!(error = %e, "gossip lag"); continue; }
                 };
-                let msg = match serde_json::from_slice::<ShareMsg>(&payload) {
-                    Ok(m) => m,
-                    Err(_) => continue,
+                let Some(msg) = wire::decode(&payload) else {
+                    tracing::debug!(share_id = %config.id, len = payload.len(), "ignoring a message that isn't wire v4");
+                    continue;
                 };
                 let ann = match msg {
                     ShareMsg::Announce(ann) => ann,
@@ -970,12 +941,12 @@ async fn handle_revoke(
         *key.write().await = fresh;
     }
 
-    let rotation_msg =
+    let chunks =
         rotation::build_signed_rotation(identity, group_id, new_epoch, &new_key_bytes, &remaining)?;
-    rotation::save_pending(data_dir, &config.id, &rotation_msg)?;
+    rotation::save_pending(data_dir, &config.id, &chunks)?;
     // Live broadcasting: append to the in-memory queue so the next announce
     // tick picks it up (no daemon restart needed).
-    pending_rotations.push(rotation_msg);
+    pending_rotations.extend(chunks);
 
     Ok(new_epoch)
 }
@@ -1317,10 +1288,13 @@ async fn publish_sync_announce(
         state.clock.clone(),
         state.timestamp,
     );
-    if let Ok(bytes) = serde_json::to_vec(&ShareMsg::Announce(ann)) {
-        if let Err(e) = handle.publish(bytes).await {
-            tracing::warn!(error = %e, "gossip publish failed");
+    match wire::encode(ShareMsg::Announce(ann)) {
+        Ok(bytes) => {
+            if let Err(e) = handle.publish(bytes).await {
+                tracing::warn!(error = %e, "gossip publish failed");
+            }
         }
+        Err(e) => tracing::warn!(error = %e, "encoding announce failed"),
     }
 }
 
@@ -1328,15 +1302,17 @@ async fn publish_auth_ops(handle: &GossipHandle, auth_state: &AuthState, share_i
     if auth_state.is_empty() {
         return;
     }
-    let bytes = match auth_announce_bytes(auth_state) {
-        Ok(b) => b,
+    let messages = match wire::auth_ops_messages(auth_state) {
+        Ok(m) => m,
         Err(e) => {
             tracing::warn!(error = %e, share_id = %share_id, "encoding auth ops failed");
             return;
         }
     };
-    if let Err(e) = handle.publish(bytes).await {
-        tracing::warn!(error = %e, share_id = %share_id, "gossip publish (auth ops) failed");
+    for bytes in messages {
+        if let Err(e) = handle.publish(bytes).await {
+            tracing::warn!(error = %e, share_id = %share_id, "gossip publish (auth ops) failed");
+        }
     }
 }
 
@@ -1348,8 +1324,7 @@ async fn publish_pending_rotations(
     share_id: &str,
 ) {
     for rot in pending {
-        let msg = ShareMsg::KeyRotation(rot.clone());
-        let bytes = match serde_json::to_vec(&msg) {
+        let bytes = match wire::encode(ShareMsg::KeyRotation(rot.clone())) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(error = %e, share_id = %share_id, epoch = rot.epoch,
@@ -1528,8 +1503,10 @@ async fn drain_rotation_buffer(
 }
 
 /// Bounded push: drop the oldest (lowest-epoch) entry once the buffer fills.
+/// Only a chunk that carries our envelope is ever buffered, and an epoch
+/// has one such chunk per rotator, so this dedups by signature.
 fn buffer_push(buf: &mut Vec<SignedRotation>, rot: SignedRotation) {
-    if buf.iter().any(|r| r.epoch == rot.epoch) {
+    if buf.iter().any(|r| r.signature == rot.signature) {
         return;
     }
     if buf.len() >= ROTATION_BUFFER_CAP {
@@ -1659,7 +1636,7 @@ mod tests {
         .unwrap();
         assert_eq!(new_epoch, 2);
 
-        // Pending in-memory queue should have one entry; on disk too.
+        // Pending in-memory queue should have one chunk; on disk too.
         assert_eq!(pending.len(), 1);
         let on_disk = rotation::load_pending(td.path(), &config.id).unwrap();
         assert_eq!(on_disk.len(), 1);
