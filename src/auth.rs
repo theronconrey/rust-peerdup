@@ -384,12 +384,12 @@ impl AuthState {
                 self.group
             ));
         }
-        self.check_shape(&op)?;
         let op_id = op.id();
         if self.ops.iter().any(|o| o.id() == op_id) || self.pending.iter().any(|o| o.id() == op_id)
         {
             return Ok(false);
         }
+        self.check_shape(&op)?;
 
         let known: HashSet<OpId> = self.ops.iter().map(|o| o.id()).collect();
         if !op.deps.iter().all(|d| known.contains(d)) {
