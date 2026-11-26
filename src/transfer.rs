@@ -421,6 +421,26 @@ impl Transfer {
     }
 }
 
+/// A staged version of `files` (path, plaintext) under `root`, for tests
+/// of what the share loop does with one.
+#[cfg(test)]
+pub(crate) fn staged_for_test(root: &Path, files: &[(&str, &[u8])]) -> StagedVersion {
+    let mut staged = StagedVersion::new(
+        files
+            .iter()
+            .map(|(p, b)| (PathBuf::from(p), *blake3::hash(b).as_bytes()))
+            .collect(),
+    );
+    for (p, b) in files {
+        let rel = PathBuf::from(p);
+        check_parents(root, &rel, true).unwrap();
+        let tmp = staging_path(&root.join(&rel)).unwrap();
+        write_new(&tmp, b).unwrap();
+        staged.staged.push((rel, tmp));
+    }
+    staged
+}
+
 /// Blobs at least this big get an info line when their fetch starts.
 const LARGE_BLOB_BYTES: u64 = 16 * 1024 * 1024;
 

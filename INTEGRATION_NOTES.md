@@ -297,29 +297,49 @@ when the rotation triggers go in).
 
 ## Deferred work
 
-### Phase 3.5 — alternate conflict strategies (not blocking)
-Phase 3.4 ships LWW as the only conflict strategy. The roadmap also calls
-for **rename** ("keep both, rename one to `foo.txt.conflict-from-<peer>`")
-and **pause-and-ask** ("mark conflicting and stop syncing until resolved").
-Both are configurable per-share extensions of the existing
-`Concurrent → lww_we_win` branch in `daemon::sync_loop`:
+### Phase 3.5 — conflict copies (done) and pause-and-ask (deferred)
+**Conflict copies are the behaviour now**, not an option
+(`daemon::commit_remote`). Last-writer-wins still picks which whole
+version wins, but it only decides which content keeps the original name:
+before a staged version is committed, a local file it would overwrite or
+remove is renamed to `name (conflict from <first 8 hex of our peer id>
+<YYYY-MM-DD HHMMSS> UTC).ext` (suffix before the last extension; a
+dotfile keeps its whole name as the stem; `-2`, `-3` if taken) when it
+holds a change the other side hasn't seen. The copy is a new local file,
+so the watcher publishes a version that dominates and both sides converge
+with exactly one copy (`tests/e2e-sync.sh` checks this).
 
-- **rename**: fetch remote into a staging copy, but instead of overwriting
-  the conflicting files, write each conflicting file to
-  `<basename>.conflict-from-<short-peer-id>.<ext>` alongside the local copy.
-  Both peers do this so the rename is visible everywhere.
-- **pause-and-ask**: set a per-share `paused_conflict: true` flag in
-  `PersistedState`, stop both publishing and applying for that share until
-  cleared via a new `peerdup share resolve <id>` subcommand.
+"A change the other side hasn't seen" needs a reference point, and the
+review's rule (on-disk hash differs from both the hash we last published
+or applied and the incoming one) only covers edits not yet announced. In
+the usual conflict the losing side *has* announced its edit, so its disk
+matches what it published and that rule would overwrite it silently. So:
+- `ShareState.manifest` maps each file to the plaintext hash we last
+  published or applied; `ShareState.base` holds the files of the last
+  version known to be shared with a peer (one we applied, or ours when a
+  peer announced the same clock and version hash back). Both persist in
+  `state.json` (format 2; a format-1 file has neither, the manifest is
+  rebuilt from the root at start, and an empty base counts every local
+  file as changed, so nothing is dropped).
+- A **fast-forward** (their clock dominates ours) compares the disk with
+  `manifest`: only unannounced edits become copies; unchanged orphans are
+  deleted, modified ones become copies.
+- A **concurrent** apply (theirs won LWW) compares with `base`: a file we
+  changed since the base becomes a copy, a file only they changed is
+  overwritten, a file we added that isn't in the base is kept under its
+  name (merged), and one unchanged since the base that they dropped is
+  deleted.
+After an apply that kept files, the loop asks the watcher for a re-check,
+so they are published.
 
-`ShareConfig` gains `conflict_strategy: ConflictStrategy` (default `Lww`).
-The Phase 3.4 LWW path stays as the default; the others are alternative
-branches in the existing concurrent handler. Estimate: 1–2 days for
-rename, ~1 day for pause-and-ask.
+Known limits: the base is per share, not per peer, so with three or more
+peers editing concurrently it can be out of date and produce an extra
+copy (never a loss). A conflict copy holds our whole file; there is no
+merge within a file.
 
-Skipped now because the Phase 3 done criterion is met by LWW alone, and
-real-world conflict-strategy preferences are likely to come out of user
-testing rather than upfront design.
+**pause-and-ask** ("mark conflicting and stop syncing until resolved") is
+still deferred: a per-share `paused_conflict` flag in `PersistedState`
+and a `share resolve <id>` subcommand.
 
 ## p2panda-auth (Phase 5c)
 
@@ -679,6 +699,8 @@ so files the user added between snapshots — which aren't in the old
 manifest — are preserved through a concurrent apply.
 
 ### LWW conflict resolution: timestamp source
+(Since Phase 3.5 the losing side's changes are kept as conflict copies;
+see "Deferred work". The timestamp still decides which version wins.)
 Phase 3.4's LWW uses `Utc::now()` at the moment the daemon **notices** a
 local change (either the watcher debounce fires, or restart reconciliation
 detects out-of-band edits). It does *not* read the file's mtime.

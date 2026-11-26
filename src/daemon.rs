@@ -20,11 +20,11 @@ use p2panda_net::iroh_endpoint::RelayUrl;
 use p2panda_net::iroh_mdns::MdnsDiscoveryMode;
 use p2panda_net::{AddressBook, Discovery, Endpoint, Gossip, MdnsDiscovery};
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::task::JoinSet;
 
@@ -607,7 +607,7 @@ async fn sync_loop(
         publish_sync_announce(&topic_handle, s, &identity, group_id, &auth_state).await;
     }
 
-    let (_watcher, mut watch_rx) =
+    let (_watcher, watch_tx, mut watch_rx) =
         spawn_fs_watcher(&root).with_context(|| format!("watching {root:?}"))?;
     let mut announce_tick = tokio::time::interval(Duration::from_secs(10));
     announce_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -735,6 +735,16 @@ async fn sync_loop(
                     clock: remote_clock,
                     timestamp: remote_ts,
                 };
+                // A peer announcing our exact version has it: it becomes
+                // the base later concurrent edits are measured against.
+                if let Some(s) = state.as_mut() {
+                    if s.clock == remote.clock && s.version_hash == remote.version_hash && s.base != s.manifest {
+                        s.base = s.manifest.clone();
+                        if let Err(e) = persist(&data_dir, &config.id, s) {
+                            tracing::warn!(error = ?e, "could not persist state");
+                        }
+                    }
+                }
                 match judge(&config.id, state.as_ref(), &remote) {
                     Verdict::Ignore => {}
                     Verdict::LocalWins(new_state) => {
@@ -744,7 +754,7 @@ async fn sync_loop(
                         publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
                         state = Some(new_state);
                     }
-                    Verdict::Fetch if fetch.is_some() => {
+                    Verdict::Fetch { .. } if fetch.is_some() => {
                         // One fetch per share at a time; keep the newest
                         // version that isn't older than the one waiting.
                         let older = next
@@ -755,7 +765,7 @@ async fn sync_loop(
                             next = Some(remote);
                         }
                     }
-                    Verdict::Fetch => {
+                    Verdict::Fetch { .. } => {
                         fetch = Some(start_fetch(&mut generation, remote, &config.id, &transfer, &root, &key, &fetch_tx).await);
                     }
                 }
@@ -785,8 +795,13 @@ async fn sync_loop(
                             publish_sync_announce(&topic_handle, &new_state, &identity, group_id, &auth_state).await;
                             state = Some(new_state);
                         }
-                        Verdict::Fetch => match commit_remote(&root, staged, &remote, state.as_ref(), &mut cache) {
-                            Ok(new_state) => {
+                        Verdict::Fetch { concurrent } => match commit_remote(&root, staged, &remote, state.as_ref(), &mut cache, concurrent, &peer_id_hex[..8]) {
+                            Ok((new_state, rescan)) => {
+                                if rescan {
+                                    // Conflict copies or files kept from our
+                                    // side: publish them as a newer version.
+                                    let _ = watch_tx.send(());
+                                }
                                 tracing::info!(share_id = %config.id, version_hash = %new_state.version_hash,
                                     "applied remote version");
                                 if let Err(e) = persist(&data_dir, &config.id, &new_state) {
@@ -804,7 +819,7 @@ async fn sync_loop(
                 }
                 if let Some(queued) = next.take() {
                     match judge(&config.id, state.as_ref(), &queued) {
-                        Verdict::Fetch => {
+                        Verdict::Fetch { .. } => {
                             fetch = Some(start_fetch(&mut generation, queued, &config.id, &transfer, &root, &key, &fetch_tx).await);
                         }
                         Verdict::LocalWins(new_state) => {
@@ -1012,9 +1027,29 @@ struct ShareState {
     clock: VectorClock,
     /// When this version was created. Tiebreaker for LWW conflict resolution.
     timestamp: DateTime<Utc>,
-    /// Files in this version, relative to the share root. Used for orphan
-    /// deletion on apply: files in old manifest but not in new are removed.
-    manifest: BTreeSet<PathBuf>,
+    /// Files in this version, relative to the share root, with the
+    /// plaintext hash we published or applied. Orphan deletion and
+    /// conflict copies compare the disk against it.
+    manifest: FileMap,
+    /// Files of the last version known to be shared with a peer: one we
+    /// applied, or ours when a peer announced it back. A concurrent apply
+    /// counts a file as changed by us if it differs from this.
+    base: FileMap,
+}
+
+/// Path (relative to the share root) to the blake3 of its plaintext.
+type FileMap = BTreeMap<PathBuf, [u8; 32]>;
+
+fn to_hex_map(m: &FileMap) -> BTreeMap<PathBuf, String> {
+    m.iter()
+        .map(|(p, h)| (p.clone(), blake3::Hash::from_bytes(*h).to_hex().to_string()))
+        .collect()
+}
+
+fn from_hex_map(m: &BTreeMap<PathBuf, String>) -> FileMap {
+    m.iter()
+        .filter_map(|(p, h)| Some((p.clone(), *blake3::Hash::from_hex(h).ok()?.as_bytes())))
+        .collect()
 }
 
 fn persist(data_dir: &Path, share_id: &str, s: &ShareState) -> Result<()> {
@@ -1022,10 +1057,13 @@ fn persist(data_dir: &Path, share_id: &str, s: &ShareState) -> Result<()> {
         data_dir,
         share_id,
         &PersistedState {
+            format: share_state::STATE_FORMAT,
             version_hash: s.version_hash.clone(),
             clock: s.clock.clone(),
             timestamp: s.timestamp,
-            manifest: s.manifest.clone(),
+            manifest: s.manifest.keys().cloned().collect(),
+            files: to_hex_map(&s.manifest),
+            base: to_hex_map(&s.base),
         },
     )
 }
@@ -1076,6 +1114,7 @@ async fn reconcile_on_start(
                 clock: p.clock,
                 timestamp: p.timestamp,
                 manifest,
+                base: from_hex_map(&p.base),
             }));
         }
         Some(p) => {
@@ -1088,6 +1127,7 @@ async fn reconcile_on_start(
                 clock,
                 timestamp: Utc::now(),
                 manifest,
+                base: from_hex_map(&p.base),
             }
         }
         None => {
@@ -1100,6 +1140,7 @@ async fn reconcile_on_start(
                 clock,
                 timestamp: Utc::now(),
                 manifest,
+                base: FileMap::new(),
             }
         }
     };
@@ -1138,6 +1179,7 @@ async fn handle_local_change(
         clock,
         timestamp: Utc::now(),
         manifest: new_manifest,
+        base: current.map(|s| s.base.clone()).unwrap_or_default(),
     };
     persist(data_dir, &config.id, &new_state)?;
     Ok(Some(new_state))
@@ -1146,7 +1188,7 @@ async fn handle_local_change(
 /// Snapshot a share's content: the version hash, the set of relative
 /// paths, and each file's plaintext blake3. Every peer computes the same
 /// values for the same content.
-fn snapshot_content(root: &Path) -> Result<(String, BTreeSet<PathBuf>, Vec<FileHash>)> {
+fn snapshot_content(root: &Path) -> Result<(String, FileMap, Vec<FileHash>)> {
     let mut paths = Vec::new();
     collect_files(root, root, &mut paths)?;
     paths.sort();
@@ -1160,7 +1202,7 @@ fn snapshot_content(root: &Path) -> Result<(String, BTreeSet<PathBuf>, Vec<FileH
             .with_context(|| format!("hashing {abs:?}"))?;
         files.push((rel.clone(), *content_hasher.finalize().as_bytes()));
     }
-    let manifest = paths.into_iter().collect();
+    let manifest = files.iter().cloned().collect();
     Ok((transfer::version_hash_of(&files), manifest, files))
 }
 
@@ -1211,13 +1253,14 @@ enum Verdict {
     /// Concurrent, and ours wins last-writer-wins: keep our content with
     /// both clocks merged (so our next announce dominates).
     LocalWins(ShareState),
-    /// Newer, or concurrent and it wins: fetch and apply it.
-    Fetch,
+    /// Newer (`concurrent: false`), or concurrent and it wins: fetch and
+    /// apply it.
+    Fetch { concurrent: bool },
 }
 
 fn judge(share_id: &str, state: Option<&ShareState>, remote: &RemoteVersion) -> Verdict {
     let Some(local) = state else {
-        return Verdict::Fetch;
+        return Verdict::Fetch { concurrent: false };
     };
     match local.clock.compare(&remote.clock) {
         ClockOrdering::Equal => Verdict::Ignore,
@@ -1225,7 +1268,7 @@ fn judge(share_id: &str, state: Option<&ShareState>, remote: &RemoteVersion) -> 
             tracing::debug!(share_id, "ignoring older remote announce");
             Verdict::Ignore
         }
-        ClockOrdering::OtherDominates => Verdict::Fetch,
+        ClockOrdering::OtherDominates => Verdict::Fetch { concurrent: false },
         ClockOrdering::Concurrent => {
             if lww_we_win(
                 local.timestamp,
@@ -1252,7 +1295,7 @@ fn judge(share_id: &str, state: Option<&ShareState>, remote: &RemoteVersion) -> 
                     remote_ts = %remote.timestamp,
                     "concurrent edits; LWW: remote wins, fetching"
                 );
-                Verdict::Fetch
+                Verdict::Fetch { concurrent: true }
             }
         }
     }
@@ -1333,35 +1376,174 @@ async fn start_fetch(
     FetchTask { generation, handle }
 }
 
-/// Apply a fetched, verified version to the share root: rename the staged
-/// files into place, remove the files the new version dropped, and merge
-/// the clocks. Runs on the share loop, after `judge` said the version
-/// still wins.
+/// Apply a fetched, verified version to the share root and return the new
+/// state, plus whether files of ours were kept (so the caller publishes
+/// them as a newer version). Runs on the share loop, after `judge` said
+/// the version still wins.
+///
+/// Local content is never silently lost. A file the new version would
+/// overwrite or remove is moved to a conflict copy
+/// (`name (conflict from <our id> <date>).ext`) when it holds changes the
+/// other side hasn't seen:
+/// - `concurrent: false` (the version descends from ours): the file
+///   differs from what we last published or applied (`manifest`), i.e. an
+///   edit not yet announced;
+/// - `concurrent: true` (both sides changed; theirs won last-writer-wins):
+///   the file differs from the last version both sides had (`base`). A
+///   file we added that the other side never had is kept under its own
+///   name; one unchanged since the base that they removed is removed.
+///
+/// Conflict copies and kept files are new local files: the watcher
+/// publishes them as a version that dominates, so both sides converge
+/// with one copy. Last-writer-wins only decides which content keeps the
+/// original name.
 fn commit_remote(
     root: &Path,
     staged: transfer::StagedVersion,
     remote: &RemoteVersion,
     current: Option<&ShareState>,
     cache: &mut BlobCache,
-) -> Result<ShareState> {
-    let new_manifest: BTreeSet<PathBuf> = staged.files.iter().map(|(p, _)| p.clone()).collect();
+    concurrent: bool,
+    me_short: &str,
+) -> Result<(ShareState, bool)> {
+    let incoming: FileMap = staged.files.iter().cloned().collect();
+    let empty = FileMap::new();
+    let (recorded, base) = current
+        .map(|s| (&s.manifest, &s.base))
+        .unwrap_or((&empty, &empty));
+    // Did we change this file, as far as the other side knows?
+    let ours = |rel: &Path, disk: &[u8; 32]| {
+        let known = if concurrent { base } else { recorded };
+        known.get(rel) != Some(disk)
+    };
+    let now = Utc::now();
+    let mut kept = false;
+
+    for (rel, theirs) in &incoming {
+        let Some(disk) = hash_existing_file(&root.join(rel))? else {
+            continue;
+        };
+        if disk != *theirs && ours(rel.as_path(), &disk) {
+            keep_as_conflict_copy(root, rel, me_short, now)?;
+            kept = true;
+        }
+    }
+
     staged.apply_to_cache(cache);
     staged.commit(root)?;
 
-    if let Some(s) = current {
-        delete_orphans(root, &s.manifest, &new_manifest);
+    for rel in recorded.keys().filter(|p| !incoming.contains_key(*p)) {
+        let disk = match hash_existing_file(&root.join(rel)) {
+            Ok(Some(h)) => h,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(error = ?e, path = %rel.display(), "could not check a removed file; keeping it");
+                kept = true;
+                continue;
+            }
+        };
+        if concurrent && !base.contains_key(rel) {
+            tracing::info!(path = %rel.display(), "kept a file the other side doesn't have");
+            kept = true;
+        } else if ours(rel.as_path(), &disk) {
+            if let Err(e) = keep_as_conflict_copy(root, rel, me_short, now) {
+                tracing::warn!(error = ?e, path = %rel.display(), "could not keep a conflict copy; leaving the file");
+            }
+            kept = true;
+        } else {
+            match std::fs::remove_file(root.join(rel)) {
+                Ok(()) => tracing::info!(path = %rel.display(), "removed orphan"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %rel.display(), "failed to remove orphan")
+                }
+            }
+        }
     }
 
     let mut clock = current.map(|s| s.clock.clone()).unwrap_or_default();
     clock.merge(&remote.clock);
 
-    Ok(ShareState {
-        version_hash: remote.version_hash.clone(),
-        manifest_hash: remote.manifest.clone(),
-        clock,
-        timestamp: remote.timestamp,
-        manifest: new_manifest,
-    })
+    Ok((
+        ShareState {
+            version_hash: remote.version_hash.clone(),
+            manifest_hash: remote.manifest.clone(),
+            clock,
+            timestamp: remote.timestamp,
+            base: incoming.clone(),
+            manifest: incoming,
+        },
+        kept,
+    ))
+}
+
+/// blake3 of a regular file's contents, or `None` if nothing (or not a
+/// regular file) is there.
+fn hash_existing_file(path: &Path) -> Result<Option<[u8; 32]>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow!("checking {path:?}: {e}")),
+    }
+    let mut file = std::fs::File::open(path).with_context(|| format!("opening {path:?}"))?;
+    let mut h = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut h).with_context(|| format!("hashing {path:?}"))?;
+    Ok(Some(*h.finalize().as_bytes()))
+}
+
+/// Move `rel` to a free conflict-copy name beside it.
+fn keep_as_conflict_copy(
+    root: &Path,
+    rel: &Path,
+    me_short: &str,
+    when: DateTime<Utc>,
+) -> Result<PathBuf> {
+    let copy = conflict_copy_name(rel, me_short, when, |p| {
+        std::fs::symlink_metadata(root.join(p)).is_ok()
+    });
+    let (from, to) = (root.join(rel), root.join(&copy));
+    std::fs::rename(&from, &to).with_context(|| format!("renaming {from:?} -> {to:?}"))?;
+    tracing::warn!(path = %rel.display(), copy = %copy.display(),
+        "concurrent change: kept our version as a conflict copy");
+    Ok(copy)
+}
+
+/// `dir/name (conflict from <peer> <YYYY-MM-DD HHMMSS> UTC).ext`, with
+/// `-2`, `-3`, ... before the extension if that is `taken`. The suffix goes
+/// before the last extension; a dotfile (`.bashrc`) keeps its whole name
+/// as the stem.
+fn conflict_copy_name(
+    rel: &Path,
+    me_short: &str,
+    when: DateTime<Utc>,
+    taken: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    let name = rel
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => name.split_at(i),
+        _ => (name.as_str(), ""),
+    };
+    let tag = format!(
+        "{stem} (conflict from {me_short} {})",
+        when.format("%Y-%m-%d %H%M%S UTC")
+    );
+    let parent = rel.parent().unwrap_or(Path::new(""));
+    let mut n = 1;
+    loop {
+        let candidate = if n == 1 {
+            parent.join(format!("{tag}{ext}"))
+        } else {
+            parent.join(format!("{tag}-{n}{ext}"))
+        };
+        if !taken(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// LWW tiebreak: later timestamp wins; on tie, lexicographically larger
@@ -1379,24 +1561,22 @@ fn lww_we_win(
     }
 }
 
-fn delete_orphans(root: &Path, old: &BTreeSet<PathBuf>, new: &BTreeSet<PathBuf>) {
-    for rel in old.difference(new) {
-        let abs = root.join(rel);
-        match std::fs::remove_file(&abs) {
-            Ok(()) => tracing::info!(path = %rel.display(), "removed orphan"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(error = %e, path = %rel.display(), "failed to remove orphan"),
-        }
-    }
-}
-
 /// Watch the share root recursively. Returns the watcher (which must be kept
 /// alive for events to flow) and an unbounded receiver of "something changed"
 /// notifications. We don't care about event details — any change just means
 /// "recompute the version hash."
-fn spawn_fs_watcher(root: &Path) -> Result<(notify::RecommendedWatcher, UnboundedReceiver<()>)> {
+/// The sender is handed back too, so the share loop can ask for a re-check
+/// itself (after an apply that kept local files).
+fn spawn_fs_watcher(
+    root: &Path,
+) -> Result<(
+    notify::RecommendedWatcher,
+    UnboundedSender<()>,
+    UnboundedReceiver<()>,
+)> {
     use notify::{RecommendedWatcher, RecursiveMode, Watcher};
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let tx_loop = tx.clone();
     let mut watcher: RecommendedWatcher =
         notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
             Ok(ev) => {
@@ -1418,7 +1598,7 @@ fn spawn_fs_watcher(root: &Path) -> Result<(notify::RecommendedWatcher, Unbounde
     watcher
         .watch(root, RecursiveMode::Recursive)
         .with_context(|| format!("watching {root:?}"))?;
-    Ok((watcher, rx))
+    Ok((watcher, tx_loop, rx))
 }
 
 /// Read one event, then keep reading until `settle` elapses without another
@@ -1819,6 +1999,211 @@ mod tests {
         // The in-memory keyring (held via Arc<RwLock<...>>) must have the
         // new epoch too.
         assert_eq!(key.read().await.current_epoch(), 2);
+    }
+
+    const ME: &str = "abcd1234";
+
+    fn at() -> DateTime<Utc> {
+        "2026-11-26T01:38:00Z".parse().unwrap()
+    }
+
+    #[test]
+    fn conflict_copy_names() {
+        let free = |_: &Path| false;
+        let name = |p: &str| conflict_copy_name(Path::new(p), ME, at(), free);
+        let tag = "(conflict from abcd1234 2026-11-26 013800 UTC)";
+        assert_eq!(name("notes.txt"), PathBuf::from(format!("notes {tag}.txt")));
+        assert_eq!(name("Makefile"), PathBuf::from(format!("Makefile {tag}")));
+        assert_eq!(name(".bashrc"), PathBuf::from(format!(".bashrc {tag}")));
+        assert_eq!(
+            name("dir/archive.tar.gz"),
+            PathBuf::from(format!("dir/archive.tar {tag}.gz"))
+        );
+        // Taken names get a counter before the extension.
+        let first = PathBuf::from(format!("notes {tag}.txt"));
+        let second = PathBuf::from(format!("notes {tag}-2.txt"));
+        let taken = |p: &Path| p == first.as_path() || p == second.as_path();
+        assert_eq!(
+            conflict_copy_name(Path::new("notes.txt"), ME, at(), taken),
+            PathBuf::from(format!("notes {tag}-3.txt"))
+        );
+        // Every generated name is a valid manifest path.
+        for p in [
+            "notes.txt",
+            "Makefile",
+            ".bashrc",
+            "dir/archive.tar.gz",
+            "a/b/.env",
+        ] {
+            let copy = name(p);
+            let s = copy.to_str().unwrap();
+            assert_eq!(transfer::manifest_path_to_rel(s).unwrap(), copy, "{s}");
+        }
+    }
+
+    fn h(b: &[u8]) -> [u8; 32] {
+        *blake3::hash(b).as_bytes()
+    }
+
+    fn files(entries: &[(&str, &[u8])]) -> FileMap {
+        entries
+            .iter()
+            .map(|(p, b)| (PathBuf::from(p), h(b)))
+            .collect()
+    }
+
+    fn remote() -> RemoteVersion {
+        let mut clock = VectorClock::new();
+        clock.increment(&"ee".repeat(32));
+        RemoteVersion {
+            manifest: "aa".repeat(32),
+            provider: "ee".repeat(32),
+            version_hash: "bb".repeat(32),
+            clock,
+            timestamp: at(),
+        }
+    }
+
+    fn state(manifest: FileMap, base: FileMap) -> ShareState {
+        ShareState {
+            version_hash: "cc".repeat(32),
+            manifest_hash: "dd".repeat(32),
+            clock: VectorClock::new(),
+            timestamp: at(),
+            manifest,
+            base,
+        }
+    }
+
+    fn write(root: &Path, rel: &str, b: &[u8]) {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, b).unwrap();
+    }
+
+    fn copies(root: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_name().to_string_lossy().contains("(conflict from "))
+            .map(|e| {
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(e.path()).unwrap(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn fast_forward_keeps_unannounced_edits_as_conflict_copies() {
+        let td = TmpDir::new("ff");
+        let root = td.path();
+        // We last had a=v1, b=v1, c=v1; a and c were edited since,
+        // without being announced.
+        write(root, "a.txt", b"local edit");
+        write(root, "b.txt", b"v1");
+        write(root, "c.txt", b"local edit of c");
+        let current = state(
+            files(&[("a.txt", b"v1"), ("b.txt", b"v1"), ("c.txt", b"v1")]),
+            FileMap::new(),
+        );
+        // Their newer version changes a and drops b and c.
+        let staged = transfer::staged_for_test(root, &[("a.txt", b"theirs")]);
+        let mut cache = BlobCache::default();
+        let (next, kept) = commit_remote(
+            root,
+            staged,
+            &remote(),
+            Some(&current),
+            &mut cache,
+            false,
+            ME,
+        )
+        .unwrap();
+        assert!(kept);
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"theirs");
+        assert!(!root.join("b.txt").exists(), "unchanged orphan is removed");
+        assert!(!root.join("c.txt").exists());
+        let c = copies(root);
+        assert_eq!(c.len(), 2, "{c:?}");
+        assert!(c
+            .iter()
+            .any(|(n, b)| n.starts_with("a ") && b == b"local edit"));
+        assert!(c
+            .iter()
+            .any(|(n, b)| n.starts_with("c ") && b == b"local edit of c"));
+        assert_eq!(next.manifest, files(&[("a.txt", b"theirs")]));
+        assert_eq!(next.base, next.manifest);
+    }
+
+    #[test]
+    fn fast_forward_overwrites_files_we_did_not_change() {
+        let td = TmpDir::new("ff-clean");
+        let root = td.path();
+        write(root, "a.txt", b"v1");
+        let current = state(files(&[("a.txt", b"v1")]), FileMap::new());
+        let staged = transfer::staged_for_test(root, &[("a.txt", b"v2")]);
+        let (_, kept) = commit_remote(
+            root,
+            staged,
+            &remote(),
+            Some(&current),
+            &mut BlobCache::default(),
+            false,
+            ME,
+        )
+        .unwrap();
+        assert!(!kept);
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v2");
+        assert!(copies(root).is_empty());
+    }
+
+    #[test]
+    fn concurrent_apply_measures_against_the_shared_base() {
+        let td = TmpDir::new("concurrent");
+        let root = td.path();
+        // Both sides had a=v0, b=v0, gone=v0. We changed a and added
+        // new; they changed b, and removed gone. Their version won.
+        write(root, "a.txt", b"ours");
+        write(root, "b.txt", b"v0");
+        write(root, "gone.txt", b"v0");
+        write(root, "new.txt", b"added by us");
+        let base = files(&[("a.txt", b"v0"), ("b.txt", b"v0"), ("gone.txt", b"v0")]);
+        let current = state(
+            files(&[
+                ("a.txt", b"ours"),
+                ("b.txt", b"v0"),
+                ("gone.txt", b"v0"),
+                ("new.txt", b"added by us"),
+            ]),
+            base,
+        );
+        let staged = transfer::staged_for_test(root, &[("a.txt", b"v0"), ("b.txt", b"theirs")]);
+        let (_, kept) = commit_remote(
+            root,
+            staged,
+            &remote(),
+            Some(&current),
+            &mut BlobCache::default(),
+            true,
+            ME,
+        )
+        .unwrap();
+        assert!(kept);
+        // Our edit to a survives as a copy; theirs keeps the name.
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"v0");
+        let c = copies(root);
+        assert_eq!(c.len(), 1, "{c:?}");
+        assert!(c[0].0.starts_with("a (conflict from abcd1234 ") && c[0].1 == b"ours");
+        // Only they changed b: no copy, their content.
+        assert_eq!(std::fs::read(root.join("b.txt")).unwrap(), b"theirs");
+        // Unchanged since the base and dropped by them: removed.
+        assert!(!root.join("gone.txt").exists());
+        // Added by us, unknown to them: kept under its own name.
+        assert_eq!(std::fs::read(root.join("new.txt")).unwrap(), b"added by us");
     }
 
     #[tokio::test]

@@ -13,7 +13,12 @@
 #   5. Nothing leaks into either share root (no staging files left over).
 #   6. While B fetches a large file from A, and A is stalled mid-transfer
 #      (SIGSTOP), B's share loop still runs: a local edit on B is noticed
-#      within seconds. Fetches run off the loop.
+#      within seconds. Fetches run off the loop. The two versions are
+#      concurrent; B's wins, and A keeps big.bin (B never had it) and
+#      republishes it, so both sides end with both files.
+#   7. Concurrent edits to one file: B is stopped, both edit same.txt,
+#      B starts. Both converge with the winning edit in same.txt and
+#      exactly one conflict copy holding the other.
 #
 # Usage: tests/e2e-sync.sh [path/to/rust-peerdup]   (default: target/debug)
 # Peers find each other on the local network (mDNS), so this runs on one
@@ -136,10 +141,38 @@ within 10 "B notices a local edit while its fetch is stalled" \
     more_than "local change detected" "$LOG_B" "$changes_before"
 [ ! -e "$ROOT_B/big.bin" ] || fail "big.bin applied while its provider was stopped"
 kill -CONT "$PID_A"
-# B's edit and A's big file are concurrent versions. Last-writer-wins
-# picks one whole version (B's, the later), so big.bin doesn't survive;
-# what matters here is that B kept running and both sides converge.
 wait_for "trees agree after the stalled fetch" same_tree
+for r in "$ROOT_A" "$ROOT_B"; do
+    [ -f "$r/big.bin" ] && [ -f "$r/during-fetch.txt" ] || fail "$r lost a side's file"
+done
+ok "both sides kept big.bin and B's edit"
+rm "$ROOT_A/big.bin"
+wait_for "big.bin's deletion reaches B" test ! -e "$ROOT_B/big.bin"
+
+info "Concurrent edits to the same file"
+echo "original" > "$ROOT_A/same.txt"
+wait_for "same.txt reaches B" grep -qx original "$ROOT_B/same.txt"
+sleep 3   # let B announce the version back, so A knows B has it
+kill -TERM "$PID_B"; wait "$PID_B" 2>/dev/null || true; PID_B=""
+changes_before="$(count "local change detected" "$LOG_A")"
+echo "edit on A" > "$ROOT_A/same.txt"
+wait_for "A publishes its edit" more_than "local change detected" "$LOG_A" "$changes_before"
+echo "edit on B" > "$ROOT_B/same.txt"
+"$BIN" --data-dir "$DATA_B" serve --no-dbus >>"$LOG_B" 2>&1 & PID_B=$!
+copies_in() { find "$1" -name 'same (conflict from *' -not -name '*.peerdup-tmp' | wc -l; }
+one_copy_each() {
+    same_tree && [ "$(copies_in "$ROOT_A")" -eq 1 ] && [ "$(copies_in "$ROOT_B")" -eq 1 ]
+}
+wait_for "both sides converge with one conflict copy" one_copy_each
+sleep 12   # one announce round: no further copies appear
+one_copy_each || fail "conflict copies kept multiplying"
+winner="$(cat "$ROOT_A/same.txt")"
+copy="$(cat "$(find "$ROOT_A" -name 'same (conflict from *')")"
+case "$winner/$copy" in
+    "edit on A/edit on B"|"edit on B/edit on A") ;;
+    *) fail "same.txt has '$winner' and the copy has '$copy'" ;;
+esac
+ok "same.txt has '$winner'; the conflict copy has the losing '$copy'"
 
 if find "$ROOT_A" "$ROOT_B" -name '*.peerdup-tmp' | grep -q .; then
     fail "staging files left in a share root"
