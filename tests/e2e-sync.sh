@@ -82,7 +82,7 @@ within() {
 count() { grep -c "$1" "$2" || true; }
 more_than() { [ "$(count "$1" "$2")" -gt "$3" ]; }
 
-export RUST_LOG="${RUST_LOG:-rust_peerdup=info}"
+export RUST_LOG="${RUST_LOG:-rust_peerdup=debug}"
 
 info "Setting up peers"
 mkdir -p "$ROOT_A/docs" "$ROOT_B"

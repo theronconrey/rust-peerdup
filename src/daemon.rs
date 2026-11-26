@@ -619,13 +619,25 @@ async fn sync_loop(
     // arrives meanwhile waits in `next`. Dropping `fetch` aborts the task,
     // and its staged files are removed.
     let (fetch_tx, mut fetch_rx) = mpsc::channel::<FetchDone>(1);
+    const SETTLE: Duration = Duration::from_millis(500);
+    let mut change_due: Option<tokio::time::Instant> = None;
     let mut fetch: Option<FetchTask> = None;
     let mut next: Option<RemoteVersion> = None;
     let mut generation: u64 = 0;
 
     loop {
         tokio::select! {
-            Some(()) = debounce(&mut watch_rx, Duration::from_millis(500)) => {
+            // Debounce: every event pushes the deadline back; the check runs
+            // once things have been quiet for SETTLE. Both arms are
+            // cancel-safe, so an event is never lost when another arm wins
+            // the select (the old `debounce()` future consumed the first
+            // event and dropped it whenever that happened).
+            Some(()) = watch_rx.recv() => {
+                change_due = Some(tokio::time::Instant::now() + SETTLE);
+            }
+            _ = sleep_until_due(change_due) => {
+                change_due = None;
+                tracing::debug!(share_id = %config.id, "filesystem changed; checking for a new version");
                 let outcome = {
                     let k = key.read().await;
                     handle_local_change(&config, &transfer, &root, &data_dir, &peer_id_hex, &k, state.as_ref(), &mut cache).await
@@ -1163,6 +1175,7 @@ async fn handle_local_change(
         return Ok(None);
     }
     let (new_vhash, new_manifest, files) = snapshot_content(root)?;
+    tracing::debug!(share_id = %config.id, files = files.len(), "snapshot taken");
     if current
         .map(|s| s.version_hash == new_vhash)
         .unwrap_or(false)
@@ -1170,6 +1183,7 @@ async fn handle_local_change(
         return Ok(None);
     }
     let manifest_hash = transfer.publish(root, &files, key, cache).await?;
+    tracing::debug!(share_id = %config.id, "published to the blob store");
     cache.save(data_dir, &config.id)?;
     let mut clock = current.map(|s| s.clock.clone()).unwrap_or_default();
     clock.increment(peer_id_hex);
@@ -1583,11 +1597,14 @@ fn spawn_fs_watcher(
                 // Skip events fully inside the shadow dir — those are our
                 // own writes; reacting would make us recompute and re-encrypt
                 // forever.
+                // Staged downloads (`*.peerdup-tmp`) are ours too; their
+                // rename into place still counts, since it names the
+                // destination as well.
                 let all_in_shadow = !ev.paths.is_empty()
-                    && ev
-                        .paths
-                        .iter()
-                        .all(|p| p.components().any(|c| c.as_os_str() == PEERDUP_DIR_NAME));
+                    && ev.paths.iter().all(|p| {
+                        p.components().any(|c| c.as_os_str() == PEERDUP_DIR_NAME)
+                            || p.to_string_lossy().ends_with(".peerdup-tmp")
+                    });
                 if !all_in_shadow {
                     let _ = tx.send(());
                 }
@@ -1601,20 +1618,11 @@ fn spawn_fs_watcher(
     Ok((watcher, tx_loop, rx))
 }
 
-/// Read one event, then keep reading until `settle` elapses without another
-/// event, then resolve. Collapses bursts (like an editor's atomic save:
-/// unlink + rename + write) into a single "change happened" signal.
-///
-/// Returns `Some(())` when a debounced change is ready, `None` when the
-/// watcher channel has closed.
-async fn debounce(rx: &mut UnboundedReceiver<()>, settle: Duration) -> Option<()> {
-    rx.recv().await?;
-    loop {
-        match tokio::time::timeout(settle, rx.recv()).await {
-            Ok(Some(())) => continue,
-            Ok(None) => return Some(()), // channel closed mid-debounce; deliver what we have
-            Err(_) => return Some(()),   // settled
-        }
+/// Resolves at `due`, or never if there is no change waiting.
+async fn sleep_until_due(due: Option<tokio::time::Instant>) {
+    match due {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending().await,
     }
 }
 
