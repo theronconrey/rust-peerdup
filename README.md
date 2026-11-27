@@ -47,8 +47,8 @@ writing:
 | Write permission enforced on sync announces (readers, revoked members) | ✅ Done (signed announces) |
 | 7. D-Bus IPC surface | ⚠️ Partial: CLI talks to the daemon over `org.peerdup.Daemon1`; no signals yet |
 | 6a. Transport: iroh-blobs over iroh | ✅ Done (spike checks open) |
-| 6. Only members can connect (replaces the BitTorrent admission gate) | ✅ Done for new connections; a revoked member's open connection isn't closed yet |
-| 7.5. Sync across networks | ⚠️ In progress: works via relays; conflict copies done; random topics next |
+| 6. Only members can connect (replaces the BitTorrent admission gate) | ✅ Done: a revoked member's open connections are closed, and blobs are served per share |
+| 7.5. Sync across networks | ⚠️ In progress: works via relays; conflict copies and random share topics done |
 
 Detailed design notes, including non-obvious gotchas about iroh and
 p2panda, live in [`INTEGRATION_NOTES.md`](INTEGRATION_NOTES.md). Read it
@@ -116,7 +116,9 @@ rust-peerdup whoami
 #   prints:  d18c65e7…
 
 # 2. On A: create a share and invite B.
-rust-peerdup share-add --topic mydemo --path ~/Sync/mydemo --role sync
+rust-peerdup share-add --name mydemo --path ~/Sync/mydemo --role sync
+#   --name is only a label; the share's id and gossip topic come from a
+#   random secret, which the invite carries. (--topic still works.)
 SHARE_ID=$(rust-peerdup share-list | tail -1 | awk '{print $1}')
 rust-peerdup share-invite "$SHARE_ID" <B-pubkey-hex> --auth-role writer
 #   prints the ticket string. Send it to B over a secure channel.
@@ -131,6 +133,12 @@ journalctl --user -u rust-peerdup -f  # watch sync events live
 ```
 
 Edits in either share root propagate within ~1–2 seconds.
+
+Invites are ticket format v4; tickets from older builds are refused.
+A share made before random topics keeps working with its old id and
+gossip topic, which derive from its name and can be guessed; the daemon
+warns about it at start. To move it to a random topic, create a new
+share on the same folder and invite the members again.
 
 For two daemons on the **same** machine (e.g. local smoke testing), give
 each its own data dir (`tests/e2e-sync.sh` does exactly this):
@@ -148,7 +156,9 @@ rust-peerdup share-revoke  <share-id> <peer-pubkey-hex>
 ```
 
 A revocation rotates the share key and sends the new key to the remaining
-members. Until a member has it, that member publishes nothing new, and no
+members. A revoked peer that is in none of your other shares is
+disconnected at once (every open connection, not just new ones), and
+each share's files are served only to that share's members. Until a member has it, that member publishes nothing new, and no
 member accepts new content encrypted under an older key. Members that are
 offline during a revocation still trust the revoked peer until they hear of
 it (see `SECURITY.md`).
@@ -218,12 +228,13 @@ uninstall.sh                        remove binary + unit + activation (keeps dat
 Tests are in-module (`#[cfg(test)] mod tests`); run with `cargo test`.
 
 End-to-end tests, each a script that starts real daemons (CI runs all
-three against the binary from the RPM):
+four against the binary from the RPM):
 
 ```bash
-tests/e2e-sync.sh   target/debug/rust-peerdup   # two peers, one network
-tests/e2e-revoke.sh target/debug/rust-peerdup   # owner, writers, reader; revoke; old keys
-tests/e2e-xnet.sh   target/debug/rust-peerdup   # two isolated networks (docker)
+tests/e2e-sync.sh      target/debug/rust-peerdup   # two peers, one network
+tests/e2e-revoke.sh    target/debug/rust-peerdup   # owner, writers, reader; revoke; old keys
+tests/e2e-isolation.sh target/debug/rust-peerdup   # two shares; live revoke over D-Bus (needs dbus-daemon)
+tests/e2e-xnet.sh      target/debug/rust-peerdup   # two isolated networks (docker)
 ```
 
 ## Contributing

@@ -54,8 +54,9 @@ impl Daemon1Iface {
         Ok(self.rt.identity.verifying_key().to_hex())
     }
 
-    /// Return all configured shares as `(id, topic, root_path, role,
-    /// created_at_rfc3339)` tuples. Reads from disk (single source of
+    /// Return all configured shares as `(id, name, root_path, role,
+    /// created_at_rfc3339)` tuples. The second field was the topic string
+    /// before ticket v4; it is the share's name now, never its secret. Reads from disk (single source of
     /// truth for share configs); the running daemon's spawned-task map
     /// is a subset of this list (shares may exist on disk but not yet be
     /// running, e.g. immediately after `share-add` before the spawn task
@@ -71,7 +72,7 @@ impl Daemon1Iface {
             };
             out.push((
                 c.id,
-                c.topic,
+                c.name,
                 c.root_path.display().to_string(),
                 role.to_string(),
                 c.created_at.to_rfc3339(),
@@ -83,7 +84,7 @@ impl Daemon1Iface {
     /// Add a new share to disk and spawn its share task. Returns the
     /// allocated share id. The share is bootstrapped with this daemon as
     /// auth-group Owner, mirroring the Phase 5c CLI's `share-add` body.
-    async fn share_add(&self, topic: &str, path: &str, role: &str) -> zbus::fdo::Result<String> {
+    async fn share_add(&self, name: &str, path: &str, role: &str) -> zbus::fdo::Result<String> {
         let role = ShareRole::from_str(role)
             .map_err(|e| fdo_err(anyhow::anyhow!("invalid role {role:?}: {e}")))?;
         let path = PathBuf::from(path);
@@ -95,12 +96,13 @@ impl Daemon1Iface {
 
         // Hold both runtime locks together while we check for an existing
         // share with the same id and spawn the new task. This avoids the
-        // race where two concurrent ShareAdd calls with the same topic
-        // both pass the existence check.
+        // race where two concurrent ShareAdd calls for the same id both
+        // pass the existence check (ids are random now, so that takes a
+        // collision; the check stays cheap insurance).
         let mut shares_guard = self.rt.shares.lock().await;
         let mut tasks_guard = self.rt.tasks.lock().await;
 
-        let config = ShareConfig::new(topic.to_string(), path, role);
+        let config = ShareConfig::create(name.to_string(), path, role).map_err(fdo_err)?;
         let share_id = config.id.clone();
 
         if shares_guard.contains_key(&share_id) {

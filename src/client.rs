@@ -51,10 +51,10 @@ impl DaemonClient {
         self.call_no_args("ShareList").await
     }
 
-    pub async fn share_add(&self, topic: &str, path: &Path, role: &str) -> Result<String> {
+    pub async fn share_add(&self, name: &str, path: &Path, role: &str) -> Result<String> {
         let path_str = path.to_string_lossy().into_owned();
         self.proxy
-            .call("ShareAdd", &(topic, path_str.as_str(), role))
+            .call("ShareAdd", &(name, path_str.as_str(), role))
             .await
             .map_err(map_call_err)
     }

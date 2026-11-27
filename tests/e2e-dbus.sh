@@ -162,7 +162,7 @@ ok "all 10 methods present in introspection"
 
 mkdir -p "$SHARE_DIR"
 echo "phase7-content" > "$SHARE_DIR/file1.txt"
-"$BIN" share-add --topic "$TOPIC" --path "$SHARE_DIR" --role sync >/dev/null \
+"$BIN" share-add --name "$TOPIC" --path "$SHARE_DIR" --role sync >/dev/null \
     || fail "share-add via D-Bus failed"
 ok "share-add succeeded"
 

@@ -98,7 +98,7 @@ Quick reference:
       $BIN_NAME whoami
 
   Create a share (you become its Owner):
-      $BIN_NAME share-add --topic <name> --path <folder> --role sync
+      $BIN_NAME share-add --name <name> --path <folder> --role sync
 
   Invite another peer (they ran 'whoami' and sent you their pubkey):
       $BIN_NAME share-invite <share-id> <invitee-pubkey> --auth-role writer

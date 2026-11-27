@@ -47,8 +47,14 @@ them do):
   refuse anything new under the old key, so they don't spread it, but
   only the revocation reaching the lagging member stops the direct path.
   Details in `INTEGRATION_NOTES.md`, "Old keys after revocation".
-- After a revocation, a peer that already had a connection open keeps it
-  until it closes (`INTEGRATION_NOTES.md`, "Known gaps").
+- A peer revoked from one share that is still a member of another share
+  on the same daemon keeps its connection, and can keep hearing the first
+  share's gossip (announced hashes, clocks, membership changes) over it.
+  It can't fetch that share's files or decrypt anything new
+  (`INTEGRATION_NOTES.md`, "Members-only connections").
+- Shares made before random topics (ticket v4) keep a gossip topic
+  derived from their name, which others can guess; re-create them to get
+  a random one (`INTEGRATION_NOTES.md`, "Share identity and topics").
 - Two Owners revoking or rotating at the same moment can leave the share
   unable to publish until one of them runs `share-rotate-key` (it fails
   closed; see "Old keys after revocation").

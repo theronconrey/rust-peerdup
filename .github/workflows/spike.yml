@@ -30,7 +30,7 @@ jobs:
       - name: Install Fedora tooling
         run: >
           dnf -y install git-core rpm-build cargo rust clippy rustfmt
-          cargo-rpm-macros dnf-plugins-core
+          cargo-rpm-macros dnf-plugins-core dbus-daemon
 
       - uses: actions/checkout@v5
 
@@ -68,6 +68,7 @@ jobs:
           cargo build --locked
           tests/e2e-sync.sh target/debug/rust-peerdup
           tests/e2e-revoke.sh target/debug/rust-peerdup
+          tests/e2e-isolation.sh target/debug/rust-peerdup
 
       - uses: actions/upload-artifact@v4
         with:

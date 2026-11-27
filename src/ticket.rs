@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 use crate::auth::{group_id_for, AuthState, MemberId, SignedOp};
 use crate::crypto::KEY_LEN;
-use crate::share::{ShareConfig, ShareRole};
+use crate::share::{ShareConfig, ShareRole, ShareTopic};
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -12,11 +12,13 @@ use serde::{Deserialize, Serialize};
 pub const MAX_TICKET_BYTES: usize = 1024 * 1024;
 
 /// Current ticket schema version. 2 added the auth-log snapshot (Phase 5c);
-/// 3 added the inviter's network address. Older tickets are refused.
-pub const TICKET_VERSION: u8 = 3;
+/// 3 added the inviter's network address; 4 replaced the topic string
+/// with the share's random topic secret and a separate name. Older
+/// tickets are refused.
+pub const TICKET_VERSION: u8 = 4;
 
 /// A share invitation. Contains everything a receiving peer needs to join
-/// the share locally: the topic (so gossip lines up), the per-share keyring
+/// the share locally: the topic secret (so gossip lines up), the per-share keyring
 /// (so the receiver can decrypt content), the auth-log snapshot (so the
 /// receiver can replay group membership and recognise themselves as a
 /// member), and a suggested role.
@@ -29,13 +31,15 @@ pub const TICKET_VERSION: u8 = 3;
 /// under an old epoch.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Ticket {
-    /// Schema version of the ticket format itself. Current: 2.
+    /// Schema version of the ticket format itself (`TICKET_VERSION`).
     pub version: u8,
-    /// Logical share id (`hex(blake3(topic))[..16]`). Receivers use this
-    /// directly as the share id; it doesn't need to be recomputed.
+    /// Share id. `decode` checks it derives from `topic`.
     pub share_id: String,
-    /// Topic string. Receivers will hash it to derive the gossip topic.
-    pub topic: String,
+    /// The share's name, a label (`share::validate_name`).
+    pub name: String,
+    /// The share's topic secret (or, for a share made before v4, its
+    /// legacy topic string): the share id and gossip topic derive from it.
+    pub topic: ShareTopic,
     /// Concatenated 32-byte keys, epoch N's key at index N-1. Same wire
     /// format as `keys.bin` on disk.
     pub keys: Vec<[u8; KEY_LEN]>,
@@ -91,12 +95,13 @@ impl Ticket {
         }
         // share_id becomes a directory name; it must be the one the topic
         // derives, which also makes it 16 hex characters.
-        if ticket.share_id != crate::share::id_from_topic(&ticket.topic) {
+        if ticket.share_id != ticket.topic.share_id() {
             return Err(anyhow!(
                 "ticket share id {:?} does not match its topic",
                 ticket.share_id
             ));
         }
+        crate::share::validate_name(&ticket.name).context("ticket share name")?;
         ticket.role.ensure_encrypted()?;
         Ok(ticket)
     }
@@ -162,6 +167,7 @@ pub fn install_join(
     }
     let cfg = ShareConfig {
         id: ticket.share_id.clone(),
+        name: ticket.name.clone(),
         topic: ticket.topic.clone(),
         root_path,
         role: ticket.role,
@@ -186,16 +192,21 @@ pub fn install_join(
 mod tests {
     use super::*;
     use crate::auth::{group_id_for, AuthRole, AuthState, MemberId};
+    use crate::share::TopicSecret;
     use p2panda_core::SigningKey;
 
-    fn make_log() -> (SigningKey, SigningKey, Vec<SignedOp>) {
-        make_log_for("demo")
+    fn demo() -> ShareTopic {
+        ShareTopic::Secret(TopicSecret::from_bytes([42u8; 32]))
     }
 
-    fn make_log_for(topic: &str) -> (SigningKey, SigningKey, Vec<SignedOp>) {
+    fn make_log() -> (SigningKey, SigningKey, Vec<SignedOp>) {
+        make_log_for(&demo())
+    }
+
+    fn make_log_for(topic: &ShareTopic) -> (SigningKey, SigningKey, Vec<SignedOp>) {
         let alice = SigningKey::generate();
         let bob = SigningKey::generate();
-        let group = group_id_for(&crate::share::id_from_topic(topic));
+        let group = group_id_for(&topic.share_id());
         let mut state = AuthState::empty_for(group);
         state.create_group(&alice, group).unwrap();
         state
@@ -214,8 +225,9 @@ mod tests {
         let (_alice, bob, log) = make_log();
         let t = Ticket {
             version: TICKET_VERSION,
-            share_id: crate::share::id_from_topic("demo"),
-            topic: "demo".into(),
+            share_id: demo().share_id(),
+            name: "demo".into(),
+            topic: demo(),
             keys: vec![[1u8; KEY_LEN], [2u8; KEY_LEN]],
             auth_log: log.clone(),
             invitee_pubkey: *bob.verifying_key().as_bytes(),
@@ -225,6 +237,7 @@ mod tests {
         let s = t.encode().unwrap();
         let back = Ticket::decode(&s).unwrap();
         assert_eq!(back.share_id, t.share_id);
+        assert_eq!(back.name, t.name);
         assert_eq!(back.topic, t.topic);
         assert_eq!(back.keys, t.keys);
         assert_eq!(back.role, t.role);
@@ -239,8 +252,9 @@ mod tests {
     fn ticket_with(log: Vec<SignedOp>, invitee: &SigningKey) -> Ticket {
         Ticket {
             version: TICKET_VERSION,
-            share_id: crate::share::id_from_topic("demo"),
-            topic: "demo".into(),
+            share_id: demo().share_id(),
+            name: "demo".into(),
+            topic: demo(),
             keys: vec![[1u8; KEY_LEN]],
             auth_log: log,
             invitee_pubkey: *invitee.verifying_key().as_bytes(),
@@ -272,7 +286,8 @@ mod tests {
         assert!(err.contains("different public key"), "{err}");
 
         // A log for another share's group.
-        let (_, other_bob, other_log) = make_log_for("another-share");
+        let other = ShareTopic::Secret(TopicSecret::generate());
+        let (_, other_bob, other_log) = make_log_for(&other);
         assert!(ticket_with(other_log, &other_bob)
             .verified_auth_state(me(&other_bob))
             .is_err());
@@ -312,8 +327,9 @@ mod tests {
         let (_alice, bob, log) = make_log();
         let mut t = Ticket {
             version: 1,
-            share_id: crate::share::id_from_topic("demo"),
-            topic: "demo".into(),
+            share_id: demo().share_id(),
+            name: "demo".into(),
+            topic: demo(),
             keys: vec![[1u8; KEY_LEN]],
             auth_log: log,
             invitee_pubkey: *bob.verifying_key().as_bytes(),
@@ -334,7 +350,8 @@ mod tests {
         let t = Ticket {
             version: TICKET_VERSION,
             share_id: "../../../../tmp/evil".into(),
-            topic: "demo".into(),
+            name: "demo".into(),
+            topic: demo(),
             keys: vec![[7u8; KEY_LEN]],
             auth_log: log,
             invitee_pubkey: *bob.verifying_key().as_bytes(),
@@ -355,8 +372,9 @@ mod tests {
             .with_relay_url(crate::bootstrap::default_relay_urls()[0].clone());
         let t = Ticket {
             version: TICKET_VERSION,
-            share_id: crate::share::id_from_topic("demo"),
-            topic: "demo".into(),
+            share_id: demo().share_id(),
+            name: "demo".into(),
+            topic: demo(),
             keys: vec![[3u8; KEY_LEN]],
             auth_log: log,
             invitee_pubkey: *bob.verifying_key().as_bytes(),
@@ -365,5 +383,74 @@ mod tests {
         };
         let back = Ticket::decode(&t.encode().unwrap()).unwrap();
         assert_eq!(back.inviter_addr, Some(addr));
+    }
+
+    fn v4(topic: ShareTopic, share_id: String, name: &str) -> Ticket {
+        let (_alice, bob, log) = make_log_for(&topic);
+        Ticket {
+            version: TICKET_VERSION,
+            share_id,
+            name: name.into(),
+            topic,
+            keys: vec![[5u8; KEY_LEN]],
+            auth_log: log,
+            invitee_pubkey: *bob.verifying_key().as_bytes(),
+            role: ShareRole::Sync,
+            inviter_addr: None,
+        }
+    }
+
+    #[test]
+    fn v4_carries_the_secret_and_checks_the_id_against_it() {
+        let secret = ShareTopic::Secret(TopicSecret::generate());
+        let t = v4(secret.clone(), secret.share_id(), "photos");
+        let back = Ticket::decode(&t.encode().unwrap()).unwrap();
+        assert_eq!(back.topic, secret);
+        assert_eq!(back.topic.gossip_topic(), secret.gossip_topic());
+
+        // Another share's id with this secret (or the other way round).
+        let other = TopicSecret::generate();
+        let err = Ticket::decode(
+            &v4(secret.clone(), other.share_id(), "photos")
+                .encode()
+                .unwrap(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("does not match its topic"), "{err}");
+        // The id a legacy topic of the same name would have.
+        let legacy_id = ShareTopic::Legacy("photos".into()).share_id();
+        assert!(Ticket::decode(&v4(secret, legacy_id, "photos").encode().unwrap()).is_err());
+    }
+
+    #[test]
+    fn legacy_shares_can_still_be_invited_to() {
+        let legacy = ShareTopic::Legacy("old-share".into());
+        let t = v4(legacy.clone(), legacy.share_id(), "old-share");
+        let back = Ticket::decode(&t.encode().unwrap()).unwrap();
+        assert_eq!(back.topic, legacy);
+        assert_eq!(
+            back.share_id,
+            blake3::hash(b"old-share").to_hex().as_str()[..16]
+        );
+    }
+
+    #[test]
+    fn a_hostile_name_is_refused() {
+        let secret = ShareTopic::Secret(TopicSecret::generate());
+        let t = v4(secret.clone(), secret.share_id(), "\u{1b}]0;owned\u{7}");
+        let err = Ticket::decode(&t.encode().unwrap()).unwrap_err();
+        assert!(format!("{err:#}").contains("control characters"), "{err:#}");
+    }
+
+    #[test]
+    fn a_v3_ticket_is_refused() {
+        let secret = ShareTopic::Secret(TopicSecret::generate());
+        let mut t = v4(secret.clone(), secret.share_id(), "photos");
+        t.version = 3;
+        let err = Ticket::decode(&t.encode().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unsupported ticket version"), "{err}");
     }
 }

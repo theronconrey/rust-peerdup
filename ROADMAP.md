@@ -22,7 +22,7 @@ guesses, not commitments. Add 50% if part-time, double for "with surprises."
 | 6a. Transport decision | ✅ Decided: iroh-blobs over iroh (see `INTEGRATION_NOTES.md`, "Transport: iroh-blobs"); spike checks open | — |
 | 6. Swarm admission gate | ✅ Replaced: members-only connection gate on the iroh endpoint (`access.rs`); no librqbit hook needed | — |
 | 7. D-Bus IPC surface | ⚠️ Partial: methods and activation done; no signals, bus name not final | 1 week |
-| 7.5. Make it real across machines | 👉 In progress: cross-network sync, members-only connections and signed announces, old key epochs refused after a revocation, fetches off the loop, size limits and conflict copies done (all in CI); random topics still to do | 2–3 weeks left |
+| 7.5. Make it real across machines | 👉 In progress: cross-network sync, members-only connections (live ones closed on revocation) and signed announces, per-share blob access, random share topics, old key epochs refused after a revocation, fetches off the loop, size limits and conflict copies done (all in CI) | 2–3 weeks left |
 | 7.6. Formats and release engineering | Planned | 1–2 weeks |
 | 8. Linux UI (GTK4/libadwaita app) | Planned | 6–10 weeks |
 | 9. Other platforms (Linux Flatpak GUI; Windows, macOS) | Planned | 8–12 weeks |
@@ -354,7 +354,14 @@ would put these gaps in front of users.
   silent last-write-wins. *Done (`daemon::commit_remote`).*
 - Random 32-byte share topics generated at `share-add` and carried in the
   ticket; the human-readable name becomes a label. Today's user-chosen
-  topics collide and are guessable.
+  topics collide and are guessable. *Done: ticket v4, `--name`
+  (INTEGRATION_NOTES, "Share identity and topics"); shares made before
+  keep their guessable topic until re-created.*
+- Revocation cuts a revoked node's live connections, and a member of one
+  share can't fetch another share's blobs. *Done (`src/access.rs`,
+  `tests/e2e-isolation.sh`). A node still in another share keeps its
+  connection and can still hear the share's gossip (iroh-gossip has no
+  per-topic gate); rotating the topic on revocation is the next step.*
 - Bind rotation signatures to the share (group id in the signed bytes).
 - Auth CRDT: process remote ops on a copy and commit only on success; cap
   the pending buffer; check the group id; check the local role before

@@ -10,8 +10,9 @@
 #   4. A revokes B. A new file from A reaches C but never B (B is refused
 #      at the connection and can't decrypt the new epoch anyway).
 #   5. B's edits after its revocation never reach A.
-#   6. C learns of the revocation over gossip (B leaves its member list)
-#      and installs the rotated key, with an auth log well over 4 KiB:
+#   6. C learns of the revocation over gossip (B leaves its member list),
+#      blocks B and closes B's live connections, and installs the rotated
+#      key, with an auth log well over 4 KiB:
 #      A also invites $EXTRA throwaway members that never run a daemon.
 #      p2panda-net's default 4 KiB message limit used to drop these
 #      messages (wire format v4); no daemon may log a publish failure.
@@ -90,7 +91,7 @@ export RUST_LOG="${RUST_LOG:-rust_peerdup=info}"
 info "A creates a share and invites B and D (writers) and C (reader)"
 mkdir -p "$(root a)" "$(root b)" "$(root c)" "$(root d)"
 echo "hello from A" > "$(root a)/hello.txt"
-pd a share-add --topic "e2e-revoke-$$-$RANDOM" --path "$(root a)" --role sync >/dev/null
+pd a share-add --name "e2e-revoke-$$-$RANDOM" --path "$(root a)" --role sync >/dev/null
 share="$(pd a share-list | awk 'NR>1 {print $1; exit}')"
 pub_b="$(pd b whoami)"; pub_c="$(pd c whoami)"; pub_d="$(pd d whoami)"
 pd a share-invite "$share" "$pub_b" --auth-role writer 2>/dev/null | pd b share-join - --path "$(root b)" >/dev/null
@@ -141,6 +142,16 @@ pd a share-members "$share" | grep -q "$pub_b" && fail "B still listed as a memb
 ok "B is no longer a member"
 wait_for "C learns over gossip that B was revoked" c_dropped_b
 wait_for "C installs the rotated key" c_rotated
+# C ran throughout; B was only a member of this share, so C blocks it and
+# closes the connections B has open to it, not just new ones.
+# (Field names are coloured in the log, hence the sed.)
+cut_b_lines() {
+    sed -e 's/\x1b\[[0-9;]*m//g' "$SCRATCH/c.log" \
+        | grep "no longer a member of any share" | grep "node=$pub_b"
+}
+c_cut_b() { cut_b_lines | grep -q .; }
+wait_for "C cuts B off once it learns of the revocation" c_cut_b
+cut_b_lines | head -1 | cut -c1-220 | sed 's/^/    /'
 
 info "A adds a file after the revocation"
 echo "after revoking B" > "$(root a)/secret.txt"

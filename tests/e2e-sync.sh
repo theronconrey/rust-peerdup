@@ -89,7 +89,7 @@ mkdir -p "$ROOT_A/docs" "$ROOT_B"
 echo "hello from A" > "$ROOT_A/hello.txt"
 head -c 3000000 /dev/urandom > "$ROOT_A/docs/blob.bin"   # spans many chunks
 
-"$BIN" --data-dir "$DATA_A" share-add --topic "e2e-sync-$$-$RANDOM" --path "$ROOT_A" --role sync >/dev/null
+"$BIN" --data-dir "$DATA_A" share-add --name "e2e-sync-$$-$RANDOM" --path "$ROOT_A" --role sync >/dev/null
 SHARE_ID="$("$BIN" --data-dir "$DATA_A" share-list | awk 'NR>1 {print $1; exit}')"
 [ -n "$SHARE_ID" ] || fail "no share id from share-list"
 PUB_B="$("$BIN" --data-dir "$DATA_B" whoami)"
