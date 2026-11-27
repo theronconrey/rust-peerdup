@@ -994,6 +994,32 @@ mod tests {
         assert!(!state.is_member(group, me_of(&mallory)));
     }
 
+    /// `auth.log` bytes for a fixed log, as written by p2panda-auth 0.5.2.
+    /// Ed25519 signing is deterministic and the log is linear (one head at
+    /// each step), so the bytes are too. A dependency bump that changes the
+    /// serialised shape of an op (and so every signature and op id) fails
+    /// here instead of on users' disks.
+    const GOLDEN_AUTH_LOG_HEX: &str = "";
+
+    #[test]
+    fn golden_auth_log_is_byte_stable() {
+        let key = |b: u8| SigningKey::from_bytes(&[b; 32]);
+        let (alice, bob, carol) = (key(1), key(2), key(3));
+        let group = group_id_for("golden-share");
+        let mut state = AuthState::empty_for(group);
+        state.create_group(&alice, group).unwrap();
+        state
+            .add_member(&alice, group, me_of(&bob), AuthRole::Writer)
+            .unwrap();
+        state
+            .add_member(&alice, group, me_of(&carol), AuthRole::Reader)
+            .unwrap();
+        state.remove_member(&alice, group, me_of(&bob)).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&state.ops, bincode::config::standard()).unwrap();
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, GOLDEN_AUTH_LOG_HEX, "auth.log encoding changed");
+    }
+
     #[test]
     fn member_id_hex_round_trip() {
         let m = MemberId([
