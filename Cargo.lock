@@ -3228,10 +3228,11 @@ dependencies = [
 
 [[package]]
 name = "p2panda-auth"
-version = "0.5.2"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69f9d1950cb8c605a0b476162d2b5abf6ea83a7145f572f601c1012a72688cb2"
+checksum = "ae9b2f2e6b73cd743b5ad745f48b438165f48eeb8a08ee412fb78d7c05738d59"
 dependencies = [
+ "p2panda-core",
  "petgraph",
  "serde",
  "thiserror 2.0.18",
@@ -3239,9 +3240,9 @@ dependencies = [
 
 [[package]]
 name = "p2panda-core"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac464c3443a03b1f0e8d492e2cabf26a55a75f694aa2e6d67be90e3fdf461c45"
+checksum = "83755e5571066a25f75b32d6db668faba317ff7af2c8fc0fc18e0ead93475f0b"
 dependencies = [
  "blake3",
  "cbor-core",
