@@ -16,10 +16,8 @@
 use crate::data_dir;
 use anyhow::{anyhow, Context, Result};
 use p2panda_auth::group::resolver::StrongRemove;
-use p2panda_auth::group::{
-    GroupAction, GroupControlMessage, GroupCrdt, GroupCrdtState, GroupMember,
-};
-use p2panda_auth::traits::{IdentityHandle, Operation, OperationId, Orderer};
+use p2panda_auth::group::{GroupAction, GroupCrdt, GroupCrdtState, GroupMember};
+use p2panda_auth::traits::Operation;
 use p2panda_auth::{Access, AccessLevel};
 use p2panda_core::{Signature, SigningKey, VerifyingKey};
 
@@ -27,7 +25,6 @@ use p2panda_core::{Signature, SigningKey, VerifyingKey};
 pub const SIGNATURE_LEN: usize = 64;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::convert::Infallible;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -74,7 +71,7 @@ impl fmt::Display for MemberId {
     }
 }
 
-impl IdentityHandle for MemberId {}
+impl p2panda_core::Author for MemberId {}
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct OpId(pub [u8; 32]);
@@ -95,7 +92,13 @@ impl fmt::Debug for OpId {
     }
 }
 
-impl OperationId for OpId {}
+impl fmt::Display for OpId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_hex())
+    }
+}
+
+impl p2panda_core::OperationId for OpId {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -134,11 +137,21 @@ impl fmt::Display for AuthRole {
     }
 }
 
+/// The signed payload of an auth op. p2panda-auth 0.8 dropped its
+/// `GroupControlMessage`; this is the same struct, so an op serialises to
+/// the same bytes and existing `auth.log` files, signatures and op ids stay
+/// valid. Don't reorder or retype its fields.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupControlMessage {
+    pub group_id: MemberId,
+    pub action: GroupAction<MemberId, ()>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SignedOp {
     pub author: MemberId,
     pub deps: Vec<OpId>,
-    pub payload: GroupControlMessage<MemberId, ()>,
+    pub payload: GroupControlMessage,
     #[serde(with = "serde_bytes_64")]
     pub signature: [u8; SIGNATURE_LEN],
 }
@@ -213,7 +226,7 @@ impl SignedOp {
     }
 }
 
-impl Operation<MemberId, OpId, GroupControlMessage<MemberId, ()>> for SignedOp {
+impl Operation<MemberId, OpId, ()> for SignedOp {
     fn id(&self) -> OpId {
         self.compute_id()
     }
@@ -223,38 +236,11 @@ impl Operation<MemberId, OpId, GroupControlMessage<MemberId, ()>> for SignedOp {
     fn dependencies(&self) -> Vec<OpId> {
         self.deps.clone()
     }
-    fn payload(&self) -> GroupControlMessage<MemberId, ()> {
-        self.payload.clone()
+    fn group_id(&self) -> MemberId {
+        self.payload.group_id
     }
-}
-
-/// We construct operations directly (signed at the application layer) and
-/// only use `GroupCrdt::process`, never `GroupCrdt::prepare` or the
-/// high-level `Groups` API. So the orderer's `next_message` hook is never
-/// called; the other two methods are stubbed to be inert.
-#[derive(Debug, Default, Clone)]
-pub struct NoOpOrderer;
-
-impl Orderer<MemberId, OpId, GroupControlMessage<MemberId, ()>> for NoOpOrderer {
-    type State = ();
-    type Operation = SignedOp;
-    type Error = Infallible;
-
-    fn next_message(
-        _y: Self::State,
-        _payload: &GroupControlMessage<MemberId, ()>,
-    ) -> Result<(Self::State, Self::Operation), Self::Error> {
-        unreachable!("peerdup constructs auth ops directly via AuthState::*")
-    }
-
-    fn queue(y: Self::State, _msg: &Self::Operation) -> Result<Self::State, Self::Error> {
-        Ok(y)
-    }
-
-    fn next_ready_message(
-        y: Self::State,
-    ) -> Result<(Self::State, Option<Self::Operation>), Self::Error> {
-        Ok((y, None))
+    fn action(&self) -> GroupAction<MemberId, ()> {
+        self.payload.action.clone()
     }
 }
 
@@ -268,9 +254,9 @@ pub const MAX_OP_BYTES: usize = 64 * 1024;
 /// Cap on ops buffered while their dependencies are missing.
 const MAX_PENDING_OPS: usize = 256;
 
-type Resolver = StrongRemove<MemberId, OpId, (), SignedOp>;
-type Crdt = GroupCrdt<MemberId, OpId, (), Resolver, NoOpOrderer>;
-type CrdtState = GroupCrdtState<MemberId, OpId, (), NoOpOrderer>;
+type Resolver = StrongRemove<MemberId, OpId, SignedOp, ()>;
+type Crdt = GroupCrdt<MemberId, OpId, SignedOp, (), Resolver>;
+type CrdtState = GroupCrdtState<MemberId, OpId, SignedOp, ()>;
 
 pub struct AuthState {
     /// The share's group. Every op must be for it, and the first one must
@@ -290,7 +276,7 @@ impl AuthState {
     pub fn empty_for(group: MemberId) -> Self {
         Self {
             group,
-            crdt: CrdtState::new(()),
+            crdt: CrdtState::new(),
             ops: Vec::new(),
             pending: Vec::new(),
         }
@@ -361,7 +347,7 @@ impl AuthState {
         action: GroupAction<MemberId, ()>,
     ) -> Result<SignedOp> {
         let me = MemberId(*my_key.verifying_key().as_bytes());
-        let deps: Vec<OpId> = self.crdt.inner.heads().into_iter().collect();
+        let deps: Vec<OpId> = self.crdt.inner.heads(&[self.group]).into_iter().collect();
         let payload = GroupControlMessage { group_id, action };
         let canonical =
             bincode::serde::encode_to_vec((&me, &deps, &payload), bincode::config::standard())
@@ -454,7 +440,8 @@ impl AuthState {
         // from the ops already applied (they applied once, so they apply
         // again) rather than leaving an empty group behind, which would then
         // reject every rotation.
-        let prev = std::mem::replace(&mut self.crdt, CrdtState::new(()));
+        self.check_self_remove(&op)?;
+        let prev = std::mem::replace(&mut self.crdt, CrdtState::new());
         match Crdt::process(prev, &op) {
             Ok(next) => {
                 self.crdt = next;
@@ -468,8 +455,40 @@ impl AuthState {
         }
     }
 
+    /// p2panda-auth 0.7 lets any member sign its own `Remove` (upstream
+    /// #1234; 0.5.2 required a manager). peerdup counts every `Remove` in
+    /// effect toward the required key epoch, and only an Owner's revocation
+    /// rotates the key, so a Reader's self-removal would raise the required
+    /// epoch past every key and stop the share. Refuse it unless the author
+    /// was an Owner at the op's dependencies, which is what 0.5.2 accepted.
+    /// Runs with the op's dependencies applied.
+    fn check_self_remove(&self, op: &SignedOp) -> Result<()> {
+        let GroupAction::Remove {
+            member: GroupMember::Individual(removed),
+        } = &op.payload.action
+        else {
+            return Ok(());
+        };
+        if *removed != op.author {
+            return Ok(());
+        }
+        let heads: HashSet<OpId> = op.deps.iter().copied().collect();
+        let members = Crdt::members_at(&self.crdt, heads, self.group)
+            .map_err(|e| anyhow!("auth crdt error: {e:?}"))?;
+        let was_owner = members
+            .iter()
+            .any(|(m, a)| *m == op.author && a.level == AccessLevel::Manage);
+        if !was_owner {
+            return Err(anyhow!(
+                "refusing a self-removal by a non-Owner ({})",
+                op.author.to_hex()
+            ));
+        }
+        Ok(())
+    }
+
     fn rebuild_from_log(&mut self) -> Result<()> {
-        let mut crdt = CrdtState::new(());
+        let mut crdt = CrdtState::new();
         for op in &self.ops {
             crdt = Crdt::process(crdt, op)
                 .map_err(|e| anyhow!("rebuilding auth state from its log: {e:?}"))?;
@@ -748,7 +767,7 @@ mod tests {
             };
             // A Create with no deps (a fresh root) and one built on the
             // current heads (as if authored with a full copy of the log).
-            let heads: Vec<OpId> = state.crdt.inner.heads().into_iter().collect();
+            let heads: Vec<OpId> = state.crdt.inner.heads(&[group]).into_iter().collect();
             for op in [create(Vec::new()), create(heads)] {
                 let _ = state.apply_remote(op);
                 assert_eq!(
@@ -975,7 +994,7 @@ mod tests {
         state
             .add_member(&alice, group, me_of(&carol), AuthRole::Writer)
             .unwrap();
-        let before: Vec<OpId> = state.crdt.inner.heads().into_iter().collect();
+        let before: Vec<OpId> = state.crdt.inner.heads(&[group]).into_iter().collect();
         state.remove_member(&alice, group, me_of(&mallory)).unwrap();
         assert_eq!(state.required_epoch(), 2);
 
@@ -994,12 +1013,49 @@ mod tests {
         assert!(!state.is_member(group, me_of(&mallory)));
     }
 
-    /// `auth.log` bytes for a fixed log, as written by p2panda-auth 0.5.2.
+    /// p2panda-auth 0.8 itself applies a Reader's self-removal; our guard
+    /// refuses it, so the required epoch doesn't move without a rotation.
+    #[test]
+    fn a_readers_self_removal_is_refused() {
+        let alice = fresh_key();
+        let bob = fresh_key();
+        let group = group_id_for("share-self-remove");
+        let mut state = AuthState::empty_for(group);
+        state.create_group(&alice, group).unwrap();
+        state
+            .add_member(&alice, group, me_of(&bob), AuthRole::Reader)
+            .unwrap();
+        let heads: Vec<OpId> = state.crdt.inner.heads(&[group]).into_iter().collect();
+        let leave = forge(
+            &bob,
+            heads,
+            GroupAction::Remove {
+                member: GroupMember::Individual(me_of(&bob)),
+            },
+            group,
+        );
+
+        // Upstream, without our guard: the CRDT takes it.
+        let mut raw = CrdtState::new();
+        for op in state.ops() {
+            raw = Crdt::process(raw, op).unwrap();
+        }
+        let raw = Crdt::process(raw, &leave).expect("0.8 accepts a self-removal");
+        assert!(!raw.members(group).iter().any(|(m, _)| *m == me_of(&bob)));
+
+        // Through AuthState: refused, nothing changes.
+        assert!(state.apply_remote(leave).is_err());
+        assert!(state.is_member(group, me_of(&bob)));
+        assert_eq!(state.required_epoch(), 1);
+    }
+
+    /// `auth.log` bytes for a fixed log, as written by p2panda-auth 0.5.2
+    /// (spike run 45930566953).
     /// Ed25519 signing is deterministic and the log is linear (one head at
     /// each step), so the bytes are too. A dependency bump that changes the
     /// serialised shape of an op (and so every signature and op id) fails
     /// here instead of on users' disks.
-    const GOLDEN_AUTH_LOG_HEX: &str = "";
+    const GOLDEN_AUTH_LOG_HEX: &str = "048a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c00388caa2dcdd877f0bf3e0fff6d45467419de4af125c4ba46a1f6c172a951e26d0001008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c0003406d1e03f7c8eae48127727bd726c1ea64e10290dc32854859b80aec8a2ace59e6c43785b5d7fdbf56b234d76528e516f4853acfd6e4996ce80ca00945469ce50e8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c01b181280d3b841f49a5e64624586e25cb5a678a5a930fdbe3bcbfc6d9fc92ad20388caa2dcdd877f0bf3e0fff6d45467419de4af125c4ba46a1f6c172a951e26d01008139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3940002405dd89445d86b3ea21f000bb0dcc4137d992dc5da2cff0969366811d7a7d6cf94d2d663a7bb76732bd7a73b75f89f800c0d72cc6655ac9635ff48eb0a8939b1018a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c01abc38666cb2bb1d59987578cda04c1b266099fc99e2f4224f8edad7f22f74d72388caa2dcdd877f0bf3e0fff6d45467419de4af125c4ba46a1f6c172a951e26d0100ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1000140ce5d0e0c1dac5e1769921d0e13963c9de8219428799c8f4dfb9de204ed9c8368e5b9cce316d6eeee5017f803d36313fde269198488a347b296e3eb2fcce2a30a8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c01e5cff498627b6f92a69fc59c752a650c8f1ad8afab30214d734ba2f8d358fb39388caa2dcdd877f0bf3e0fff6d45467419de4af125c4ba46a1f6c172a951e26d02008139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b39440d4cea867aeef19f89335b2b8cfca7fe07a5cb8331e02151a06d84ef7f5d5b0eb72d3ba74dad7b099eab53cad64d3568d3d9a6789175d9dc33561cb36c4bd7f03";
 
     #[test]
     fn golden_auth_log_is_byte_stable() {
