@@ -10,7 +10,7 @@ readme = "README.md"
 [dependencies]
 p2panda-net = "0.8.1"
 p2panda-core = "0.8.1"
-p2panda-auth = { version = "0.5.2", features = ["serde"] }
+p2panda-auth = { version = "0.8.2", features = ["serde"] }
 # Pinned exactly: 0.105 is not yet production quality upstream, and the
 # blob store's on-disk format may change between releases.
 iroh-blobs = { version = "=0.105.0", features = ["fs-store"] }
