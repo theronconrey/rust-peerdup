@@ -6,7 +6,7 @@ use crate::clock::{ClockOrdering, VectorClock};
 use crate::crypto::{self, InstallOutcome, KeyRing};
 use crate::epochs;
 use crate::rotation::{self, SignedRotation, VerifyOutcome};
-use crate::share::{ShareConfig, ShareRole};
+use crate::share::{self, ShareConfig, ShareRole};
 use crate::share_state::{self, PersistedState};
 use crate::ticket::{self, Ticket, TICKET_VERSION};
 use crate::transfer::{self, BlobCache, FileHash, Transfer, PEERDUP_DIR_NAME};
@@ -43,6 +43,33 @@ const ROTATION_BUFFER_CAP: usize = 64;
 /// memo is cleared when the required epoch changes and when it fills.
 const REFUSED_MEMO_CAP: usize = 256;
 
+/// How often a share announces its version, auth log and pending rotations.
+const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Announce ticks a leaving node keeps sending its auth log, with its own
+/// `Remove`, before it drops the share: six, about 50 s (the first goes
+/// out at once). Once any member has the op, every member re-sends the
+/// whole log each tick, so the leaver only has to reach one of them; six
+/// tries ride out lost gossip messages and a peer that is just
+/// reconnecting, and the Owners' rotation does not wait for it. A member
+/// that applies the op cuts the leaver's connections (`access.rs`), so
+/// staying longer gains little. If no member is online meanwhile, the
+/// leave stays local: the others still list this node until an Owner
+/// revokes it.
+const LEAVE_GRACE_TICKS: u32 = 6;
+
+/// How long an Owner other than the share's designated rotator (its
+/// lowest-id Owner) waits before it mints the key a leave needs itself:
+/// six announce ticks. The designated rotator mints at once and re-sends
+/// its rotation every tick, so this rides out lost messages before a
+/// second Owner risks minting the same epoch (a fork, which fails closed:
+/// `try_install_rotation`), and bounds the stall when the designated
+/// rotator is offline.
+const LEAVE_ROTATE_GRACE: Duration = Duration::from_secs(60);
+
+/// The running shares' command senders, by share id.
+pub type SharesMap = Arc<Mutex<HashMap<String, mpsc::Sender<ShareCommand>>>>;
+
 /// Command sent from an IPC handler into the running share task. Each variant
 /// pairs a request with a `oneshot::Sender` for the reply, so per-share state
 /// (auth log, keyring, pending rotations) only mutates inside the share loop's
@@ -63,6 +90,11 @@ pub enum ShareCommand {
     },
     Members {
         reply: oneshot::Sender<Result<Vec<(MemberId, AuthRole)>>>,
+    },
+    /// Leave the share: author our own `Remove`, tell the other members
+    /// for `LEAVE_GRACE_TICKS`, then remove the share's state here.
+    Leave {
+        reply: oneshot::Sender<Result<()>>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -119,7 +151,7 @@ pub struct DaemonRuntime {
     pub access: Arc<Access>,
     /// `share_id -> mpsc tx for ShareCommand`. Populated when a share task is
     /// spawned, removed on shutdown / `share-remove`.
-    pub shares: Arc<Mutex<HashMap<String, mpsc::Sender<ShareCommand>>>>,
+    pub shares: SharesMap,
     /// All share tasks. The select loop in `serve()` polls this for
     /// unexpected exits; the IPC layer pushes new tasks here on
     /// `ShareAdd`/`ShareJoin`.
@@ -302,6 +334,7 @@ pub async fn spawn_share_task(
     let access = rt.access.clone();
     let identity = rt.identity.clone();
     let data_dir = rt.data_dir.clone();
+    let shares = rt.shares.clone();
     let peer_id_hex = identity.verifying_key().to_hex();
     let share_id_for_ctx = config.id.clone();
 
@@ -312,6 +345,7 @@ pub async fn spawn_share_task(
             gossip,
             address_book,
             access,
+            shares,
             data_dir,
             peer_id_hex,
             identity,
@@ -501,6 +535,7 @@ async fn run_share(
     gossip: Gossip,
     address_book: AddressBook,
     access: Arc<Access>,
+    shares: SharesMap,
     data_dir: PathBuf,
     peer_id_hex: String,
     identity: SigningKey,
@@ -539,6 +574,7 @@ async fn run_share(
                 gossip,
                 address_book,
                 access,
+                shares,
                 topic,
                 data_dir,
                 peer_id_hex,
@@ -566,6 +602,7 @@ async fn sync_loop(
     gossip: Gossip,
     address_book: AddressBook,
     access: Arc<Access>,
+    shares: SharesMap,
     topic: Topic,
     data_dir: PathBuf,
     peer_id_hex: String,
@@ -600,6 +637,29 @@ async fn sync_loop(
         .set_members(&config.id, member_ids(&auth_state, group_id))
         .await;
     let topic_handle = gossip.stream(topic).await?;
+    let me = MemberId(*identity.verifying_key().as_bytes());
+    // `share-leave` in direct mode, or a daemon stopped while leaving.
+    if share::is_leaving(&data_dir, &config.id) {
+        match record_leave(&data_dir, &config.id, &identity, &mut auth_state) {
+            Ok(()) => {
+                return finish_leave(
+                    &config,
+                    &data_dir,
+                    &access,
+                    &shares,
+                    &topic_handle,
+                    &auth_state,
+                    &mut cmd_rx,
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::error!(error = ?e, share_id = %config.id,
+                    "could not leave the share; it keeps running here");
+                let _ = std::fs::remove_file(share::leaving_path(&data_dir, &config.id));
+            }
+        }
+    }
     let mut sub = topic_handle.subscribe();
     tracing::info!(share_id = %config.id, root = %root.display(), "sync started");
 
@@ -637,7 +697,7 @@ async fn sync_loop(
 
     let (_watcher, watch_tx, mut watch_rx) =
         spawn_fs_watcher(&root).with_context(|| format!("watching {root:?}"))?;
-    let mut announce_tick = tokio::time::interval(Duration::from_secs(10));
+    let mut announce_tick = tokio::time::interval(ANNOUNCE_INTERVAL);
     announce_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     announce_tick.tick().await;
 
@@ -662,8 +722,62 @@ async fn sync_loop(
     // memo was built under.
     let mut refused: HashSet<String> = HashSet::new();
     let mut refused_under = required_now(&auth_state, epoch_floor);
+    // Removals no key covers yet (a member left): since when, whether the
+    // wait was logged, and when to try again after a failed rotation.
+    let mut gap_since: Option<tokio::time::Instant> = None;
+    let mut told_wait = false;
+    let mut rotate_retry: Option<tokio::time::Instant> = None;
 
     loop {
+        // A member left and no key covers it yet: an Owner mints one, the
+        // designated rotator at once, the others after a grace period
+        // (`auto_rotation`). A revocation's key is minted with its Remove.
+        {
+            let have = key.read().await.current_epoch();
+            let gap_age = if auth_state.required_epoch() > have {
+                gap_since
+                    .get_or_insert_with(tokio::time::Instant::now)
+                    .elapsed()
+            } else {
+                gap_since = None;
+                told_wait = false;
+                Duration::ZERO
+            };
+            let buffered = rotation_buffer.iter().any(|r| r.epoch > have);
+            let may_try = rotate_retry.is_none_or(|t| tokio::time::Instant::now() >= t);
+            match auto_rotation(&auth_state, group_id, me, have, buffered, gap_age) {
+                AutoRotate::Now if may_try => {
+                    match auto_rotate(
+                        &config,
+                        &data_dir,
+                        &identity,
+                        &key,
+                        &auth_state,
+                        &mut pending_rotations,
+                    )
+                    .await
+                    {
+                        Ok(epoch) => {
+                            rotate_retry = None;
+                            tracing::info!(share_id = %config.id, epoch,
+                                "a member left: rotated the share key and queued it for the remaining members");
+                        }
+                        Err(e) => {
+                            rotate_retry = Some(tokio::time::Instant::now() + ANNOUNCE_INTERVAL);
+                            tracing::warn!(error = ?e, share_id = %config.id,
+                                "a member left, but rotating the share key failed; retrying");
+                        }
+                    }
+                }
+                AutoRotate::Wait if !told_wait => {
+                    told_wait = true;
+                    tracing::info!(share_id = %config.id, have, grace_secs = LEAVE_ROTATE_GRACE.as_secs(),
+                        "a member left; waiting for the share's first Owner to send the next key \
+                         (this node mints it if it hasn't arrived after the grace period)");
+                }
+                _ => {}
+            }
+        }
         // Whenever the keyring has advanced past the version we publish
         // (a revocation or rotation here, or a rotated key installed from
         // gossip), or a change waited for the key, publish now: the same
@@ -741,7 +855,7 @@ async fn sync_loop(
                 publish_pending_rotations(&topic_handle, &pending_rotations, &config.id).await;
             }
             Some(cmd) = cmd_rx.recv() => {
-                let exit = handle_share_command(
+                let next = handle_share_command(
                     cmd,
                     &config,
                     &data_dir,
@@ -751,9 +865,26 @@ async fn sync_loop(
                     &mut pending_rotations,
                     epoch_floor,
                 ).await;
-                if exit {
-                    access.remove_share(&config.id).await;
-                    return Ok(());
+                match next {
+                    AfterCommand::Continue => {}
+                    AfterCommand::Exit => {
+                        access.remove_share(&config.id).await;
+                        return Ok(());
+                    }
+                    AfterCommand::Leave => {
+                        // Nothing is fetched or published from here on.
+                        drop(fetch.take());
+                        return finish_leave(
+                            &config,
+                            &data_dir,
+                            &access,
+                            &shares,
+                            &topic_handle,
+                            &auth_state,
+                            &mut cmd_rx,
+                        )
+                        .await;
+                    }
                 }
                 // An invite or a revocation may have changed who's in.
                 access.set_members(&config.id, member_ids(&auth_state, group_id)).await;
@@ -949,7 +1080,7 @@ async fn handle_published(
                 share_id,
                 have,
                 required,
-                "local change waits for the rotated key from a revocation; \
+                "local change waits for the share's next key (a member left or was revoked); \
                  it is published once the key arrives"
             );
             return None;
@@ -997,8 +1128,16 @@ async fn handle_published(
     Some(new_state)
 }
 
-/// Dispatch a `ShareCommand` against the share-loop's owned state. Returns
-/// `true` iff the loop should exit (Shutdown).
+/// What the share loop does after a command.
+enum AfterCommand {
+    Continue,
+    /// Shutdown: stop the share task.
+    Exit,
+    /// Leave: our `Remove` is saved; tell the others, then drop the share.
+    Leave,
+}
+
+/// Dispatch a `ShareCommand` against the share-loop's owned state.
 #[allow(clippy::too_many_arguments)]
 async fn handle_share_command(
     cmd: ShareCommand,
@@ -1009,7 +1148,7 @@ async fn handle_share_command(
     auth_state: &mut AuthState,
     pending_rotations: &mut Vec<SignedRotation>,
     epoch_floor: u64,
-) -> bool {
+) -> AfterCommand {
     match cmd {
         ShareCommand::Invite {
             invitee,
@@ -1030,7 +1169,7 @@ async fn handle_share_command(
             )
             .await;
             let _ = reply.send(result);
-            false
+            AfterCommand::Continue
         }
         ShareCommand::Revoke { target, reply } => {
             let result = handle_revoke(
@@ -1045,7 +1184,7 @@ async fn handle_share_command(
             )
             .await;
             let _ = reply.send(result);
-            false
+            AfterCommand::Continue
         }
         ShareCommand::RotateKey { reply } => {
             let result = handle_rotate_key(
@@ -1059,20 +1198,220 @@ async fn handle_share_command(
             )
             .await;
             let _ = reply.send(result);
-            false
+            AfterCommand::Continue
         }
         ShareCommand::Members { reply } => {
             let group_id = auth::group_id_for(&config.id);
             let mut members = auth_state.members(group_id);
             members.sort_by_key(|(m, _)| m.0);
             let _ = reply.send(Ok(members));
-            false
+            AfterCommand::Continue
+        }
+        ShareCommand::Leave { reply } => {
+            let result = record_leave(data_dir, &config.id, identity, auth_state);
+            let ok = result.is_ok();
+            let _ = reply.send(result);
+            if ok {
+                AfterCommand::Leave
+            } else {
+                AfterCommand::Continue
+            }
         }
         ShareCommand::Shutdown { reply } => {
             let _ = reply.send(());
-            true
+            AfterCommand::Exit
         }
     }
+}
+
+/// Author and save this node's own `Remove` (unless it already left),
+/// then write the `leaving` marker, so a daemon stopped before it has
+/// told the others finishes the leave on its next start. Shared by the
+/// daemon and direct mode. Refused for a non-member and for the only
+/// Owner (`AuthState::leave`).
+pub fn record_leave(
+    data_dir: &Path,
+    share_id: &str,
+    identity: &SigningKey,
+    auth_state: &mut AuthState,
+) -> Result<()> {
+    let group_id = auth::group_id_for(share_id);
+    let me = MemberId(*identity.verifying_key().as_bytes());
+    if !auth_state.has_left(group_id, me) {
+        auth_state.leave(identity, group_id)?;
+        auth::save(data_dir, share_id, auth_state)?;
+    }
+    share::mark_leaving(data_dir, share_id)
+}
+
+/// Send the auth log (with our `Remove`) for `LEAVE_GRACE_TICKS` announce
+/// ticks, then remove the share's state here as `share-remove` does: the
+/// plaintext files in the share root stay. Nothing is fetched or
+/// published meanwhile. A Shutdown (daemon stopping, or `share-remove`)
+/// ends it early; the marker stays, so the next start finishes the leave
+/// unless the share was removed.
+async fn finish_leave(
+    config: &ShareConfig,
+    data_dir: &Path,
+    access: &Access,
+    shares: &SharesMap,
+    topic_handle: &GossipHandle,
+    auth_state: &AuthState,
+    cmd_rx: &mut mpsc::Receiver<ShareCommand>,
+) -> Result<()> {
+    tracing::info!(share_id = %config.id, ticks = LEAVE_GRACE_TICKS,
+        "left the share; telling the other members before removing it here");
+    let mut tick = tokio::time::interval(ANNOUNCE_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut sent = 0u32;
+    while sent < LEAVE_GRACE_TICKS {
+        tokio::select! {
+            // The first tick completes at once.
+            _ = tick.tick() => {
+                publish_auth_ops(topic_handle, auth_state, &config.id).await;
+                sent += 1;
+            }
+            Some(cmd) = cmd_rx.recv() => {
+                if reply_while_leaving(cmd, auth_state, &config.id) {
+                    access.remove_share(&config.id).await;
+                    return Ok(());
+                }
+            }
+        }
+    }
+    access.remove_share(&config.id).await;
+    shares.lock().await.remove(&config.id);
+    share::remove(data_dir, &config.id)?;
+    let shadow = config.root_path.join(PEERDUP_DIR_NAME);
+    if shadow.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&shadow) {
+            tracing::warn!(error = %e, path = %shadow.display(), "could not remove the shadow dir");
+        }
+    }
+    tracing::info!(share_id = %config.id, root = %config.root_path.display(),
+        "left the share and removed it from this machine; its files stay");
+    Ok(())
+}
+
+/// Answer a command that arrives while leaving. Returns `true` for
+/// Shutdown.
+fn reply_while_leaving(cmd: ShareCommand, auth_state: &AuthState, share_id: &str) -> bool {
+    let leaving = || anyhow!("this node is leaving share {share_id}");
+    match cmd {
+        ShareCommand::Invite { reply, .. } => {
+            let _ = reply.send(Err(leaving()));
+        }
+        ShareCommand::Revoke { reply, .. } | ShareCommand::RotateKey { reply } => {
+            let _ = reply.send(Err(leaving()));
+        }
+        ShareCommand::Members { reply } => {
+            let mut members = auth_state.members(auth::group_id_for(share_id));
+            members.sort_by_key(|(m, _)| m.0);
+            let _ = reply.send(Ok(members));
+        }
+        ShareCommand::Leave { reply } => {
+            let _ = reply.send(Ok(()));
+        }
+        ShareCommand::Shutdown { reply } => {
+            let _ = reply.send(());
+            return true;
+        }
+    }
+    false
+}
+
+/// What an Owner's share loop does about removals no key covers yet.
+#[derive(Debug, PartialEq, Eq)]
+enum AutoRotate {
+    /// No gap, not an Owner, or the gap is a revocation's (its Owner
+    /// minted the key with the Remove; it is on its way).
+    Nothing,
+    /// Another Owner is expected to mint it (or a rotation for a later
+    /// epoch is buffered, so the missing one is on its way).
+    Wait,
+    /// Mint the missing epochs now.
+    Now,
+}
+
+/// Should this node mint the key a leave needs? Only when its keyring is
+/// behind `AuthState::required_epoch`, it is an Owner, the uncovered
+/// removals are leaves (`uncovered_removals_are_leaves`), and no rotation
+/// for a later epoch is buffered. The designated rotator, the current
+/// Owner with the lowest `MemberId`, mints at once; the other Owners only
+/// once the gap has lasted `LEAVE_ROTATE_GRACE`. A fork, if two still mint
+/// the same epoch, fails closed through the epoch floor. The floor itself
+/// is left out: healing a fork stays a manual `share-rotate-key`.
+fn auto_rotation(
+    auth_state: &AuthState,
+    group_id: MemberId,
+    me: MemberId,
+    current_epoch: u64,
+    rotation_buffered: bool,
+    gap_age: Duration,
+) -> AutoRotate {
+    let required = auth_state.required_epoch();
+    if current_epoch >= required {
+        return AutoRotate::Nothing;
+    }
+    if auth_state.role_of(group_id, me) != Some(AuthRole::Owner) {
+        return AutoRotate::Nothing;
+    }
+    if !auth_state.uncovered_removals_are_leaves(required - current_epoch) {
+        return AutoRotate::Nothing;
+    }
+    if rotation_buffered {
+        return AutoRotate::Wait;
+    }
+    let rotator = auth_state
+        .members(group_id)
+        .into_iter()
+        .filter(|(_, r)| *r == AuthRole::Owner)
+        .map(|(m, _)| m)
+        .min();
+    if rotator == Some(me) || gap_age >= LEAVE_ROTATE_GRACE {
+        AutoRotate::Now
+    } else {
+        AutoRotate::Wait
+    }
+}
+
+/// Mint epochs until the keyring meets `AuthState::required_epoch`, each
+/// sent to the other current members like a revocation's. Several leaves
+/// before a rotation need several epochs: keys are installed in order.
+/// Returns the new epoch.
+async fn auto_rotate(
+    config: &ShareConfig,
+    data_dir: &Path,
+    identity: &SigningKey,
+    key: &Arc<RwLock<KeyRing>>,
+    auth_state: &AuthState,
+    pending_rotations: &mut Vec<SignedRotation>,
+) -> Result<u64> {
+    let group_id = auth::group_id_for(&config.id);
+    let me = MemberId(*identity.verifying_key().as_bytes());
+    let mut others = member_ids(auth_state, group_id);
+    others.retain(|m| *m != me);
+    others.sort_by_key(|m| m.0);
+    let target = auth_state.required_epoch();
+    let mut epoch = key.read().await.current_epoch();
+    let mut result = Ok(epoch);
+    while epoch < target {
+        match rotation::mint_and_queue(data_dir, &config.id, identity, group_id, &others) {
+            Ok((e, chunks)) => {
+                pending_rotations.extend(chunks);
+                epoch = e;
+                result = Ok(e);
+            }
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        }
+    }
+    // Reload even after a failure part-way: keys.bin may have advanced.
+    let fresh = crypto::load_or_create_keyring(data_dir, &config.id)?;
+    *key.write().await = fresh;
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1145,6 +1484,9 @@ async fn handle_revoke(
         return Err(anyhow!("share {} has no auth state on disk", config.id));
     }
     auth_state.require_owner(group_id, identity)?;
+    if target == MemberId(*identity.verifying_key().as_bytes()) {
+        return Err(anyhow!("to remove this node from a share, use share-leave"));
+    }
     if !auth_state.is_member(group_id, target) {
         return Err(anyhow!(
             "{} is not a current member of share {}",
@@ -2779,6 +3121,249 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    fn add(
+        state: &mut AuthState,
+        owner: &SigningKey,
+        group: MemberId,
+        m: &SigningKey,
+        r: AuthRole,
+    ) {
+        state.add_member(owner, group, me_of(m), r).unwrap();
+    }
+
+    /// A Reader leaves: the Owner mints epoch 2 for the remaining members
+    /// (not the leaver), and then has nothing left to do. Two more leaves
+    /// before a rotation need two more epochs.
+    #[tokio::test]
+    async fn an_owner_rotates_once_a_member_leaves() {
+        let (td, config, identity, mut auth_state, key) = bootstrap("leave-rotate");
+        let group = group_id_for(&config.id);
+        let (writer, reader) = (SigningKey::generate(), SigningKey::generate());
+        add(&mut auth_state, &identity, group, &writer, AuthRole::Writer);
+        add(&mut auth_state, &identity, group, &reader, AuthRole::Reader);
+        auth_state.leave(&reader, group).unwrap();
+        assert_eq!(auth_state.required_epoch(), 2);
+        let me = me_of(&identity);
+        assert_eq!(
+            auto_rotation(&auth_state, group, me, 1, false, Duration::ZERO),
+            AutoRotate::Now
+        );
+
+        let mut pending = Vec::new();
+        let epoch = auto_rotate(
+            &config,
+            td.path(),
+            &identity,
+            &key,
+            &auth_state,
+            &mut pending,
+        )
+        .await
+        .unwrap();
+        assert_eq!(epoch, 2);
+        assert_eq!(key.read().await.current_epoch(), 2);
+        assert_eq!(pending.len(), 1);
+        match rotation::verify_and_decrypt(&pending[0], &auth_state, group, &writer) {
+            VerifyOutcome::OkForUs(k) => {
+                assert_eq!(&k, key.read().await.key_for_epoch(2).unwrap())
+            }
+            other => panic!("expected OkForUs, got {other:?}"),
+        }
+        assert!(matches!(
+            rotation::verify_and_decrypt(&pending[0], &auth_state, group, &reader),
+            VerifyOutcome::NotForUs
+        ));
+        assert_eq!(
+            auto_rotation(&auth_state, group, me, 2, false, Duration::ZERO),
+            AutoRotate::Nothing
+        );
+
+        let (r2, r3) = (SigningKey::generate(), SigningKey::generate());
+        add(&mut auth_state, &identity, group, &r2, AuthRole::Reader);
+        add(&mut auth_state, &identity, group, &r3, AuthRole::Reader);
+        auth_state.leave(&r2, group).unwrap();
+        auth_state.leave(&r3, group).unwrap();
+        assert_eq!(
+            auto_rotation(&auth_state, group, me, 2, false, Duration::ZERO),
+            AutoRotate::Now
+        );
+        let epoch = auto_rotate(
+            &config,
+            td.path(),
+            &identity,
+            &key,
+            &auth_state,
+            &mut pending,
+        )
+        .await
+        .unwrap();
+        assert_eq!(epoch, 4);
+        assert_eq!(pending.len(), 3);
+        assert_eq!(
+            rotation::load_pending(td.path(), &config.id).unwrap().len(),
+            3
+        );
+    }
+
+    #[test]
+    fn a_non_owner_never_rotates_for_a_leave() {
+        let (_td, config, identity, mut auth_state, _key) = bootstrap("leave-writer");
+        let group = group_id_for(&config.id);
+        let (writer, reader) = (SigningKey::generate(), SigningKey::generate());
+        add(&mut auth_state, &identity, group, &writer, AuthRole::Writer);
+        add(&mut auth_state, &identity, group, &reader, AuthRole::Reader);
+        auth_state.leave(&reader, group).unwrap();
+        for age in [Duration::ZERO, LEAVE_ROTATE_GRACE * 10] {
+            for m in [&writer, &reader] {
+                assert_eq!(
+                    auto_rotation(&auth_state, group, me_of(m), 1, false, age),
+                    AutoRotate::Nothing
+                );
+            }
+        }
+    }
+
+    /// Two Owners: the one with the lower id rotates at once, the other
+    /// only after the grace period. Neither mints while a rotation for a
+    /// later epoch is buffered (the missing one is on its way).
+    #[test]
+    fn the_lowest_owner_rotates_first_and_the_others_wait() {
+        let (_td, config, identity, mut auth_state, _key) = bootstrap("leave-order");
+        let group = group_id_for(&config.id);
+        let (owner2, reader) = (SigningKey::generate(), SigningKey::generate());
+        add(&mut auth_state, &identity, group, &owner2, AuthRole::Owner);
+        add(&mut auth_state, &identity, group, &reader, AuthRole::Reader);
+        auth_state.leave(&reader, group).unwrap();
+        let (low, high) = {
+            let (a, b) = (me_of(&identity), me_of(&owner2));
+            (a.min(b), a.max(b))
+        };
+        let decide = |m, buffered, age| auto_rotation(&auth_state, group, m, 1, buffered, age);
+        assert_eq!(decide(low, false, Duration::ZERO), AutoRotate::Now);
+        assert_eq!(decide(high, false, Duration::ZERO), AutoRotate::Wait);
+        assert_eq!(
+            decide(high, false, LEAVE_ROTATE_GRACE - Duration::from_secs(1)),
+            AutoRotate::Wait
+        );
+        assert_eq!(decide(high, false, LEAVE_ROTATE_GRACE), AutoRotate::Now);
+        assert_eq!(decide(low, true, Duration::ZERO), AutoRotate::Wait);
+        assert_eq!(decide(high, true, LEAVE_ROTATE_GRACE * 2), AutoRotate::Wait);
+
+        // The designated rotator itself leaves: the other Owner is now
+        // the lowest, and rotates at once.
+        let leaver = if low == me_of(&identity) {
+            &identity
+        } else {
+            &owner2
+        };
+        auth_state.leave(leaver, group).unwrap();
+        assert_eq!(auth_state.required_epoch(), 3);
+        assert_eq!(
+            auto_rotation(&auth_state, group, high, 1, false, Duration::ZERO),
+            AutoRotate::Now
+        );
+    }
+
+    /// A revocation rotates synchronously, so the revoking Owner has no
+    /// gap left to fill; and a gap from another Owner's revocation is
+    /// that Owner's to fill (its key comes with the Remove), so nobody
+    /// auto-rotates for it.
+    #[tokio::test]
+    async fn no_auto_rotation_for_a_revocation() {
+        let (td, config, identity, mut auth_state, key) = bootstrap("leave-revoke");
+        let group = group_id_for(&config.id);
+        let (owner2, writer, reader) = (
+            SigningKey::generate(),
+            SigningKey::generate(),
+            SigningKey::generate(),
+        );
+        add(&mut auth_state, &identity, group, &owner2, AuthRole::Owner);
+        add(&mut auth_state, &identity, group, &writer, AuthRole::Writer);
+        add(&mut auth_state, &identity, group, &reader, AuthRole::Reader);
+        let me = me_of(&identity);
+
+        let epoch = handle_revoke(
+            &config,
+            td.path(),
+            &identity,
+            &key,
+            &mut auth_state,
+            &mut Vec::new(),
+            me_of(&writer),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(epoch, 2);
+        assert_eq!(
+            auto_rotation(&auth_state, group, me, 2, false, LEAVE_ROTATE_GRACE * 2),
+            AutoRotate::Nothing
+        );
+
+        // The other Owner revokes the reader; its epoch-3 key hasn't
+        // arrived here yet.
+        auth_state
+            .remove_member(&owner2, group, me_of(&reader))
+            .unwrap();
+        assert_eq!(auth_state.required_epoch(), 3);
+        for m in [me, me_of(&owner2)] {
+            assert_eq!(
+                auto_rotation(&auth_state, group, m, 2, false, LEAVE_ROTATE_GRACE * 2),
+                AutoRotate::Nothing
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn revoking_yourself_points_to_share_leave() {
+        let (td, config, identity, mut auth_state, key) = bootstrap("revoke-self");
+        let group = group_id_for(&config.id);
+        let owner2 = SigningKey::generate();
+        add(&mut auth_state, &identity, group, &owner2, AuthRole::Owner);
+        let err = handle_revoke(
+            &config,
+            td.path(),
+            &identity,
+            &key,
+            &mut auth_state,
+            &mut Vec::new(),
+            me_of(&identity),
+            0,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("share-leave"), "{err}");
+        assert!(auth_state.is_member(group, me_of(&identity)));
+    }
+
+    /// `record_leave` saves the Remove and the marker, does nothing more
+    /// the second time, and refuses the only Owner without writing either.
+    #[test]
+    fn record_leave_saves_the_remove_and_the_marker() {
+        let (td, config, identity, mut auth_state, _key) = bootstrap("leave-record");
+        let group = group_id_for(&config.id);
+        let err = record_leave(td.path(), &config.id, &identity, &mut auth_state).unwrap_err();
+        assert!(format!("{err:#}").contains("only Owner"), "{err:#}");
+        assert!(!share::is_leaving(td.path(), &config.id));
+        assert_eq!(auth_state.required_epoch(), 1);
+
+        let bob = SigningKey::generate();
+        add(&mut auth_state, &identity, group, &bob, AuthRole::Writer);
+        // Bob's own copy of the log, on Bob's machine.
+        let mut bobs = AuthState::empty_for(group);
+        for op in auth_state.ops() {
+            bobs.apply_remote(op.clone()).unwrap();
+        }
+        record_leave(td.path(), &config.id, &bob, &mut bobs).unwrap();
+        assert!(share::is_leaving(td.path(), &config.id));
+        assert!(bobs.has_left(group, me_of(&bob)));
+        let n = bobs.ops().len();
+        assert_eq!(auth::load(td.path(), &config.id).unwrap().ops().len(), n);
+        record_leave(td.path(), &config.id, &bob, &mut bobs).unwrap();
+        assert_eq!(bobs.ops().len(), n, "no second Remove");
     }
 
     fn shared_state(epoch: u64) -> ShareState {

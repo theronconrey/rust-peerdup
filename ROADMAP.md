@@ -42,6 +42,7 @@ closes; a UI on top of them would show them to users.
 | 5c. `p2panda-auth` group CRDT integration | ✅ Done (members/revoke CLI, gossip, signed ops, `auth.log` persistence) |
 | 5d. Auto key rotation on revocation | ✅ Done |
 | 5e. 4-peer revocation e2e test | ✅ Done (`tests/e2e-revoke.sh`) |
+| Members leave on their own | 🧪 Spike: `share-leave`, auto-rotation by the lowest-id Owner (`tests/e2e-leave.sh`); two Owners leaving at once is a known gap |
 
 **Total to v1.0:** roughly 10–14 months of focused work from here. The
 earlier 6–9 month figure left out cross-machine sync (7.5), format and

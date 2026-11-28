@@ -58,5 +58,15 @@ them do):
 - Two Owners revoking or rotating at the same moment can leave the share
   unable to publish until one of them runs `share-rotate-key` (it fails
   closed; see "Old keys after revocation").
+- Leaving a share (`share-leave`) is not a revocation of trust. The
+  leaver keeps everything it had up to its leave, including every key up
+  to the epoch current then, and can read anything encrypted under those
+  keys that it gets hold of. An Owner's daemon rotates the key after the
+  leave, so content added later is under a key the leaver doesn't get;
+  until that key arrives the other members publish nothing new. Revoke a
+  member you no longer trust (`share-revoke`). The only Owner can't
+  leave, but two Owners leaving at the same moment can leave a share with
+  no Owner, which can then never rotate or publish again
+  (`INTEGRATION_NOTES.md`, "Members leave on their own").
 
 The threat model is in `INTEGRATION_NOTES.md` ("Threat model: wire-only").

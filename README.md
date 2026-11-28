@@ -44,6 +44,7 @@ writing:
 | 5c. `p2panda-auth` group CRDT integration | ✅ Done |
 | 5d. Auto key rotation on revocation | ✅ Done; new versions under pre-revocation keys are refused and the current version is re-encrypted |
 | 5e. 4-peer revocation e2e test | ✅ Done |
+| Members leave on their own (`share-leave`, an Owner rotates the key) | ⚠️ Spike (`spike/self-leave`): `tests/e2e-leave.sh` |
 | Write permission enforced on sync announces (readers, revoked members) | ✅ Done (signed announces) |
 | 7. D-Bus IPC surface | ⚠️ Partial: CLI talks to the daemon over `org.peerdup.Daemon1`; no signals yet |
 | 6a. Transport: iroh-blobs over iroh | ✅ Done (spike checks open) |
@@ -163,6 +164,18 @@ member accepts new content encrypted under an older key. Members that are
 offline during a revocation still trust the revoked peer until they hear of
 it (see `SECURITY.md`).
 
+Any member can leave a share on its own; the only Owner can't:
+
+```bash
+rust-peerdup share-leave <share-id>
+```
+
+The daemon tells the other members, then removes the share from this
+machine (the files in the share folder stay). An Owner's daemon sends the
+remaining members a new key, so the leaver can't read what is added
+later. Leaving is not a revocation: the leaver keeps what it had.
+`share-remove` only drops a share locally, without telling anyone.
+
 ## D-Bus IPC
 
 Since Phase 7, the daemon exposes its API on the user session bus as
@@ -228,12 +241,13 @@ uninstall.sh                        remove binary + unit + activation (keeps dat
 Tests are in-module (`#[cfg(test)] mod tests`); run with `cargo test`.
 
 End-to-end tests, each a script that starts real daemons (CI runs all
-four against the binary from the RPM):
+five against the binary from the RPM):
 
 ```bash
 tests/e2e-sync.sh      target/debug/rust-peerdup   # two peers, one network
 tests/e2e-revoke.sh    target/debug/rust-peerdup   # owner, writers, reader; revoke; old keys
 tests/e2e-isolation.sh target/debug/rust-peerdup   # two shares; live revoke over D-Bus (needs dbus-daemon)
+tests/e2e-leave.sh     target/debug/rust-peerdup   # a member leaves; the owner rotates the key
 tests/e2e-xnet.sh      target/debug/rust-peerdup   # two isolated networks (docker)
 ```
 

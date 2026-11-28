@@ -625,8 +625,9 @@ version. `src/epochs.rs` holds the rule; the pieces:
   `Remove` op in the log that p2panda-auth's strong-remove resolver did
   not filter (`inner.ignore`), or that is part of a mutual-remove cycle
   (`inner.mutual_removes`, filtered but in effect). Every revocation
-  rotates once (daemon and direct mode), so after `n` removals keys up to
-  epoch `n` are each held by some removed member. A filtered `Remove`
+  rotates once (daemon and direct mode), and every leave gets a rotation
+  from an Owner's daemon ("Members leave on their own"), so after `n`
+  removals keys up to epoch `n` are each held by some removed member. A filtered `Remove`
   never took effect and is not counted: a removed Owner can still sign
   `Remove` ops whose dependencies predate its removal (they validate at
   those dependencies, then get filtered), and counting them would let it
@@ -1270,10 +1271,125 @@ Since 0.7 (upstream #1234) the CRDT applies a `Remove` whose author is
 the removed member, whatever their access level; 0.5.2 required a manager.
 peerdup counts every `Remove` in effect toward the required key epoch
 (`required_epoch = 1 + removals`), and only an Owner can mint the next key.
-Unguarded, a Reader could leave and raise the required epoch past every
-key, so no one could publish until an Owner rotated. `check_self_remove`
-refuses a self-removal unless the author was an Owner at the op's
-dependencies, which is what 0.5.2 accepted;
-`a_readers_self_removal_is_refused` shows the raw CRDT taking the op and
-`AuthState` refusing it. Letting members leave is planned as its own change,
-paired with an Owner-driven rotation.
+peerdup now uses this for `share-leave` (next section). `check_self_remove`
+accepts a self-removal from anyone who was a member at the op's
+dependencies, except the only Owner there, and refuses it from a
+non-member. The rule reads only the op and its causal past, so every node
+decides alike, in `apply_remote` and on replay.
+`the_only_owners_self_removal_is_refused_though_the_crdt_takes_it` shows
+the raw CRDT taking the op and `AuthState` refusing it.
+
+Upstream details this relies on (checked in the 0.8.2 source,
+`group/resolver.rs` and `group/authority_graphs.rs`):
+- `AuthorityGraphs::add_removal` returns early when `remover == removed`,
+  so a self-removal is never part of a mutual-remove cycle.
+- Strong remove filters, for every `Remove` of X, the ops *by X*
+  concurrent with it. Two leaves by one member on different heads filter
+  each other: neither counts, and the member stays. A member can't inflate
+  `removals()` by repeating its leave (`repeated_leaves_by_one_member_do_not_add_up`).
+- A leave concurrent with an Owner revoking the same member is filtered
+  (it is by the removed member); the revocation counts once.
+- A removed member's leave signed on heads after its removal is refused
+  (not a member at its deps); one signed on heads before it is filtered.
+
+Existing `auth.log` files that hold a self-removal of the only Owner (an
+Owner could `share-revoke` itself before) no longer replay; `share-revoke`
+of yourself now points to `share-leave`.
+
+## Members leave on their own
+
+`share-leave <id>` (`ShareLeave` over D-Bus, `ShareCommand::Leave`):
+
+1. **The op.** `daemon::record_leave` authors our own `Remove`
+   (`AuthState::leave`, which refuses the only Owner and non-members with
+   a clear error), saves `auth.log`, then writes `<share>/leaving`.
+   Direct mode (`--data-dir`) does the same under the daemon lock; the
+   marker makes the next daemon start finish the leave. A second
+   `share-leave` doesn't sign a second op (`has_left`): two leaves on
+   different heads would cancel each other upstream (above).
+2. **Telling the others.** `finish_leave` stops syncing (no fetch, no
+   publish, no reconcile), sends the auth log for `LEAVE_GRACE_TICKS` (6)
+   announce ticks, about 50 s with the first at once, then does what
+   `share-remove` does: drops the share's access entry and state
+   directory and the `.peerdup` shadow, and takes itself out of
+   `runtime.shares`. The plaintext files stay. Once one member has the op,
+   every member re-sends the whole log each tick, and members that apply
+   it cut the leaver's connections (`access.rs`), so the leaver only has
+   to reach one peer. A shutdown during the grace keeps the marker and the
+   next start resumes. If no member is online during the grace, the leave
+   never leaves the machine: the others still list the node until an
+   Owner revokes it.
+3. **The rotation.** Every leave raises `required_epoch`, so until a key
+   covers it nobody may publish (`epochs::may_encrypt`; logged once per
+   change at info, "local change waits for the share's next key"). An
+   Owner's share loop checks `daemon::auto_rotation` on every pass:
+   - nothing unless its keyring is behind `AuthState::required_epoch` and
+     it is a current Owner;
+   - nothing unless the uncovered removals are leaves:
+     `uncovered_removals_are_leaves(gap)` looks at the `gap` most
+     recently applied removals in effect. A revocation's key is minted
+     with its `Remove` by the revoking Owner (synchronously, in the
+     daemon and in direct mode) and re-sent every tick, so a gap left by
+     a revocation is never auto-filled, and a node never double-rotates
+     a revocation it just made (it has no gap);
+   - wait while a rotation for a later epoch is buffered (the missing
+     one is on its way);
+   - the **designated rotator**, the current Owner with the lowest
+     `MemberId`, mints at once; any other Owner only after the gap has
+     lasted `LEAVE_ROTATE_GRACE` (60 s, six ticks of the designated
+     rotator's re-sends).
+   `auto_rotate` mints epochs until the keyring meets the required epoch
+   (several leaves before a rotation need several), each sent to the
+   other current members as a revocation's is (`mint_and_queue`). The
+   loop then re-encrypts and publishes held changes as after any
+   rotation. The epoch floor is not a trigger: healing a fork stays a
+   manual `share-rotate-key`.
+
+**Stall window.** Between a leave reaching a node and the new key
+reaching it, that node publishes nothing new, and members that know of
+the leave refuse versions still under the old key. With the
+designated rotator online that is a gossip round trip plus up to one
+tick; with it offline, up to `LEAVE_ROTATE_GRACE` plus a tick, after
+which another Owner mints. With no Owner online, until one comes back.
+An Owner can't revoke or invite during the window (`check_mint`,
+`check_invite`): wait for the key.
+
+**Forks.** Two Owners can still mint the same epoch: the designated
+rotator was offline past the grace and comes back, or a leave and a
+revocation of the same member cross. The receiving nodes see two keys
+for one epoch (`InstallOutcome::Conflict`), raise the epoch floor, and
+fail closed exactly as for two concurrent revocations ("Old keys after
+revocation"): nothing new is published until an Owner runs
+`share-rotate-key`. Auto-rotation doesn't trigger on the floor, so a fork
+never feeds more automatic minting.
+
+**Attribution is a heuristic.** Keys don't name the removal they cover.
+In the concurrent case (another Owner revokes someone before it hears of
+a leave, and its key arrives here before the leave does) a node may count
+the gap as a revocation's and wait; the revoking Owner, which applied its
+own revocation first, sees a leave as the newest removal and mints after
+the grace. If that Owner is offline, the share waits for it or for a
+manual `share-rotate-key` (fails closed). A rotation that named the
+removals it covers would make this exact; it needs a wire change
+(`SignedRotation` v3).
+
+**Two Owners leaving at once.** Each sees the other as an Owner at its
+dependencies, so both ops are valid and the merged share has no Owner
+(`two_owners_leaving_at_once_leave_no_owner`). Resolving that
+deterministically would mean dropping an already-applied op (and
+everything that depends on it) when the other arrives, so it is left as
+a known gap: such a share keeps its content but can never rotate or
+publish again; re-create it. The guard does stop the common case, the
+last Owner leaving.
+
+**Leaving is not revocation.** The leaver keeps everything it had,
+including every key up to the epoch current at its leave, and the
+rotation only protects what is encrypted after it. A concurrent manual
+`share-rotate-key` that hadn't seen the leave can even hand the leaver
+the new epoch (no fork follows, since no second key is minted for it).
+Revoke a member you no longer trust (SECURITY.md).
+
+`tests/e2e-leave.sh` covers it end to end: a Reader leaves in direct mode,
+the Owner rotates, a Writer's edit reaches the Owner under the new epoch,
+the leaver's data dir loses the share and keeps its files, and the only
+Owner's leave is refused.

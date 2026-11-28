@@ -342,6 +342,24 @@ pub fn load_all(data_dir: &Path) -> Result<Vec<ShareConfig>> {
     Ok(out)
 }
 
+/// `<share>/leaving`: written once this node's self-`Remove` is in
+/// `auth.log`. A daemon that finds it tells the other members and then
+/// removes the share (`daemon::finish_leave`), at start or while running.
+pub fn leaving_path(data_dir: &Path, id: &str) -> PathBuf {
+    data_dir::shares_dir(data_dir).join(id).join("leaving")
+}
+
+pub fn mark_leaving(data_dir: &Path, id: &str) -> Result<()> {
+    validate_id(id)?;
+    let path = leaving_path(data_dir, id);
+    data_dir::write_private_atomic(&path, b"").with_context(|| format!("writing {path:?}"))?;
+    Ok(())
+}
+
+pub fn is_leaving(data_dir: &Path, id: &str) -> bool {
+    leaving_path(data_dir, id).exists()
+}
+
 pub fn remove(data_dir: &Path, id: &str) -> Result<()> {
     validate_id(id)?;
     let dir = data_dir::shares_dir(data_dir).join(id);

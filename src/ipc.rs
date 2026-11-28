@@ -301,7 +301,24 @@ impl Daemon1Iface {
         Ok(new_epoch)
     }
 
-    /// Stop the share task and remove the share's directory + shadow.
+    /// Leave a share: the share task signs this node's own `Remove`, sends
+    /// it to the other members for about a minute, then removes the share
+    /// here (the files in the share root stay). An Owner's daemon rotates
+    /// the key for the remaining members. Refused for the only Owner.
+    async fn share_leave(&self, id: &str) -> zbus::fdo::Result<()> {
+        let tx = self.share_sender(id).await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(ShareCommand::Leave { reply: reply_tx })
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("share task no longer running".to_string()))?;
+        reply_rx
+            .await
+            .map_err(|_| zbus::fdo::Error::Failed("share task dropped reply".to_string()))?
+            .map_err(fdo_err)
+    }
+
+    /// Stop the share task and remove the share's directory + shadow. Local
+    /// only: the other members aren't told (see `share_leave`).
     async fn share_remove(&self, id: &str) -> zbus::fdo::Result<()> {
         // Look up the share root before tearing down state, so we can clean
         // the .peerdup shadow afterwards.

@@ -96,8 +96,17 @@ enum Cmd {
     },
     /// List configured shares.
     ShareList,
-    /// Remove a share by id.
+    /// Drop a share from this machine only. The other members are not told
+    /// and still list you; to leave a share, use share-leave. The files in
+    /// the share folder stay.
     ShareRemove { id: String },
+    /// Leave a share: sign your own removal, tell the other members, then
+    /// drop the share from this machine. The files in the share folder
+    /// stay. An Owner of the share sends the remaining members a new key,
+    /// so you can't read what they add later; you keep everything up to
+    /// now. The only Owner of a share can't leave it. With --data-dir the
+    /// daemon finishes the leave when it next starts.
+    ShareLeave { id: String },
     /// Rotate the encryption key for a share. Generates a new key, appends
     /// it to the keyring (as a new epoch). Old ciphertexts encrypted under
     /// previous epochs remain decryptable.
@@ -190,6 +199,10 @@ async fn main() -> Result<()> {
         Cmd::ShareRemove { id } => match direct_dir {
             Some(dd) => cmd_share_remove_direct(dd, id),
             None => cmd_share_remove(id).await,
+        },
+        Cmd::ShareLeave { id } => match direct_dir {
+            Some(dd) => cmd_share_leave_direct(dd, id),
+            None => cmd_share_leave(id).await,
         },
         Cmd::ShareRotateKey { id } => match direct_dir {
             Some(dd) => cmd_share_rotate_key_direct(dd, id),
@@ -416,6 +429,17 @@ async fn cmd_share_join(ticket_str: String, path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_share_leave(id: String) -> Result<()> {
+    let client = client::DaemonClient::connect().await?;
+    client.share_leave(&id).await?;
+    println!("Leaving share {id}.");
+    println!(
+        "The daemon tells the other members over the next minute, then removes the share \
+         from this machine. The files in the share folder stay."
+    );
+    Ok(())
+}
+
 async fn cmd_share_remove(id: String) -> Result<()> {
     let client = client::DaemonClient::connect().await?;
     client.share_remove(&id).await?;
@@ -591,6 +615,9 @@ fn cmd_share_revoke_direct(data_dir: PathBuf, id: String, peer_pubkey_hex: Strin
         return Err(anyhow!("share {id} has no auth state on disk"));
     }
     auth_state.require_owner(group_id, &identity)?;
+    if target == auth::MemberId(*identity.verifying_key().as_bytes()) {
+        return Err(anyhow!("to remove this node from a share, use share-leave"));
+    }
     if !auth_state.is_member(group_id, target) {
         return Err(anyhow!(
             "{} is not a current member of share {id}",
@@ -729,6 +756,27 @@ fn cmd_share_join_direct(data_dir: PathBuf, ticket_str: String, path: PathBuf) -
         cfg.id,
         cfg.name,
         cfg.root_path.display()
+    );
+    Ok(())
+}
+
+fn cmd_share_leave_direct(data_dir: PathBuf, id: String) -> Result<()> {
+    let _lock = lock_for_direct_write(&data_dir)?;
+    let configs = share::load_all(&data_dir)?;
+    if !configs.iter().any(|c| c.id == id) {
+        return Err(anyhow!("share {id} not found"));
+    }
+    let identity = identity::load_or_create(&data_dir::identity_path(&data_dir))?;
+    let mut auth_state = auth::load(&data_dir, &id)?;
+    if auth_state.is_empty() {
+        return Err(anyhow!("share {id} has no auth state on disk"));
+    }
+    daemon::record_leave(&data_dir, &id, &identity, &mut auth_state)
+        .with_context(|| format!("leaving share {id}"))?;
+    println!("Leaving share {id}.");
+    println!(
+        "The daemon tells the other members when it next starts (for about a minute), \
+         then removes the share from this machine. The files in the share folder stay."
     );
     Ok(())
 }
