@@ -108,6 +108,13 @@ impl DaemonClient {
             .map_err(map_call_err)
     }
 
+    pub async fn share_leave(&self, id: &str) -> Result<()> {
+        self.proxy
+            .call("ShareLeave", &(id,))
+            .await
+            .map_err(map_call_err)
+    }
+
     pub async fn share_remove(&self, id: &str) -> Result<()> {
         self.proxy
             .call("ShareRemove", &(id,))

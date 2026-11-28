@@ -88,6 +88,8 @@ jobs:
           tests/e2e-revoke.sh /usr/bin/rust-peerdup
           # Per-share isolation and live revocation (A on a private bus).
           tests/e2e-isolation.sh /usr/bin/rust-peerdup
+          # A member leaves on its own; the Owner rotates the key.
+          tests/e2e-leave.sh /usr/bin/rust-peerdup
           # Linked against Fedora's SQLite, not a bundled copy.
           ldd /usr/bin/rust-peerdup | grep -q libsqlite3
           cd /

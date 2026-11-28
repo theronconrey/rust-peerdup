@@ -339,6 +339,42 @@ impl AuthState {
         self.author(my_key, group_id, action)
     }
 
+    /// Leave the share: author a `Remove` of ourselves. Refused with a
+    /// clear error for a non-member and for the only Owner; the same rule
+    /// is enforced on every op in `check_self_remove`.
+    pub fn leave(&mut self, my_key: &SigningKey, group_id: MemberId) -> Result<SignedOp> {
+        let me = MemberId(*my_key.verifying_key().as_bytes());
+        let members = self.members(group_id);
+        let Some((_, role)) = members.iter().find(|(m, _)| *m == me) else {
+            return Err(anyhow!("this node is not a member of the share"));
+        };
+        if *role == AuthRole::Owner
+            && !members
+                .iter()
+                .any(|(m, r)| *m != me && *r == AuthRole::Owner)
+        {
+            return Err(anyhow!(
+                "this node is the share's only Owner; a share without an Owner can never \
+                 rotate its key again. Invite another Owner first (share-invite \
+                 --auth-role owner), or drop the share on this machine only with share-remove"
+            ));
+        }
+        self.remove_member(my_key, group_id, me)
+    }
+
+    /// Whether `member` has left: it isn't a member and the log holds a
+    /// `Remove` of it that it authored itself.
+    pub fn has_left(&self, group_id: MemberId, member: MemberId) -> bool {
+        !self.is_member(group_id, member)
+            && self.ops.iter().any(|op| {
+                op.author == member
+                    && matches!(
+                        &op.payload.action,
+                        GroupAction::Remove { member: GroupMember::Individual(m) } if *m == member
+                    )
+            })
+    }
+
     /// Construct, sign, and apply a locally-authored op.
     fn author(
         &mut self,
@@ -455,12 +491,15 @@ impl AuthState {
         }
     }
 
-    /// p2panda-auth 0.7 lets any member sign its own `Remove` (upstream
-    /// #1234; 0.5.2 required a manager). peerdup counts every `Remove` in
-    /// effect toward the required key epoch, and only an Owner's revocation
-    /// rotates the key, so a Reader's self-removal would raise the required
-    /// epoch past every key and stop the share. Refuse it unless the author
-    /// was an Owner at the op's dependencies, which is what 0.5.2 accepted.
+    /// A member leaving: a `Remove` whose author is the removed member.
+    /// p2panda-auth 0.7+ applies one from any member (upstream #1234;
+    /// 0.5.2 required a manager). peerdup accepts it from anyone who was a
+    /// member at the op's dependencies, except the only Owner there: a
+    /// share without an Owner can never rotate its key again, and every
+    /// removal raises the required epoch (`required_epoch`), so it could
+    /// never publish again either. The Owners' daemons close the gap a
+    /// leave opens by rotating (`daemon::auto_rotation`). Depends only on
+    /// the op and its causal past, so every node decides the same.
     /// Runs with the op's dependencies applied.
     fn check_self_remove(&self, op: &SignedOp) -> Result<()> {
         let GroupAction::Remove {
@@ -475,14 +514,22 @@ impl AuthState {
         let heads: HashSet<OpId> = op.deps.iter().copied().collect();
         let members = Crdt::members_at(&self.crdt, heads, self.group)
             .map_err(|e| anyhow!("auth crdt error: {e:?}"))?;
-        let was_owner = members
-            .iter()
-            .any(|(m, a)| *m == op.author && a.level == AccessLevel::Manage);
-        if !was_owner {
+        let Some((_, access)) = members.iter().find(|(m, _)| *m == op.author) else {
             return Err(anyhow!(
-                "refusing a self-removal by a non-Owner ({})",
+                "refusing a self-removal by a non-member ({})",
                 op.author.to_hex()
             ));
+        };
+        if access.level == AccessLevel::Manage {
+            let other_owner = members
+                .iter()
+                .any(|(m, a)| *m != op.author && a.level == AccessLevel::Manage);
+            if !other_owner {
+                return Err(anyhow!(
+                    "refusing the self-removal of the share's only Owner ({})",
+                    op.author.to_hex()
+                ));
+            }
         }
         Ok(())
     }
@@ -552,20 +599,56 @@ impl AuthState {
     /// op in a mutual-remove cycle is in the filter too but does take
     /// effect (everyone in the cycle is removed), so it counts.
     pub fn removals(&self) -> u64 {
+        self.removals_in_effect().count() as u64
+    }
+
+    /// The `Remove` ops counted by `removals`, in the order this node
+    /// applied them.
+    fn removals_in_effect(&self) -> impl DoubleEndedIterator<Item = &SignedOp> {
         let inner = &self.crdt.inner;
         self.ops
             .iter()
             .filter(|op| matches!(op.payload.action, GroupAction::Remove { .. }))
-            .map(|op| op.id())
-            .filter(|id| !inner.ignore.contains(id) || inner.mutual_removes.contains(id))
-            .count() as u64
+            .filter(move |op| {
+                let id = op.id();
+                !inner.ignore.contains(&id) || inner.mutual_removes.contains(&id)
+            })
+    }
+
+    /// Whether the `gap` most recently applied removals in effect are all
+    /// members leaving. A node whose keyring is `gap` epochs behind
+    /// `required_epoch` uses this to tell a leave (an Owner's daemon mints
+    /// its key, `daemon::auto_rotation`) from a revocation (the revoking
+    /// Owner minted its key with the `Remove`, and it is on its way). Keys
+    /// don't name the removal they cover, so this is a heuristic for the
+    /// concurrent case; see INTEGRATION_NOTES.md, "Members leave on their
+    /// own".
+    pub fn uncovered_removals_are_leaves(&self, gap: u64) -> bool {
+        let mut seen = 0u64;
+        for op in self.removals_in_effect().rev() {
+            if seen == gap {
+                break;
+            }
+            let GroupAction::Remove {
+                member: GroupMember::Individual(m),
+            } = &op.payload.action
+            else {
+                return false;
+            };
+            if *m != op.author {
+                return false;
+            }
+            seen += 1;
+        }
+        gap > 0 && seen == gap
     }
 
     /// The lowest key epoch new content may be encrypted under, as far as
     /// this node's view of the membership goes: `1 + removals()`. Every
     /// revocation rotates the key once (`share-revoke`, daemon and direct
-    /// mode), so after `n` removals keys up to epoch `n` are held by at
-    /// least one removed member. Demotions don't count: a demoted member
+    /// mode), and so does every leave (an Owner's daemon), so after `n`
+    /// removals keys up to epoch `n` are held by at least one removed
+    /// member. Demotions don't count: a demoted member
     /// keeps read access. See `epochs::required` for the floor that a key
     /// fork adds, and INTEGRATION_NOTES.md, "Old keys after revocation".
     pub fn required_epoch(&self) -> u64 {
@@ -1013,27 +1096,109 @@ mod tests {
         assert!(!state.is_member(group, me_of(&mallory)));
     }
 
-    /// p2panda-auth 0.8 itself applies a Reader's self-removal; our guard
-    /// refuses it, so the required epoch doesn't move without a rotation.
+    fn self_remove(key: &SigningKey, deps: Vec<OpId>, group: MemberId) -> SignedOp {
+        forge(
+            key,
+            deps,
+            GroupAction::Remove {
+                member: GroupMember::Individual(me_of(key)),
+            },
+            group,
+        )
+    }
+
+    fn heads_of(state: &AuthState, group: MemberId) -> Vec<OpId> {
+        state.crdt.inner.heads(&[group]).into_iter().collect()
+    }
+
+    /// Any member may leave: a Reader, a Writer, and an Owner while another
+    /// Owner remains. Each leave counts as a removal, and a peer replaying
+    /// the log reaches the same membership and required epoch.
     #[test]
-    fn a_readers_self_removal_is_refused() {
+    fn members_may_leave_and_each_leave_raises_the_required_epoch() {
+        let alice = fresh_key();
+        let (owner2, writer, reader) = (fresh_key(), fresh_key(), fresh_key());
+        let group = group_id_for("share-leave");
+        let mut state = AuthState::empty_for(group);
+        state.create_group(&alice, group).unwrap();
+        state
+            .add_member(&alice, group, me_of(&owner2), AuthRole::Owner)
+            .unwrap();
+        state
+            .add_member(&alice, group, me_of(&writer), AuthRole::Writer)
+            .unwrap();
+        state
+            .add_member(&alice, group, me_of(&reader), AuthRole::Reader)
+            .unwrap();
+        assert_eq!(state.required_epoch(), 1);
+
+        for (n, leaver) in [&reader, &writer, &owner2].into_iter().enumerate() {
+            // As a remote peer's op would arrive: signed on our heads.
+            let op = self_remove(leaver, heads_of(&state, group), group);
+            assert!(state.apply_remote(op).unwrap(), "leave {n} refused");
+            assert!(!state.is_member(group, me_of(leaver)));
+            assert!(state.has_left(group, me_of(leaver)));
+            assert_eq!(state.required_epoch(), 2 + n as u64);
+            assert!(state.uncovered_removals_are_leaves(n as u64 + 1));
+        }
+        assert_eq!(
+            sorted_members(&state, group),
+            vec![(me_of(&alice), AuthRole::Owner)]
+        );
+        assert!(!state.has_left(group, me_of(&alice)));
+
+        let mut replica = AuthState::empty_for(group);
+        for op in state.ops() {
+            replica.apply_remote(op.clone()).unwrap();
+        }
+        assert_eq!(
+            sorted_members(&replica, group),
+            sorted_members(&state, group)
+        );
+        assert_eq!(replica.required_epoch(), 4);
+        // Replaying an op already applied changes nothing.
+        let last = state.ops().last().unwrap().clone();
+        assert!(!replica.apply_remote(last).unwrap());
+        assert_eq!(replica.required_epoch(), 4);
+    }
+
+    /// The local helper authors the same op and gives a clear error for
+    /// the only Owner and for a non-member.
+    #[test]
+    fn leave_refuses_the_only_owner_and_non_members() {
+        let alice = fresh_key();
+        let (bob, stranger) = (fresh_key(), fresh_key());
+        let group = group_id_for("share-leave-local");
+        let mut state = AuthState::empty_for(group);
+        state.create_group(&alice, group).unwrap();
+        state
+            .add_member(&alice, group, me_of(&bob), AuthRole::Writer)
+            .unwrap();
+        let err = state.leave(&alice, group).unwrap_err().to_string();
+        assert!(err.contains("only Owner"), "{err}");
+        let err = state.leave(&stranger, group).unwrap_err().to_string();
+        assert!(err.contains("not a member"), "{err}");
+        assert_eq!(state.required_epoch(), 1);
+        state.leave(&bob, group).unwrap();
+        assert!(state.has_left(group, me_of(&bob)));
+        assert!(state.leave(&bob, group).is_err(), "leaving twice");
+        assert_eq!(state.required_epoch(), 2);
+    }
+
+    /// p2panda-auth 0.8 itself applies the only Owner's self-removal,
+    /// which leaves a share that can never rotate again; our guard refuses
+    /// it, in `apply_remote` too.
+    #[test]
+    fn the_only_owners_self_removal_is_refused_though_the_crdt_takes_it() {
         let alice = fresh_key();
         let bob = fresh_key();
-        let group = group_id_for("share-self-remove");
+        let group = group_id_for("share-sole-owner");
         let mut state = AuthState::empty_for(group);
         state.create_group(&alice, group).unwrap();
         state
             .add_member(&alice, group, me_of(&bob), AuthRole::Reader)
             .unwrap();
-        let heads: Vec<OpId> = state.crdt.inner.heads(&[group]).into_iter().collect();
-        let leave = forge(
-            &bob,
-            heads,
-            GroupAction::Remove {
-                member: GroupMember::Individual(me_of(&bob)),
-            },
-            group,
-        );
+        let leave = self_remove(&alice, heads_of(&state, group), group);
 
         // Upstream, without our guard: the CRDT takes it.
         let mut raw = CrdtState::new();
@@ -1041,12 +1206,126 @@ mod tests {
             raw = Crdt::process(raw, op).unwrap();
         }
         let raw = Crdt::process(raw, &leave).expect("0.8 accepts a self-removal");
-        assert!(!raw.members(group).iter().any(|(m, _)| *m == me_of(&bob)));
+        assert!(!raw.members(group).iter().any(|(m, _)| *m == me_of(&alice)));
 
         // Through AuthState: refused, nothing changes.
-        assert!(state.apply_remote(leave).is_err());
-        assert!(state.is_member(group, me_of(&bob)));
+        let err = state.apply_remote(leave).unwrap_err();
+        assert!(format!("{err:#}").contains("only Owner"), "{err:#}");
+        assert!(state.is_member(group, me_of(&alice)));
         assert_eq!(state.required_epoch(), 1);
+    }
+
+    /// A stranger's self-Remove, and a revoked member's signed after its
+    /// revocation, are refused. One signed before its revocation (deps
+    /// that predate it) is filtered by the resolver and doesn't count.
+    #[test]
+    fn a_non_member_or_removed_members_self_removal_changes_nothing() {
+        let alice = fresh_key();
+        let (bob, stranger) = (fresh_key(), fresh_key());
+        let group = group_id_for("share-leave-removed");
+        let mut state = AuthState::empty_for(group);
+        state.create_group(&alice, group).unwrap();
+        state
+            .add_member(&alice, group, me_of(&bob), AuthRole::Writer)
+            .unwrap();
+        let before = heads_of(&state, group);
+
+        let err = state
+            .apply_remote(self_remove(&stranger, before.clone(), group))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("non-member"), "{err:#}");
+
+        state.remove_member(&alice, group, me_of(&bob)).unwrap();
+        assert_eq!(state.required_epoch(), 2);
+        let after = heads_of(&state, group);
+        let err = state
+            .apply_remote(self_remove(&bob, after, group))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("non-member"), "{err:#}");
+
+        // Applied and filtered, or refused: either way it changes nothing.
+        let _ = state.apply_remote(self_remove(&bob, before, group));
+        assert_eq!(state.required_epoch(), 2);
+        assert!(!state.is_member(group, me_of(&bob)));
+        assert!(!state.uncovered_removals_are_leaves(1), "the revocation");
+    }
+
+    /// A member that signs several leaves on different heads (concurrent
+    /// with one another) can't raise the required epoch by more than one:
+    /// upstream leaves self-removals out of its mutual-remove graph, and
+    /// each one filters the others.
+    #[test]
+    fn repeated_leaves_by_one_member_do_not_add_up() {
+        let alice = fresh_key();
+        let (bob, carol) = (fresh_key(), fresh_key());
+        let group = group_id_for("share-leave-twice");
+        let mut state = AuthState::empty_for(group);
+        state.create_group(&alice, group).unwrap();
+        state
+            .add_member(&alice, group, me_of(&bob), AuthRole::Writer)
+            .unwrap();
+        let early = heads_of(&state, group);
+        state
+            .add_member(&alice, group, me_of(&carol), AuthRole::Reader)
+            .unwrap();
+        let late = heads_of(&state, group);
+        let _ = state.apply_remote(self_remove(&bob, late, group));
+        let _ = state.apply_remote(self_remove(&bob, early, group));
+        assert!(state.required_epoch() <= 2, "{}", state.required_epoch());
+        assert!(state.is_member(group, me_of(&carol)));
+        assert!(state.is_member(group, me_of(&alice)));
+    }
+
+    /// The known gap: two Owners, each seeing the other at its deps, leave
+    /// at the same time. Each op is valid on its own, so the merged share
+    /// has no Owner (INTEGRATION_NOTES.md, "Members leave on their own").
+    #[test]
+    fn two_owners_leaving_at_once_leave_no_owner() {
+        let alice = fresh_key();
+        let (bob, carol) = (fresh_key(), fresh_key());
+        let group = group_id_for("share-owners-leave");
+        let mut state = AuthState::empty_for(group);
+        state.create_group(&alice, group).unwrap();
+        state
+            .add_member(&alice, group, me_of(&bob), AuthRole::Owner)
+            .unwrap();
+        state
+            .add_member(&alice, group, me_of(&carol), AuthRole::Writer)
+            .unwrap();
+        let heads = heads_of(&state, group);
+        state
+            .apply_remote(self_remove(&alice, heads.clone(), group))
+            .unwrap();
+        state.apply_remote(self_remove(&bob, heads, group)).unwrap();
+        assert!(!state
+            .members(group)
+            .iter()
+            .any(|(_, r)| *r == AuthRole::Owner));
+        assert_eq!(state.required_epoch(), 3);
+    }
+
+    /// A revocation followed by a leave: the newest removal is a leave,
+    /// the one before it a revocation.
+    #[test]
+    fn uncovered_removals_are_attributed_newest_first() {
+        let alice = fresh_key();
+        let (bob, carol) = (fresh_key(), fresh_key());
+        let group = group_id_for("share-attribution");
+        let mut state = AuthState::empty_for(group);
+        state.create_group(&alice, group).unwrap();
+        assert!(!state.uncovered_removals_are_leaves(0));
+        state
+            .add_member(&alice, group, me_of(&bob), AuthRole::Writer)
+            .unwrap();
+        state
+            .add_member(&alice, group, me_of(&carol), AuthRole::Reader)
+            .unwrap();
+        state.remove_member(&alice, group, me_of(&bob)).unwrap();
+        assert!(!state.uncovered_removals_are_leaves(1));
+        state.leave(&carol, group).unwrap();
+        assert!(state.uncovered_removals_are_leaves(1));
+        assert!(!state.uncovered_removals_are_leaves(2));
+        assert!(!state.uncovered_removals_are_leaves(3), "only two removals");
     }
 
     /// `auth.log` bytes for a fixed log. Recorded on p2panda-auth 0.5.2
