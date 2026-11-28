@@ -1049,8 +1049,9 @@ mod tests {
         assert_eq!(state.required_epoch(), 1);
     }
 
-    /// `auth.log` bytes for a fixed log, as written by p2panda-auth 0.5.2
-    /// (spike run 45930566953).
+    /// `auth.log` bytes for a fixed log. Recorded on p2panda-auth 0.5.2
+    /// (CI run 45930566953) and unchanged on 0.8, so logs already on disk
+    /// keep loading. Never reorder or retype `GroupControlMessage`'s fields.
     /// Ed25519 signing is deterministic and the log is linear (one head at
     /// each step), so the bytes are too. A dependency bump that changes the
     /// serialised shape of an op (and so every signature and op id) fails

@@ -332,13 +332,12 @@ and that each chunk decodes and verifies; `tests/e2e-revoke.sh` runs a
 share whose auth log is well over 4 KiB and fails on any publish error
 in a daemon log.
 
-## p2panda 0.8 (core, net) with p2panda-auth 0.5
+## p2panda 0.8 (core, net, auth)
 
-p2panda-net 0.8 runs on iroh 1.x, which iroh-blobs needs. Our code moved to
-p2panda-core 0.8 (`SigningKey`/`VerifyingKey`, `Topic`); p2panda-auth stays
-at 0.5.2 because 0.8 removed `GroupControlMessage`, which the membership
-code is built on. Nothing passes p2panda-core types into p2panda-auth, so
-the two core versions never meet. Gossip topics were `blake3(topic
+p2panda-net 0.8 runs on iroh 1.x, which iroh-blobs needs. Our code is on
+p2panda-core, p2panda-net and p2panda-auth 0.8. p2panda-auth stayed on 0.5.2
+for a while because 0.8 removed `GroupControlMessage`; see "p2panda-auth
+0.5 to 0.8" for how the port kept `auth.log` byte-identical. Gossip topics were `blake3(topic
 string)` across that move; since ticket v4 they derive from a random
 secret (see "Share identity and topics").
 
@@ -468,9 +467,9 @@ and a `share resolve <id>` subcommand.
 ## p2panda-auth (Phase 5c)
 
 ### Pure CRDT, no transport or persistence
-`p2panda-auth` 0.5.2 is a *library* of generic types — `GroupCrdt`,
-`GroupCrdtState`, `Access`, etc. — parameterised over `IdentityHandle`,
-`OperationId`, `Conditions`, `Resolver`, and `Orderer` traits. It does
+`p2panda-auth` 0.8 is a *library* of generic types — `GroupCrdt`,
+`GroupCrdtState`, `Access`, etc. — parameterised over p2panda-core's
+`Author` and `OperationId` traits, `Conditions` and a `Resolver`. It does
 not sign, transport, persist, or order operations. The application must
 provide:
 - An identity scheme (we use raw 32-byte Ed25519 pubkeys, `MemberId`).
@@ -484,15 +483,12 @@ provide:
 - Dependency ordering (auth ops can arrive out of order via gossip; we
   buffer them in `AuthState.pending` and drain on each new arrival).
 
-### The `Orderer` trait can be no-op
-`p2panda-auth` only calls `Orderer::next_message` from `GroupCrdt::prepare`
-(used by the high-level `Groups` API, e.g. `Groups::add()`). Calling
-`GroupCrdt::process` directly — passing in a fully-formed operation —
-never touches the orderer. peerdup constructs operations directly with
-correct dependencies (= current graph heads at author time) and only
-uses `process`. This means our `NoOpOrderer` can `unimplemented!()`
-`next_message` safely; `queue` and `next_ready_message` are inert
-no-ops.
+### No `Orderer`
+0.5.2 had an `Orderer` trait that only its high-level `prepare` path used;
+peerdup always called `process` with fully-formed ops and supplied a no-op
+orderer. 0.8 removed the trait and the generic, so there is nothing to
+supply. peerdup still builds each op itself, with the current group heads
+(`heads(&[group])`) as its dependencies.
 
 ### Group id distinct from member ids
 Both group ids and member ids share the same `IdentityHandle` type
@@ -1196,7 +1192,7 @@ Pre-release, so there is no compatibility shim.
 
 ## AuthState: a rejected op must not empty the group
 
-`Crdt::process` takes the CRDT state by value, and p2panda-auth 0.5.2's
+`Crdt::process` takes the CRDT state by value, and p2panda-auth's (0.5.2 and 0.8)
 `GroupCrdtState` is not `Clone`, so when it rejects an op the state it was
 given is gone. `AuthState::process` then rebuilds the state by replaying
 the ops already applied. Before, a rejected op left the share with an
@@ -1207,7 +1203,7 @@ the local identity is an Owner before authoring anything.
 
 ## p2panda-auth: a second Create resets group state
 
-p2panda-auth 0.5.2's `GroupCrdt::process` handles a `Create` for a group
+p2panda-auth's (0.5.2 and 0.8) `GroupCrdt::process` handles a `Create` for a group
 that already exists as a fresh definition of the group: it does not check
 that the group is new, or that the author has any role in it. Review
 finding 1, confirmed by `stranger_create_for_existing_group_is_refused`
@@ -1253,3 +1249,31 @@ duration and refuses if a daemon holds it; before, a running daemon's next
 `auth::save` could silently overwrite a direct-mode revocation. Stop the
 daemon, run the command, start it again (as `tests/e2e-revoke.sh` does),
 or go through D-Bus.
+
+## p2panda-auth 0.5 to 0.8
+
+0.8 dropped `GroupControlMessage`: the `Operation` trait has `group_id()`
+and `action()` instead of `payload()`. `auth.rs` keeps a local
+`GroupControlMessage { group_id, action }` with the same fields in the same
+order, so bincode encodes it exactly as 0.5.2 did and every existing
+signature and op id still matches. `golden_auth_log_is_byte_stable` pins
+the bytes (recorded on 0.5.2); never reorder or retype that struct.
+
+`IdentityHandle` and the crate's `OperationId` became p2panda-core's
+`Author` and `OperationId`; `StrongRemove`'s parameters were reordered;
+`heads()` takes a list of groups. The second-Create reset (above) and the
+by-value `process` with a non-`Clone` state are unchanged in 0.8, so
+`check_shape` and `rebuild_from_log` stay.
+
+### Any member may sign its own `Remove` (0.7+)
+Since 0.7 (upstream #1234) the CRDT applies a `Remove` whose author is
+the removed member, whatever their access level; 0.5.2 required a manager.
+peerdup counts every `Remove` in effect toward the required key epoch
+(`required_epoch = 1 + removals`), and only an Owner can mint the next key.
+Unguarded, a Reader could leave and raise the required epoch past every
+key, so no one could publish until an Owner rotated. `check_self_remove`
+refuses a self-removal unless the author was an Owner at the op's
+dependencies, which is what 0.5.2 accepted;
+`a_readers_self_removal_is_refused` shows the raw CRDT taking the op and
+`AuthState` refusing it. Letting members leave is planned as its own change,
+paired with an Owner-driven rotation.
